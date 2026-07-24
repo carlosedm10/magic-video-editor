@@ -151,6 +151,140 @@ def _transcript_cleanup(log, clip_sentences: list[dict]) -> set[str]:
     return cut_ids
 
 
+def _compute_topic(log, sentences: list[dict]) -> str:
+    """Cheap agent call over the (truncated) full transcript: one-line video
+    topic, used to judge out-of-context asides and cross-clip duplicates.
+    Fail-open: on error, return "" and the callers just skip topic-aware
+    checks."""
+    from ..agents.agents import get_agent
+
+    if not sentences:
+        return ""
+    full_text = " ".join(s["text"] for s in sentences)[: config.TOPIC_INPUT_CHARS]
+    try:
+        result = get_agent("video_topic").run_sync(f"Transcript:\n{full_text}").output
+        return result.topic.strip()
+    except Exception as exc:
+        log(f"video_topic failed, continuing without a topic: {exc}")
+        return ""
+
+
+def _context_check_clip(
+    log, clip_sentences: list[dict], already_cut: set[str], topic: str
+) -> set[str]:
+    """Second per-clip pass ("does this sentence belong in a video about
+    <topic>?"): for each sentence not already cut by the restart/blooper
+    pass, ask the context_check agent. Cut only clear meta/out-of-context
+    asides; conservative on content. Fail-open per sentence."""
+    from ..agents.agents import get_agent
+
+    cut: set[str] = set()
+    agent = get_agent("context_check")
+    for i, s in enumerate(clip_sentences):
+        if s["id"] in already_cut:
+            continue
+        prev_text = clip_sentences[i - 1]["text"] if i > 0 else ""
+        next_text = clip_sentences[i + 1]["text"] if i + 1 < len(clip_sentences) else ""
+        prompt = (
+            f'Video topic: "{topic}"\n\n'
+            f'Context before: "{prev_text}"\n'
+            f'SENTENCE: "{s["text"]}"\n'
+            f'Context after: "{next_text}"'
+        )
+        try:
+            result = agent.run_sync(prompt).output
+            if not result.in_context:
+                cut.add(s["id"])
+        except Exception as exc:
+            log(f"context_check failed for a sentence, skipping: {exc}")
+    return cut
+
+
+def _neighbor_context(clip_sentences: list[dict], idx: int) -> str:
+    if idx > 0:
+        return clip_sentences[idx - 1]["text"]
+    if idx + 1 < len(clip_sentences):
+        return clip_sentences[idx + 1]["text"]
+    return ""
+
+
+def _cross_clip_dedup(log, sentences: list[dict], topic: str) -> tuple[set[str], list[dict]]:
+    """Cross-clip semantic dedup with auto-cut (v4 section 1): candidate
+    pairs are currently-kept sentences from DIFFERENT clips with rapidfuzz
+    token_set_ratio in [CROSS_DEDUP_MIN_SIM, CROSS_DEDUP_MAX_SIM], capped at
+    CROSS_DEDUP_MAX_PAIRS (highest similarity first). Each pair is judged by
+    dedup_judge with one neighboring sentence of context per side and the
+    topic. same_content and confidence>=CROSS_DEDUP_AUTOCUT_CONFIDENCE ->
+    auto-cut the non-kept sentence; confidence in [CROSS_DEDUP_SUGGEST_
+    CONFIDENCE, autocut) -> an open suggestion instead. Fail-open per pair."""
+    from ..agents.agents import get_agent
+
+    by_clip: dict[str, list[dict]] = {}
+    for s in sentences:
+        by_clip.setdefault(s["clip_id"], []).append(s)
+    idx_by_id: dict[str, int] = {}
+    for clip_list in by_clip.values():
+        for i, s in enumerate(clip_list):
+            idx_by_id[s["id"]] = i
+
+    kept = [s for s in sentences if s["kept"]]
+    norm = {s["id"]: _norm(s["text"]) for s in kept}
+
+    pairs: list[tuple[float, dict, dict]] = []
+    for i, a in enumerate(kept):
+        if len(norm[a["id"]].split()) < config.DUP_MIN_WORDS:
+            continue
+        for b in kept[i + 1 :]:
+            if a["clip_id"] == b["clip_id"]:
+                continue
+            if len(norm[b["id"]].split()) < config.DUP_MIN_WORDS:
+                continue
+            sim = fuzz.token_set_ratio(norm[a["id"]], norm[b["id"]])
+            if config.CROSS_DEDUP_MIN_SIM <= sim <= config.CROSS_DEDUP_MAX_SIM:
+                pairs.append((sim, a, b))
+    pairs.sort(key=lambda p: -p[0])
+    pairs = pairs[: config.CROSS_DEDUP_MAX_PAIRS]
+    log(f"{len(pairs)} cross-clip candidate pair(s) for dedup_judge")
+
+    agent = get_agent("dedup_judge")
+    autocut: set[str] = set()
+    suggestions: list[dict] = []
+    for _sim, a, b in pairs:
+        if a["id"] in autocut or b["id"] in autocut:
+            continue
+        a_ctx = _neighbor_context(by_clip[a["clip_id"]], idx_by_id[a["id"]])
+        b_ctx = _neighbor_context(by_clip[b["clip_id"]], idx_by_id[b["id"]])
+        prompt = (
+            f'Video topic: "{topic}"\n\n'
+            f'Context before A: "{a_ctx}"\n'
+            f'A: "{a["text"]}"\n\n'
+            f'Context before B: "{b_ctx}"\n'
+            f'B: "{b["text"]}"'
+        )
+        try:
+            result = agent.run_sync(prompt).output
+        except Exception as exc:
+            log(f"dedup_judge failed for a pair, skipping: {exc}")
+            continue
+        if not result.same_content:
+            continue
+        loser = b if result.keep == "a" else a
+        if result.confidence >= config.CROSS_DEDUP_AUTOCUT_CONFIDENCE:
+            autocut.add(loser["id"])
+        elif result.confidence >= config.CROSS_DEDUP_SUGGEST_CONFIDENCE:
+            suggestions.append(
+                {
+                    "id": uuid.uuid4().hex[:8],
+                    "kind": "redundant",
+                    "sentence_ids": [a["id"], b["id"]],
+                    "message": (result.reason or "possible duplicate content across clips")[:300],
+                    "proposed_action": "cut",
+                    "status": "open",
+                }
+            )
+    return autocut, suggestions
+
+
 def _llm_tiebreak(candidates: list[dict]) -> str | None:
     """Ask the take-judge agent which near-tied take reads best. Returns
     sentence id or None."""
@@ -194,12 +328,20 @@ def run(log, project: dict) -> None:
             wavs[clip["id"]] = ffmpeg_utils.load_wav_mono(clip["wav"])
         log(f"{clip['filename']}: {len(sents)} sentences")
 
-    # LLM pass BEFORE fuzzy dedup: catch restart markers / abandoned takes
-    # retaken with different wording / meta-asides that string-similarity
-    # dedup below can't see. Fail-open, skipped entirely when ollama is down.
+    # LLM passes BEFORE fuzzy dedup: catch restart markers / abandoned takes /
+    # bloopers retaken with different wording / meta-asides that
+    # string-similarity dedup below can't see. Fail-open, skipped entirely
+    # when ollama is down.
+    topic = ""
     cleaner_cut_ids: set[str] = set()
+    context_cut_ids: set[str] = set()
     if llm.available():
-        log("Running transcript cleaner (restarts / abandoned takes)...")
+        log("Summarizing video topic...")
+        topic = _compute_topic(log, sentences)
+        if topic:
+            log(f"Topic: {topic}")
+
+        log("Running transcript cleaner (restarts / abandoned takes / bloopers)...")
         by_clip: dict[str, list[dict]] = {}
         for s in sentences:
             by_clip.setdefault(s["clip_id"], []).append(s)
@@ -207,8 +349,16 @@ def run(log, project: dict) -> None:
             cleaner_cut_ids |= _transcript_cleanup(log, clip_sentences)
         if cleaner_cut_ids:
             log(f"transcript cleaner flagged {len(cleaner_cut_ids)} sentence(s)")
+
+        if topic:
+            log("Running context pass (out-of-context asides)...")
+            for clip_sentences in by_clip.values():
+                context_cut_ids |= _context_check_clip(log, clip_sentences, cleaner_cut_ids, topic)
+            if context_cut_ids:
+                log(f"context pass flagged {len(context_cut_ids)} sentence(s)")
     else:
         log("transcript cleaner skipped (ollama unavailable)")
+    project["topic"] = topic
 
     # Cluster near-duplicate sentences (repeated takes), greedy by similarity.
     log("Detecting repeated takes...")
@@ -261,17 +411,48 @@ def run(log, project: dict) -> None:
                 )
 
     # Apply the transcript-cleaner verdicts (restart markers / abandoned
-    # takes / meta-asides) — after scoring/dedup so nothing re-flips them.
+    # takes / bloopers, then out-of-context asides) — after scoring/dedup so
+    # nothing re-flips them.
     for s in sentences:
         if s["id"] in cleaner_cut_ids:
             s["kept"] = False
             s["reason"] = "restart/abandoned take (AI)"
+        elif s["id"] in context_cut_ids:
+            s["kept"] = False
+            s["reason"] = "out-of-context aside (AI)"
 
     # Drop tiny fragments that survived (interjections, aborted starts).
     for s in sentences:
         if s["kept"] and len(norm[s["id"]].split()) < 3 and (s["end"] - s["start"]) < 1.2:
             s["kept"] = False
             s["reason"] = "fragment / aborted start"
+
+    # Cross-clip semantic dedup with auto-cut (v4 section 1): runs AFTER
+    # per-clip cleaning, on top of whatever is still kept.
+    new_suggestions: list[dict] = []
+    if llm.available():
+        log("Running cross-clip duplicate check...")
+        dedup_autocut, new_suggestions = _cross_clip_dedup(log, sentences, topic)
+        if dedup_autocut:
+            for s in sentences:
+                if s["id"] in dedup_autocut and s["kept"]:
+                    s["kept"] = False
+                    s["reason"] = "duplicate content across clips (AI)"
+            log(f"cross-clip dedup auto-cut {len(dedup_autocut)} sentence(s)")
+        if new_suggestions:
+            log(f"cross-clip dedup added {len(new_suggestions)} suggestion(s)")
+    else:
+        log("cross-clip dedup skipped (ollama unavailable)")
+
+    if new_suggestions:
+        existing = project.get("suggestions", [])
+        existing_keys = {(x["kind"], tuple(sorted(x["sentence_ids"]))) for x in existing}
+        deduped_new = [
+            x
+            for x in new_suggestions
+            if (x["kind"], tuple(sorted(x["sentence_ids"]))) not in existing_keys
+        ]
+        project["suggestions"] = existing + deduped_new
 
     for s in sentences:
         s.pop("words", None)  # words stay in the clip transcript; keep project.json light

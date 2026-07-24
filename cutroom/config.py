@@ -28,6 +28,16 @@ SYNC_MIN_CORR = 0.55  # normalized correlation to consider two clips simultaneou
 DUP_SIMILARITY = 82  # rapidfuzz token_sort_ratio threshold (0-100)
 DUP_MIN_WORDS = 4
 
+# Cross-clip semantic dedup (dedup_judge, v4)
+CROSS_DEDUP_MIN_SIM = 55  # rapidfuzz token_set_ratio floor to consider a candidate pair
+CROSS_DEDUP_MAX_SIM = 100
+CROSS_DEDUP_MAX_PAIRS = 40  # cap on candidate pairs sent to the LLM per takes run
+CROSS_DEDUP_AUTOCUT_CONFIDENCE = 4  # >= this + same_content -> auto-cut
+CROSS_DEDUP_SUGGEST_CONFIDENCE = 2  # >= this (and < autocut) -> open suggestion
+
+# Video topic summary (v4)
+TOPIC_INPUT_CHARS = 3000  # truncate full transcript to ~this many chars for video_topic
+
 # Rendering
 RENDER_CRF = 18
 RENDER_PRESET = "veryfast"

@@ -1,8 +1,12 @@
-/* Color-filter panel (spec: "Color filters"). Preset chips + 4 sliders
-   (brightness/contrast/saturation/temperature, -1..1) + a live before/after
-   preview pair against the first camera clip at t=25% duration, debounced
-   300ms, plus Apply/Save persisting project["color"] via
-   PUT /api/projects/{pid}/color.
+/* Color-filter panel (spec: "Color filters"; v4 §4 removed the old
+   side-by-side before/after <img> preview — that job now belongs to the
+   draggable on-viewer comparison divider, ui/editor/compare.js, which mounts
+   over #player-stage while the inspector's Color tab is active). This panel
+   is just preset chips + 4 sliders (brightness/contrast/saturation/
+   temperature, -1..1) plus Save, persisting project["color"] via
+   PUT /api/projects/{pid}/color. Every change (before saving) is forwarded
+   live to window.EditorUI.compare.setLiveConfig() so the divider updates
+   instantly as the user drags — a no-op if the overlay isn't mounted.
 
    Exposes window.ColorPanel.render(container, project, refresh) — project
    and refresh are optional and fall back to the global state/refreshProject
@@ -26,8 +30,8 @@ function _colorDefaults(project) {
   };
 }
 
-function _colorPreviewClip(project) {
-  return project.clips.find((c) => c.role === "camera" && c.info?.has_video);
+function _pushLiveColor(cfg) {
+  try { window.EditorUI?.compare?.setLiveConfig(cfg); } catch (e) { console.error("compare live update failed", e); }
 }
 
 window.ColorPanel = window.ColorPanel || {
@@ -37,13 +41,12 @@ window.ColorPanel = window.ColorPanel || {
     if (!container || !project) return;
 
     const cfg = _colorDefaults(project);
-    const clip = _colorPreviewClip(project);
 
     container.innerHTML = `
       <div class="card">
         <b>Color grading</b>
-        <div class="hint">Pick a preset and fine-tune with the sliders — the preview updates live.</div>
-        ${!clip ? '<div class="dim">Add a camera clip to preview color filters.</div>' : `
+        <div class="hint">Pick a preset and fine-tune with the sliders — open the viewer's before/after
+          divider (this tab) to see it live; the exact look comes from the rendered preview.</div>
         <div class="row" id="color-presets" style="margin:10px 0">
           ${COLOR_PRESETS.map(([key, label]) => `
             <button class="btn small color-preset ${cfg.preset === key ? "primary" : ""}"
@@ -59,47 +62,20 @@ window.ColorPanel = window.ColorPanel || {
                 step="0.05" value="${cfg[key]}" style="width:100%">
             </div>`).join("")}
         </div>
-        <div class="row" style="gap:20px;align-items:flex-start">
-          <div>
-            <div class="dim" style="margin-bottom:4px">Before</div>
-            <img id="color-before" style="max-width:280px;width:100%;border-radius:10px;background:#000;display:block" />
-          </div>
-          <div>
-            <div class="dim" style="margin-bottom:4px">After</div>
-            <img id="color-after" style="max-width:280px;width:100%;border-radius:10px;background:#000;display:block" />
-          </div>
-        </div>
-        <div class="row" style="margin-top:12px">
+        <div class="row">
           <button class="btn primary" id="color-save">Save</button>
           <span id="color-feedback" class="dim"></span>
         </div>
-        `}
       </div>`;
 
-    if (!clip) return;
-
-    const t = (clip.info.duration || 1) * 0.25;
-    const beforeUrl = `/api/projects/${project.id}/preview-frame?clip_id=${clip.id}&t=${t}&preset=none`;
-    let debounceTimer = null;
-
-    const updateAfter = () => {
-      const q = new URLSearchParams({
-        clip_id: clip.id, t: String(t), preset: cfg.preset,
-        brightness: String(cfg.brightness), contrast: String(cfg.contrast),
-        saturation: String(cfg.saturation), temperature: String(cfg.temperature),
-      });
-      $("#color-after").src = `/api/projects/${project.id}/preview-frame?${q.toString()}&_=${Date.now()}`;
-    };
-
-    $("#color-before").src = `${beforeUrl}&_=${Date.now()}`;
-    updateAfter();
+    _pushLiveColor(cfg);
 
     document.querySelectorAll(".color-preset").forEach((btn) => {
       btn.onclick = () => {
         cfg.preset = btn.dataset.preset;
         document.querySelectorAll(".color-preset").forEach((b) =>
           b.classList.toggle("primary", b === btn));
-        updateAfter();
+        _pushLiveColor(cfg);
       };
     });
 
@@ -108,8 +84,7 @@ window.ColorPanel = window.ColorPanel || {
         const key = input.dataset.key;
         cfg[key] = Number(input.value);
         $(`#color-val-${key}`).textContent = cfg[key];
-        clearTimeout(debounceTimer);
-        debounceTimer = setTimeout(updateAfter, 300);
+        _pushLiveColor(cfg);
       };
     });
 

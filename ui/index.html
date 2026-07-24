@@ -23,10 +23,11 @@
     </div>
     <div id="stage-bar" class="stage-bar"></div>
     <button id="run-all-btn" class="btn primary run-all-btn" hidden>✦ Run pipeline</button>
+    <button id="queue-badge" class="btn small queue-badge" hidden title="Open Queue">🧵 Queue <span id="queue-badge-count">0</span></button>
     <div class="rail" id="icon-rail">
       <button class="rail-btn" data-tab="takes" title="Takes">🎬<span>Takes</span></button>
       <button class="rail-btn" data-tab="reels" title="Reels">📱<span>Reels</span></button>
-      <button class="rail-btn" data-tab="jobs" title="Activity">🕒<span>Activity</span></button>
+      <button class="rail-btn" data-tab="jobs" title="Queue">🧵<span>Queue</span></button>
     </div>
   </header>
 
@@ -52,7 +53,7 @@
           placeholder="…or paste absolute file/folder paths, comma separated, Enter">
         <div id="media-bin-list" class="bin-list"></div>
         <div class="bin-footer row">
-          <button class="icon-btn" id="settings-gear" data-tab="settings" title="Settings">⚙️</button>
+          <button class="icon-btn" id="settings-gear" title="Settings">⚙️</button>
           <div id="health" class="health"></div>
         </div>
       </aside>
@@ -110,8 +111,7 @@
         <nav class="drawer-tabs">
           <button data-tab="takes" class="tab">Takes</button>
           <button data-tab="reels" class="tab">Reels</button>
-          <button data-tab="settings" class="tab">Settings</button>
-          <button data-tab="jobs" class="tab">Activity</button>
+          <button data-tab="jobs" class="tab">Queue</button>
         </nav>
         <span class="grow"></span>
         <button class="btn small" id="drawer-close">✕ Close</button>
@@ -119,10 +119,14 @@
       <div class="drawer-body">
         <section id="tab-takes" class="tabpane"></section>
         <section id="tab-reels" class="tabpane" hidden></section>
-        <section id="tab-settings" class="tabpane" hidden></section>
         <section id="tab-jobs" class="tabpane" hidden></section>
       </div>
     </div>
+  </div>
+
+  <div id="settings-overlay" class="settings-overlay" hidden>
+    <button class="btn small settings-close" id="settings-close" title="Close (Esc)">✕ Close</button>
+    <div id="tab-settings" class="settings-page"></div>
   </div>
 
 </div>
@@ -133,10 +137,13 @@
 <script src="/ui/tabs/settings.js"></script>
 <script src="/ui/panels/color.js"></script>
 <script src="/ui/panels/audio.js"></script>
+<script src="/ui/panels/subtitles.js"></script>
+<script src="/ui/panels/fx.js"></script>
 <script src="/ui/editor/state.js"></script>
 <script src="/ui/editor/mediabin.js"></script>
 <script src="/ui/editor/player.js"></script>
 <script src="/ui/editor/timeline.js"></script>
+<script src="/ui/editor/compare.js"></script>
 <script src="/ui/editor/inspector.js"></script>
 <script src="/ui/editor/suggestions.js"></script>
 <script src="/ui/fx.js"></script>

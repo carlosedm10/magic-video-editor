@@ -41,9 +41,40 @@ def new_project(name: str) -> dict:
     return project
 
 
-def save(project: dict) -> None:
+def save(project: dict, *, preserve_queue: bool = True) -> None:
+    """Persist `project`. By default, re-merges whatever "queue" currently
+    holds ON DISK into what we're about to write.
+
+    Why: store.save() is called from dozens of sites across the pipeline
+    stages and API endpoints, usually holding an in-memory `project`
+    snapshot loaded once at the start of a (sometimes multi-minute)
+    operation. cutroom/queue.py's project["queue"] is meanwhile mutated
+    out-of-band (new items enqueued, cancelled, reordered, job_id/status
+    updates) via its OWN fresh load-mutate-save cycles on the SAME
+    project.json. Every plain store.save(project) from a long-running
+    caller was silently overwriting project["queue"] with its own stale
+    (pre-mutation) copy, permanently losing whatever queue.py had written
+    in the meantime -- reproduced live: an item enqueued while a `run-all`
+    stage was executing vanished the instant that stage's next internal
+    store.save() landed, and the run-all item's own job_id (set by
+    queue.py moments after starting it) got reverted to null the same way.
+    Only cutroom.queue itself should ever intentionally overwrite this
+    field, so its call sites pass preserve_queue=False.
+
+    This narrows the race to the (non-atomic-with-queue.py's own
+    _state_lock) read-then-write window here -- microseconds, not the
+    minutes-long window before this fix -- rather than eliminating it
+    outright, which would need a shared lock/merge scheme across both
+    modules; flagged as a residual risk, not attempted here."""
     with _lock:
         path = _pfile(project["id"])
+        if preserve_queue and path.exists():
+            try:
+                on_disk_queue = json.loads(path.read_text()).get("queue")
+                if on_disk_queue is not None:
+                    project["queue"] = on_disk_queue
+            except Exception:
+                pass
         tmp = path.with_suffix(".tmp")
         tmp.write_text(json.dumps(project, indent=1))
         tmp.replace(path)

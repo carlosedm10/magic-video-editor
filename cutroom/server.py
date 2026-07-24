@@ -5,15 +5,29 @@ in api/projects.py, stage-running endpoints in api/pipeline.py."""
 
 import atexit
 import shutil
+import subprocess
+import sys
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse, Response, StreamingResponse
+from pydantic import BaseModel
 
-from . import config, ffmpeg_utils, llm, store
-from .api import audio, edl, filters, pipeline, projects, settings, suggestions
+from . import __version__, config, ffmpeg_utils, llm, store
+from .api import (
+    audio,
+    edl,
+    filters,
+    ollama,
+    pipeline,
+    projects,
+    settings,
+    subtitles,
+    suggestions,
+    thumbs,
+)
 
-app = FastAPI(title="CutRoom")
+app = FastAPI(title="Magic Video Editor")
 UI_DIR = Path(__file__).parent.parent / "ui"
 
 app.include_router(projects.router)
@@ -23,6 +37,9 @@ app.include_router(audio.router)
 app.include_router(filters.router)
 app.include_router(edl.router)
 app.include_router(suggestions.router)
+app.include_router(ollama.router)
+app.include_router(subtitles.router)
+app.include_router(thumbs.router)
 
 
 # ---------- UI ----------
@@ -48,12 +65,35 @@ def ui_asset(path: str):
 @app.get("/api/health")
 def health():
     return {
+        "name": "Magic Video Editor",
+        "version": __version__,
+        "by": "carlosedm10",
         "ffmpeg": shutil.which("ffmpeg") is not None,
         "ollama": llm.available(),
         "model": config.OLLAMA_MODEL,
         "whisper": config.WHISPER_MODEL,
         "data_dir": str(config.DATA_DIR),
     }
+
+
+# ---------- folder open (Settings > General "Open folder", v4 section 5) ----------
+
+
+class OpenFolderRequest(BaseModel):
+    path: str
+
+
+@app.post("/api/open-folder")
+def open_folder(body: OpenFolderRequest):
+    home = Path.home().resolve()
+    target = Path(body.path).expanduser().resolve()
+    if not (target == home or target.is_relative_to(home)):
+        raise HTTPException(400, "path must be inside the user's home directory")
+    target.mkdir(parents=True, exist_ok=True)
+    if sys.platform != "darwin":
+        raise HTTPException(400, "opening a folder is only supported on macOS")
+    subprocess.run(["open", str(target)], check=True)
+    return {"ok": True}
 
 
 # ---------- media streaming (Range-aware for <video> seeking) ----------

@@ -4,7 +4,13 @@
    tab (docs/PLATFORM-SPEC.md v3, "Ingestion model: camera groups"). The
    static controls (buttons, paste-path input) are wired once; render() only
    rebuilds the clip list itself, so typing in the paste-path box or button
-   state never gets clobbered by an unrelated refreshProject() tick. */
+   state never gets clobbered by an unrelated refreshProject() tick.
+
+   Clips are HTML5-draggable (spec v4 §4 "Media bin: clips draggable INTO
+   the timeline") — ui/editor/timeline.js is the drop target and inserts a
+   full-clip segment at the drop index via Editor.insertClip(). The MIME
+   type "application/x-mve-clip" (clip id as payload) is this app's own,
+   private contract between the two files. */
 
 window.EditorUI = window.EditorUI || {};
 
@@ -40,8 +46,11 @@ window.EditorUI.mediabin = {
             <span class="grow"></span>
             <span class="dim">${clips.length}</span>
           </div>
-          ${clips.map((c) => `
-            <div class="bin-clip row" data-clip="${c.id}">
+          ${clips.map((c) => {
+            const draggable = c.info?.duration > 0;
+            return `
+            <div class="bin-clip row" data-clip="${c.id}" ${draggable ? 'draggable="true"' : ""}
+              title="${draggable ? "Drag onto the timeline to append this clip" : ""}">
               <span class="bin-clip-name grow" title="${esc(c.filename)}">${esc(c.filename)}</span>
               <span class="dim mono">${c.info ? fmtT(c.info.duration) : "…"}</span>
               ${this._proxyTag(c)}
@@ -49,11 +58,20 @@ window.EditorUI.mediabin = {
                 title="${c.role === "camera" ? "Switch to audio-only" : "Switch to camera"}">
                 ${c.role === "camera" ? "🎥" : "🎙"}</button>
               <button class="icon-btn danger" data-del="${c.id}" title="Remove">✕</button>
-            </div>`).join("")}
+            </div>`;
+          }).join("")}
         </div>`;
     }).join("") ||
       '<div class="dim" style="padding:8px 4px">No clips yet — add files or a folder above.'
       + ' A folder becomes one camera group.</div>';
+
+    list.querySelectorAll(".bin-clip[draggable]").forEach((el) => {
+      el.addEventListener("dragstart", (e) => {
+        e.dataTransfer.effectAllowed = "copy";
+        e.dataTransfer.setData("application/x-mve-clip", el.dataset.clip);
+        e.dataTransfer.setData("text/plain", el.dataset.clip);
+      });
+    });
 
     list.querySelectorAll("[data-main-group]").forEach((el) => el.onclick = async () => {
       await api(`/projects/${project.id}/groups/${encodeURIComponent(el.dataset.mainGroup)}/main`, { method: "POST" });

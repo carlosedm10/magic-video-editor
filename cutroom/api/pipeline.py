@@ -1,10 +1,18 @@
 """Stage-running endpoints: individual pipeline stages, the all-in-one
-run-all job, reel rendering, and job status polling."""
+run-all job, reel rendering, the job queue, and job status polling.
+
+Actually running a stage/run-all/reel-render is delegated to cutroom.queue:
+this module's *_kind functions are the KIND_RUNNERS registered for
+"stage:*", "run-all" and "reel_render:*" respectively (registered at import
+time, at the bottom of this file), and the HTTP endpoints below just
+enqueue + return the queue item -- the queue's one-item-per-project rule
+replaces the old per-endpoint 409 (JobBusyError) guard."""
 
 from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel
 
-from .. import jobs, store
-from ..jobs import JobBusyError, JobCancelled
+from .. import jobs, queue, store
+from ..jobs import JobCancelled
 from ..pipeline import ingest, ordering, reels, render, review, sync, takes, transcribe
 
 router = APIRouter(prefix="/api", tags=["pipeline"])
@@ -34,43 +42,38 @@ STAGE_LABELS = {
 }
 
 
-def _busy(e: JobBusyError) -> HTTPException:
-    return HTTPException(
-        409,
-        detail={"message": "a job is already running for this project", "job": e.job_id},
-    )
+# --------------------------------------------------------------------------
+# KIND_RUNNERS: callable(log, project, payload) registered into cutroom.queue
+# --------------------------------------------------------------------------
 
 
-@router.post("/projects/{pid}/run/{stage}")
-def run_stage(pid: str, stage: str):
+def _run_stage_kind(log, project: dict, payload: dict) -> None:
+    """Runner for queue kind "stage:<name>". Accepts stage either explicitly
+    in payload["stage"] (what run_stage() below sends) or implicitly from
+    the kind's suffix via payload["_kind"] (queue.py always injects this —
+    covers callers that hit the generic POST .../queue endpoint with just
+    {"kind": "stage:ingest"} and no payload)."""
+    stage = payload.get("stage") or payload["_kind"].split(":", 1)[1]
     if stage not in STAGES:
-        raise HTTPException(400, f"unknown stage {stage}")
-    project = store.load(pid)
+        raise RuntimeError(f"unknown stage {stage}")
     fn = STAGES[stage]
-
-    def task(log, project=project, stage=stage):
-        try:
-            fn(log, project)
-            store.mark_stage(project, stage, "done")
-        except JobCancelled:
-            store.mark_stage(project, stage, "error", "cancelled")
-            raise
-        except Exception as e:
-            store.mark_stage(project, stage, "error", str(e)[:300])
-            raise
-
     try:
-        return {"job": jobs.start(f"{stage}:{pid}", task, lock_key=pid)}
-    except JobBusyError as e:
-        raise _busy(e) from e
+        fn(log, project)
+        store.mark_stage(project, stage, "done")
+    except JobCancelled:
+        store.mark_stage(project, stage, "error", "cancelled")
+        raise
+    except Exception as e:
+        store.mark_stage(project, stage, "error", str(e)[:300])
+        raise
 
 
 class _StageLogProxy:
-    """Wraps the job's JobLog so a stage's own log.progress() calls update
-    both that stage's entry in job['stages'] (via JobLog.stage) and the
-    overall run-all job progress: (completed_stages + stage_frac) / total."""
+    """Wraps the queue item's log so a stage's own log.progress() calls
+    update both that stage's entry in job["stages"] (via JobLog.stage) and
+    the overall run-all job progress: (completed_stages + stage_frac) / total."""
 
-    def __init__(self, log: jobs.JobLog, stage: str, index: int, total: int):
+    def __init__(self, log, stage: str, index: int, total: int):
         self._log = log
         self._stage = stage
         self._index = index
@@ -85,63 +88,113 @@ class _StageLogProxy:
         self._log.progress((self._index + frac) / self._total)
 
 
+def _run_all_kind(log, project: dict, payload: dict) -> None:
+    """Runner for queue kind "run-all": every stage in order. A failure in
+    the final (reels) stage is reported but does not fail the item — any
+    earlier failure stops the run and errors it, same as a single stage."""
+    total = len(STAGE_ORDER)
+    for name in STAGE_ORDER:
+        log.stage(name, status="pending", progress=0.0)
+    for i, stage in enumerate(STAGE_ORDER):
+        fn = STAGES[stage]
+        log(f"--- {STAGE_LABELS.get(stage, stage)} ---")
+        log.stage(stage, status="running", progress=0.0)
+        proxy = _StageLogProxy(log, stage, i, total)
+        try:
+            fn(proxy, project)
+            store.mark_stage(project, stage, "done")
+            log.stage(stage, status="done", progress=1.0)
+            log.progress((i + 1) / total)
+        except JobCancelled:
+            store.mark_stage(project, stage, "error", "cancelled")
+            log.stage(stage, status="error", progress=1.0)
+            raise
+        except Exception as e:
+            store.mark_stage(project, stage, "error", str(e)[:300])
+            log.stage(stage, status="error", progress=1.0)
+            log(f"{stage} failed: {e}")
+            if stage == "reels":
+                # Last stage, non-critical: finish the run-all item as
+                # successful even though reels errored.
+                log.progress(1.0)
+                return
+            raise
+
+
+def _run_reel_kind(log, project: dict, payload: dict) -> None:
+    """Runner for queue kind prefix "reel_render:*" (e.g. "reel_render:ab12cd34").
+    Same explicit-or-from-kind fallback as _run_stage_kind above."""
+    rid = payload.get("reel_id") or payload["_kind"].split(":", 1)[1]
+    reels.render_reel(log, project, rid)
+
+
+queue.register_runner("stage:*", _run_stage_kind)
+queue.register_runner("run-all", _run_all_kind)
+queue.register_runner("reel_render:*", _run_reel_kind)
+
+
+# --------------------------------------------------------------------------
+# HTTP endpoints
+# --------------------------------------------------------------------------
+
+
+class ReorderBody(BaseModel):
+    ids: list[str]
+
+
+class EnqueueBody(BaseModel):
+    kind: str
+    payload: dict = {}
+
+
+@router.post("/projects/{pid}/run/{stage}")
+def run_stage(pid: str, stage: str):
+    if stage not in STAGES:
+        raise HTTPException(400, f"unknown stage {stage}")
+    store.load(pid)  # raises if the project doesn't exist
+    item = queue.enqueue(pid, f"stage:{stage}", {"stage": stage})
+    return {"item": item}
+
+
 @router.post("/projects/{pid}/run-all")
 def run_all(pid: str):
-    """One background job running every stage in order. A failure in the
-    final (reels) stage is reported but does not fail the job — any earlier
-    failure stops the run and errors the job, same as today's per-stage run."""
-    project = store.load(pid)
-
-    def task(log, project=project):
-        total = len(STAGE_ORDER)
-        for name in STAGE_ORDER:
-            log.stage(name, status="pending", progress=0.0)
-        for i, stage in enumerate(STAGE_ORDER):
-            fn = STAGES[stage]
-            log(f"--- {STAGE_LABELS.get(stage, stage)} ---")
-            log.stage(stage, status="running", progress=0.0)
-            proxy = _StageLogProxy(log, stage, i, total)
-            try:
-                fn(proxy, project)
-                store.mark_stage(project, stage, "done")
-                log.stage(stage, status="done", progress=1.0)
-                log.progress((i + 1) / total)
-            except JobCancelled:
-                store.mark_stage(project, stage, "error", "cancelled")
-                log.stage(stage, status="error", progress=1.0)
-                raise
-            except Exception as e:
-                store.mark_stage(project, stage, "error", str(e)[:300])
-                log.stage(stage, status="error", progress=1.0)
-                log(f"{stage} failed: {e}")
-                if stage == "reels":
-                    # Last stage, non-critical: finish the run-all job as
-                    # successful even though reels errored.
-                    log.progress(1.0)
-                    return
-                raise
-
-    try:
-        return {"job": jobs.start(f"run-all:{pid}", task, lock_key=pid)}
-    except JobBusyError as e:
-        raise _busy(e) from e
+    store.load(pid)
+    item = queue.enqueue(pid, "run-all", {})
+    return {"item": item}
 
 
 @router.post("/projects/{pid}/reels/{rid}/render")
 def reel_render(pid: str, rid: str):
-    project = store.load(pid)
-    # Same per-project lock as run/{stage} and run-all: without it, a reel
-    # render can race a concurrent pipeline job's store.save() on the same
-    # project.json (last-write-wins), the same class of bug as two servers
-    # sharing a project directory.
-    try:
-        return {
-            "job": jobs.start(
-                f"reel:{rid}", lambda log: reels.render_reel(log, project, rid), lock_key=pid
-            )
-        }
-    except JobBusyError as e:
-        raise _busy(e) from e
+    store.load(pid)
+    item = queue.enqueue(pid, f"reel_render:{rid}", {"reel_id": rid})
+    return {"item": item}
+
+
+@router.post("/projects/{pid}/queue")
+def queue_enqueue(pid: str, body: EnqueueBody):
+    store.load(pid)
+    item = queue.enqueue(pid, body.kind, body.payload)
+    return {"item": item}
+
+
+@router.get("/projects/{pid}/queue")
+def queue_list(pid: str):
+    store.load(pid)
+    return {"queue": queue.list_queue(pid)}
+
+
+@router.delete("/projects/{pid}/queue/{item_id}")
+def queue_cancel(pid: str, item_id: str):
+    store.load(pid)
+    if not queue.cancel_item(pid, item_id):
+        raise HTTPException(404, "queue item not found or already finished")
+    return {"status": "ok"}
+
+
+@router.post("/projects/{pid}/queue/reorder")
+def queue_reorder(pid: str, body: ReorderBody):
+    store.load(pid)
+    return {"queue": queue.reorder(pid, body.ids)}
 
 
 @router.get("/jobs/{jid}")

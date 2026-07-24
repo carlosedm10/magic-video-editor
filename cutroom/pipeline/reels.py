@@ -8,7 +8,7 @@ import uuid
 
 from .. import config, ffmpeg_utils, llm, store
 from ..agents.agents import get_agent
-from . import audio_enhance, faces, filters
+from . import audio_enhance, faces, filters, subtitles
 
 
 def _candidate_windows(project: dict) -> list[dict]:
@@ -123,49 +123,15 @@ def suggest(log, project: dict) -> None:
     log(f"Suggested {len(picked)} reels (from {len(scored)} scored candidates).")
 
 
-ASS_HEADER = f"""[Script Info]
-ScriptType: v4.00+
-PlayResX: {config.REEL_W}
-PlayResY: {config.REEL_H}
-WrapStyle: 0
-
-[V4+ Styles]
-Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, \
-BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, \
-BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: Default,Helvetica,74,&H00FFFFFF,&H00FFFFFF,&H80000000,&H00000000,\
--1,0,0,0,100,100,0,0,1,4,0,2,60,60,140,1
-
-[Events]
-Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
-"""
-
-
-def _ass_for_window(clip: dict, start: float, end: float, ass_path: str) -> None:
-    """Karaoke-ish subtitles: cues of ~4 words from whisper word timestamps,
-    re-based to the reel's local time. .ass so styling needs no filter quoting."""
-    words = []
-    for seg in clip["transcript"]["segments"]:
-        words.extend(w for w in seg["words"] if start <= w["s"] < end)
-
-    def ts(t: float) -> str:
-        t = max(0.0, t - start)
-        h, rem = divmod(t, 3600)
-        m, s = divmod(rem, 60)
-        return f"{int(h)}:{int(m):02d}:{int(s):02d}.{int((s % 1) * 100):02d}"
-
-    events, cue = [], []
-    for i, w in enumerate(words):
-        cue.append(w)
-        nxt_gap = words[i + 1]["s"] - w["e"] if i + 1 < len(words) else 99
-        if len(cue) >= 4 or nxt_gap > 0.6:
-            text = " ".join(x["w"] for x in cue).replace("\n", " ")
-            events.append(
-                f"Dialogue: 0,{ts(cue[0]['s'])},{ts(cue[-1]['e'])},Default,,0,0,0,,{text}"
-            )
-            cue = []
-    with open(ass_path, "w") as f:
-        f.write(ASS_HEADER + "\n".join(events) + "\n")
+# The reel ASS generator now lives in cutroom/pipeline/subtitles.py, shared
+# with final/preview render. Default project["subtitles"] config (style
+# "clean", 4 words/cue, PlayRes = the reel's own W/H) reproduces the exact
+# look of the old hardcoded ASS_HEADER/_ass_for_window below, so reels keep
+# their default appearance; a project can still opt into "bold"/"karaoke" or
+# a different words_per_cue via the Subtitles inspector tab.
+def _ass_for_window(clip: dict, start: float, end: float, ass_path: str, project: dict) -> None:
+    cfg = subtitles.normalize_config(project.get("subtitles"))
+    subtitles.write_ass(ass_path, clip, start, end, cfg, (config.REEL_W, config.REEL_H))
 
 
 def render_reel(log, project: dict, reel_id: str) -> None:
@@ -195,7 +161,7 @@ def render_reel(log, project: dict, reel_id: str) -> None:
     ass = None
     if ffmpeg_utils.supports_subtitles():
         ass = str(pdir / "work" / f"reel_{reel_id}.ass")
-        _ass_for_window(clip, reel["start"], reel["end"], ass)
+        _ass_for_window(clip, reel["start"], reel["end"], ass, project)
     else:
         log("ffmpeg has no libass — rendering without burned subtitles")
 

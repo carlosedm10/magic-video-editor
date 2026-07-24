@@ -27,6 +27,84 @@ function _setSaveState(text, isError) {
   el.style.color = isError ? "var(--danger)" : "";
 }
 
+/* ---------- manifest hash (spec v4 §3 render bar / preview-match) ----------
+   Mirrors cutroom/pipeline/render.py's _preview_manifest: sha256 hex[:16] of
+   json.dumps({edl, color, subtitles, audio_enhance}, sort_keys=True,
+   default=str). Two things a generic JSON.stringify would get wrong here:
+   (1) Python's default `json.dumps` separators are ", " and ": " (a space
+   after each), NOT JSON.stringify's compact ",%":"; get this wrong and every
+   hash mismatches even when the data is identical — verified byte-for-byte
+   against cutroom.pipeline.render._preview_manifest while building this.
+   (2) every numeric field in this payload that's declared Python `float`
+   (edl start/end/transition.duration, all four color sliders) serializes
+   with a trailing ".0" when integer-valued, vs plain ints for the one true
+   int field (subtitles.words_per_cue) — JS has one number type, so this
+   encodes the known shape field-by-field rather than walking it generically. */
+function _pyFloat(v) {
+  if (v === null || v === undefined) return "null";
+  const n = Number(v);
+  if (!Number.isFinite(n)) return "null";
+  return Number.isInteger(n) ? `${n}.0` : String(n);
+}
+function _pyInt(v) {
+  if (v === null || v === undefined) return "null";
+  return String(Math.trunc(Number(v)));
+}
+function _pyStr(v) {
+  return v === null || v === undefined ? "null" : JSON.stringify(String(v));
+}
+function _pyBool(v) {
+  return v === null || v === undefined ? "null" : (v ? "true" : "false");
+}
+function _pyEdlJson(edl) {
+  if (!edl) return "null";
+  return "[" + edl.map((s) => {
+    const tr = s.transition || { type: "none", duration: 0.5 };
+    return "{"
+      + `"clip_id": ${_pyStr(s.clip_id)}, `
+      + `"end": ${_pyFloat(s.end)}, `
+      + `"start": ${_pyFloat(s.start)}, `
+      + `"text": ${_pyStr(s.text || "")}, `
+      + `"transition": {"duration": ${_pyFloat(tr.duration)}, "type": ${_pyStr(tr.type)}}`
+      + "}";
+  }).join(", ") + "]";
+}
+function _pyColorJson(c) {
+  if (!c) return "null";
+  return "{"
+    + `"brightness": ${_pyFloat(c.brightness)}, `
+    + `"contrast": ${_pyFloat(c.contrast)}, `
+    + `"preset": ${_pyStr(c.preset)}, `
+    + `"saturation": ${_pyFloat(c.saturation)}, `
+    + `"temperature": ${_pyFloat(c.temperature)}`
+    + "}";
+}
+function _pySubtitlesJson(s) {
+  if (!s) return "null";
+  return "{"
+    + `"color": ${_pyStr(s.color)}, `
+    + `"enabled": ${_pyBool(s.enabled)}, `
+    + `"font": ${_pyStr(s.font)}, `
+    + `"outline_color": ${_pyStr(s.outline_color)}, `
+    + `"position": ${_pyStr(s.position)}, `
+    + `"size": ${_pyStr(s.size)}, `
+    + `"style": ${_pyStr(s.style)}, `
+    + `"words_per_cue": ${_pyInt(s.words_per_cue)}`
+    + "}";
+}
+function _manifestJson(payload) {
+  return "{"
+    + `"audio_enhance": ${_pyBool(payload.audio_enhance)}, `
+    + `"color": ${_pyColorJson(payload.color)}, `
+    + `"edl": ${_pyEdlJson(payload.edl)}, `
+    + `"subtitles": ${_pySubtitlesJson(payload.subtitles)}`
+    + "}";
+}
+async function _sha256Hex16(text) {
+  const buf = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text));
+  return [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, "0")).join("").slice(0, 16);
+}
+
 const Editor = {
   pid: null,
   segments: null,      // array of {_id, clip_id, start, end, text, transition}
@@ -51,8 +129,84 @@ const Editor = {
     this.history = [_cloneSegments(this.segments)];
     this.historyIndex = 0;
     this.dirty = false;
+    this._loadMarkers();
     _setSaveState("");
     this._notify();
+  },
+
+  /* ---------- markers (spec v4 §4 — "M adds a marker") ----------
+     No backend field fits (PUT /edl only accepts `segments`, and there's no
+     generic project PATCH endpoint) — kept client-side in localStorage per
+     project, per the brief's documented fallback. Integrator: a real
+     project["markers"] field + small PATCH endpoint would let these survive
+     a different machine/browser and show up for other viewers. */
+  markers: [],
+  _markersKey() { return `mve.markers.${this.pid}`; },
+  _loadMarkers() {
+    try { this.markers = JSON.parse(localStorage.getItem(this._markersKey()) || "[]"); }
+    catch (_e) { this.markers = []; }
+  },
+  _saveMarkers() {
+    try { localStorage.setItem(this._markersKey(), JSON.stringify(this.markers)); }
+    catch (_e) { /* storage full/unavailable — markers still work for this session */ }
+  },
+  addMarker(edlTime, label) {
+    this.markers.push({
+      id: `m${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`,
+      edl_t: Math.round(Math.max(0, edlTime) * 100) / 100,
+      label: label || "",
+    });
+    this.markers.sort((a, b) => a.edl_t - b.edl_t);
+    this._saveMarkers();
+    try { window.EditorUI.timeline?.renderMarkers?.(); } catch (e) { console.error(e); }
+  },
+  removeMarker(id) {
+    this.markers = this.markers.filter((m) => m.id !== id);
+    this._saveMarkers();
+    try { window.EditorUI.timeline?.renderMarkers?.(); } catch (e) { console.error(e); }
+  },
+
+  /* ---------- media-bin drag-drop (spec v4 §4 — "clips draggable onto the
+     timeline") ---------- */
+  insertClip(clipId, atIndex) {
+    const clip = this.clip(clipId);
+    const dur = clip?.info?.duration;
+    if (!dur || dur <= 0) return;
+    const seg = _withClientId({
+      clip_id: clipId, start: 0, end: dur, text: "",
+      transition: { type: "none", duration: 0.5 },
+    });
+    const segs = _cloneSegments(this.segments || []);
+    const idx = Math.max(0, Math.min(atIndex, segs.length));
+    segs.splice(idx, 0, seg);
+    this.commit(segs, { select: idx });
+  },
+
+  /* ---------- preview-render staleness (spec v4 §3 render bar) ----------
+     Uses the LIVE (possibly-unsaved) edit state for the edl part — if you're
+     mid-edit the backend doesn't know about it yet regardless of hash, so
+     that's the more correct "stale" signal than re-fetching project.edl. */
+  async computeManifestHash() {
+    const payload = {
+      edl: (this.segments || []).map((s) => ({
+        clip_id: s.clip_id, start: s.start, end: s.end, text: s.text || "",
+        transition: s.transition || { type: "none", duration: 0.5 },
+      })),
+      color: state.project?.color ?? null,
+      subtitles: state.project?.subtitles ?? null,
+      audio_enhance: state.project?.audio_enhance ?? null,
+    };
+    return _sha256Hex16(_manifestJson(payload));
+  },
+  async previewIsStale() {
+    const preview = state.project?.preview;
+    if (!preview?.manifest) return true;
+    try {
+      const hash = await this.computeManifestHash();
+      return hash !== preview.manifest;
+    } catch (_e) {
+      return true; // crypto.subtle unavailable or similar — default to "stale"
+    }
   },
 
   _pushHistory() {
@@ -250,4 +404,8 @@ window.EditorUI.onProjectRefreshed = function (project) {
   // (e.g. while a job is being polled).
   try { window.EditorUI.mediabin?.render(project); } catch (e) { console.error(e); }
   try { window.EditorUI.inspector?.renderColorAudio(); } catch (e) { console.error(e); }
+  // color/subtitles/audio_enhance/preview can all change here (inspector tabs,
+  // a completed preview_render job) — recheck render-bar + player-mode staleness.
+  try { window.EditorUI.timeline?.refreshRenderBar?.(); } catch (e) { console.error(e); }
+  try { window.EditorUI.player?.onProjectRefreshed?.(); } catch (e) { console.error(e); }
 };

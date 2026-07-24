@@ -62,10 +62,13 @@ def run(log, project: dict) -> None:
 
     from ..agents.agents import get_agent
 
+    topic = project.get("topic") or ""
+    topic_line = f'Video topic: "{topic}"\n\n' if topic else ""
+
     log(f"Asking the reviewer agent to check {len(id_map)} kept sentence(s)...")
     try:
         result = get_agent("reviewer").run_sync(
-            f"Full kept transcript, in narrative order, grouped by clip:\n{listing}"
+            f"{topic_line}Full kept transcript, in narrative order, grouped by clip:\n{listing}"
         ).output
     except Exception as e:
         log(f"Reviewer failed, skipping: {e}")

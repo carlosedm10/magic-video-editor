@@ -24,6 +24,39 @@ class TranscriptCleanup(BaseModel):
     reason: str = Field(default="", description="One-line rationale for the cuts")
 
 
+class VideoTopic(BaseModel):
+    """One-line topic summary of a video's transcript, used to judge whether a
+    sentence is an out-of-context aside. Flat and cheap on purpose — a small
+    model runs this once per clip batch."""
+
+    topic: str = Field(..., description="One short line describing what the video is about")
+
+
+class ContextCheck(BaseModel):
+    """Flat per-sentence judgement: does this sentence belong in a video
+    about the given topic? Cut only clear meta/out-of-context asides; keep
+    anything that is plausibly content, even if terse or plain."""
+
+    in_context: bool = Field(
+        ..., description="True if the sentence belongs in a video about the given topic"
+    )
+    reason: str = Field(default="", description="One-line rationale")
+
+
+class DedupJudge(BaseModel):
+    """Judges whether two sentences from DIFFERENT clips say the same thing,
+    and if so which one to keep. Flat schema, small-model friendly."""
+
+    same_content: bool = Field(
+        ..., description="True if both sentences convey the same content/idea"
+    )
+    keep: Literal["a", "b"] = Field(
+        ..., description="Which of the two sentences reads better and should be kept"
+    )
+    confidence: int = Field(..., ge=1, le=5, description="Confidence in this judgement, 1-5")
+    reason: str = Field(default="", description="One-line rationale")
+
+
 class ClipOrder(BaseModel):
     """Narrative order for separately recorded clips."""
 

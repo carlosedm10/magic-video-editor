@@ -203,3 +203,212 @@ ollama/model) sits next to it at the bottom.
 Opening the secondary views (Takes/Reels/Settings/Activity overlay/drawer) rendered an
 EMPTY panel. Integrator + UI verification must confirm each overlay actually mounts its
 module content (TABS.* renderers get a valid container) and Close restores the editor.
+
+---
+
+# v4 — Pro editor parity + AI coherence (owner direction 2026-07-24 late)
+
+Research base: FCP window anatomy (sidebar/browser left, viewer center, INSPECTOR with
+multiple tabs right, timeline with filmstrips+waveforms bottom), Premiere render bar +
+preview files + proxy workflow, standard timeline interactions (JKL, I/O, ripple delete,
+snapping, markers), CapCut auto-captions with style templates. Apply these patterns.
+
+## 1. AI coherence v2 (top priority — the cut still ships duplicates and bloopers)
+- **Cross-clip semantic dedup with AUTO-cut**: not all clips are good; several clips say
+  the same thing in different words. New pass in `takes` AFTER the per-clip cleaner:
+  candidate pairs = sentence pairs across DIFFERENT clips with fuzzy similarity 55–100 or
+  sharing rare keywords; agent task `dedup_judge` sees both sentences WITH 1 sentence of
+  surrounding context each and answers flat: {same_content: bool, keep: "a"|"b",
+  confidence: 1-5, reason}. confidence>=4 and same_content -> AUTO-cut the loser
+  (reason "duplicate content across clips (AI)"); confidence 2-3 -> create a suggestion
+  instead. Duplicates are allowed only when clearly rhetorical emphasis (the agent is
+  told this exception).
+- **Blooper hunt v2**: the cleaner must ALSO catch mistake-reaction comments and
+  out-of-context asides: "ay, me he equivocado", "otra vez", "esto no", "¿cómo se dice?",
+  "se me ha ido", "espera", laughing at oneself, greetings restarted mid-video, camera
+  checks. Give the cleaner the VIDEO TOPIC first (one-line summary produced by a cheap
+  agent call over the full transcript) so "out of context" is judgeable per sentence.
+  Two passes per clip: (1) restart/blooper pass (existing, expanded), (2) context pass
+  ("does this sentence belong in a video about <topic>?"). Stay conservative on content;
+  be AGGRESSIVE on meta-comments about the recording itself.
+- Verify against the REAL project c7642fc7755e transcripts (copy the project first,
+  work on the copy) and report precision/recall by hand-checking the decisions.
+
+## 2. Job queue (replace reject-with-409 for user actions)
+- New `cutroom/queue.py`: per-project FIFO persisted in project.json ("queue": [...]),
+  one global worker thread that executes queue items sequentially per project (parallel
+  across projects only within resource limits). Item kinds: stage:<name>, run-all,
+  preview_render, final_render, reel_render:<id>, proxies, thumbs.
+- API: POST enqueue (replaces direct run for UI), GET queue, DELETE queue item, POST
+  reorder. The old direct endpoints stay for compat but enqueue too.
+- **Auto-enqueue rules**: after run-all completes -> thumbs + top-5 reel renders; after
+  any EDL/color/subtitles/audio change -> debounced (5s) preview_render; ingest of new
+  clips -> proxies + thumbs. Everything respects the ffmpeg semaphore + RAM guard.
+- Activity view becomes **Queue**: pending/running/done items with cancel per item.
+
+## 3. Preview-render workflow (the pro pattern the owner described)
+- Timeline shows a Premiere-style **render bar** above the blocks: garnet/red = the
+  current EDL+effects differ from the last preview render; green = preview up to date.
+- `preview_render` job: 540p, crf 32, preset ultrafast, all effects INCLUDED (color,
+  transitions, subtitles, audio enhance) -> <project>/preview/preview.mp4 + a manifest
+  hash of (edl+color+subtitles+audio) it corresponds to.
+- Player gets a mode toggle: **Draft (virtual)** | **Preview (rendered)**. Auto-switch to
+  Preview when the manifest hash matches current state; fall back to Draft otherwise.
+  Draft mode approximates transitions live (CSS opacity crossfade between the two
+  stacked <video> elements at junctions; fade via to-black overlay) and shows subtitles
+  as a DOM overlay from transcript timings — no render needed.
+- final_render = existing render stage; writes to the export dir (see 5).
+
+## 4. Editor UX to pro parity
+- **Inspector (right) becomes TABBED like FCP**: tabs Video | Color | Audio | Subtitles |
+  FX | Ideas(suggestions). Icons + labels, garnet active underline. Video tab = segment
+  in/out/duration + per-junction transition. FX tab = transition defaults + (future)
+  effects list. Ideas = suggestions cards.
+- **Before/after comparison ON the viewer**: when the Color tab is active, a vertical
+  divider handle appears mid-viewer; left half shows original, right half shows graded
+  (CSS filter approximation live: brightness/contrast/saturate/sepia/hue-rotate mapped
+  from the color config; exact result comes from the preview render). Draggable divider.
+- **Timeline pro**: filmstrip thumbnails INSIDE blocks (backend sprite: 1 frame per ~2s
+  at 90px height per clip, generated by the thumbs job, drawn via background-position);
+  a thin audio waveform strip at block bottom (peaks json from thumbs job); snapping
+  (toggle, S) to playhead/edges; ripple delete (delete closes the gap — our EDL is
+  gapless so delete already ripples; label it); J/K/L shuttle (reverse not required:
+  K pause, L play/2x on repeat, J rewind-jump 2s), I/O set in/out trim of selected
+  segment at playhead; M adds a marker (stored in project, shown on ruler); render bar
+  strip (see 3).
+- **Media bin**: clips draggable INTO the timeline (drag = append segment of full clip
+  at drop position). Projects stay in the top switcher.
+- Keep keyboard map visible via a small "?" shortcuts popover.
+
+## 5. Settings = full-screen page (NOT a drawer)
+- Full-screen overlay page with left section nav: General | Models | Performance |
+  Transcription | About. Large, calm, plenty of whitespace.
+- **General**: export destination folder — settings.export_dir (default
+  ~/Movies/Magic Video Editor), native pick_folder button + editable path; final renders
+  and reels are WRITTEN there under <project name>/; "Open folder" button (opens Finder
+  via a small API endpoint using `open`).
+- **Models**: existing default+per-task dropdowns PLUS an **Ollama model manager**:
+  search field querying our backend proxy of the ollama.com library (scrape/parse
+  https://ollama.com/search?q=...; cache 1h; fallback to a curated static catalog of
+  qwen2.5/llama3.x/gemma/mistral entries when offline), each result shows name, sizes,
+  and a compatibility badge computed from psutil total RAM (size_gb <= ram*0.5 "Runs
+  great", <= ram*0.75 "Tight", else "Too big"); an Install button POSTs /api/ollama/pull
+  (streams ollama /api/pull progress into a queue job with progress bar); installed
+  models listed with size + delete button (ollama delete). Short guide text.
+- **About/System**: correct product name "Magic Video Editor by carlosedm10" (the
+  current System card wrongly reads as CutRoom), version, data dir, health checks.
+- Settings gear stays bottom-left but opens this full-screen page.
+
+## 6. Subtitles tool (CapCut-style)
+- project["subtitles"] = {enabled, style: clean|bold|karaoke, font (from a curated list
+  of macOS system fonts: Helvetica Neue, Arial Black, Futura, Impact, Avenir Next,
+  SF Pro if available), size (S/M/L), color, outline_color, position: bottom|center,
+  words_per_cue (default 4)}.
+- Live preview: DOM overlay on the player driven by transcript word timings mapped
+  through the EDL (both Draft and the subtitle styling in the Subtitles inspector tab
+  update it instantly).
+- Burn-in: the .ass generator (exists for reels) becomes shared
+  `cutroom/pipeline/subtitles.py`, parameterized by the style config; final render and
+  preview render burn it per segment (cue times re-based per segment); reels reuse it.
+- Inspector Subtitles tab: enable toggle, style preset chips with mini-previews, font
+  dropdown, size, colors, position, words-per-cue.
+
+## Constraints reminder
+Same conventions as v2/v3 (ruff, vanilla JS, PromptedOutput flat schemas, ffmpeg only via
+ffmpeg_utils, never git commit, strict file ownership). UI must keep the garnet/navy
+brand. All heavy work goes through the queue + semaphore. make lint && make smoke green.
+
+---
+
+# v5 — Reel Editor (owner request 2026-07-24 late-night)
+
+When the user opens a reel for editing, the REEL EDITOR replaces the main editor view
+(full takeover, "← Back to project" to return). Scope: fix framing, extend/trim the cut,
+hand-edit subtitles, restyle, re-render THAT reel.
+
+## Data model (per reel, all optional overrides)
+reel gains: {in_override, out_override (clip-local seconds; may EXTEND beyond the AI cut,
+clamped to clip bounds), crop_x (0..1 horizontal center of the 9:16 window; falls back to
+the face-detected center), cue_overrides: {cue_index: text}, subtitle_style: partial
+override of project["subtitles"], status: suggested|edited|rendered}.
+API: PATCH /api/projects/{pid}/reels/{rid} accepting these; POST .../reels/{rid}/render
+(existing) honors all overrides; render enqueues via the queue.
+
+## UI (reuse editor chrome, scoped)
+- Center: 9:16 preview (virtual playback of the source clip between in/out, using the
+  preview proxy). FRAMING: overlay showing the 9:16 crop window over the full 16:9 frame
+  (dimmed sides); drag horizontally to set crop_x; the preview crops live via CSS
+  (object-fit/translate math).
+- Bottom: single-segment mini-timeline with in/out edge handles that CAN extend beyond
+  the original AI window (show the AI cut as a subtle highlight inside the full clip
+  strip; filmstrip thumbnails from the existing sprite).
+- Right inspector tabs: Reel (in/out numbers, duration, title editable, score readonly),
+  Subs (cue LIST with per-cue editable text inputs — typo fixes — plus the style
+  controls, overriding project defaults for this reel), Export (Render button -> queue
+  reel_render, shows last rendered file + play).
+- Entry points: Reels drawer card "Edit" button; after render, "Edit" stays available.
+- Keyboard: same transport keys; Esc = back to project.
+
+Backend notes: render_reel must use in/out overrides for cutting, crop_x for the crop
+filter (bypass face detection when set), cue_overrides + merged style for the .ass.
+Subtitle cues for the reel are word-timed from the transcript within [in,out] as today,
+then text-overridden by index.
+
+## v5 addendum — Timeline UX fixes (owner feedback on v3/v4 timeline)
+1. **Left-edge trim visual anchor**: dragging a block's LEFT edge must visually extend/
+   shrink the block's START (left edge moves, right edge stays put on screen). Today the
+   math is right but the block visually grows at the END — the block must stay anchored
+   by its right edge during a left-edge drag (adjust the layout offset live during the
+   drag, not only on commit).
+2. **Undo history panel**: a visible edit-history log (Premiere-style): every EDL-affecting
+   action pushes a labeled entry ("Trim IMG_9234 start", "Reorder", "Split", "Delete",
+   "Transition crossfade"...) into a capped 30-entry history; a small clock icon in the
+   timeline toolbar opens the list; clicking an entry restores that state (undo/redo
+   keyboard continues to work and stays in sync with the panel).
+3. **Zoom-out must fit everything**: minimum zoom = fit ALL clips in the visible strip
+   with ~20% spare room (compute from total EDL duration / viewport width), plus a
+   "Fit" button that jumps to that level. Zoom slider range adapts per project.
+
+## v5 addendum — pydantic_ai native OllamaModel migration (owner request)
+Replace the OpenAIChatModel+OllamaProvider construction in cutroom/agents/agents.py with
+the NATIVE `pydantic_ai.models.ollama.OllamaModel` (exists in our installed 2.17; it
+subclasses OpenAIChatModel so behavior is compatible). Additionally switch structured
+output from PromptedOutput to `NativeOutput(schema)` — self-hosted Ollama >=0.5 enforces
+response_format json_schema via llama.cpp grammar-constrained decoding (see the
+OllamaModel docstring), which guarantees schema-valid output at generation time and is
+strictly better than the PromptedOutput workaround we adopted when tool-calling failed.
+MUST be verified live against every registered agent task (take_judge, transcript_cleaner,
+video_topic, context_check, dedup_judge, clip_order, reel_scorer, reviewer) with the
+settings default model before landing; if any task misbehaves under NativeOutput, keep
+PromptedOutput for that task only, with a comment.
+
+## v5 addendum — export filenames (owner request)
+Exported files must be named by their TITLE, not timestamps/ids:
+- Final render -> "<project name>.mp4" (the project name acts as the video title;
+  sanitize for filesystem: strip /:\\ etc., collapse spaces; if the file exists,
+  append " (2)", " (3)"...).
+- Reel render -> "<reel title>.mp4" (same sanitization/dedup; fall back to
+  "Reel <rank>" when the title is empty). Applies to files written to the export dir;
+  internal work files keep their ids.
+
+## v5 addendum — SEO copywriter + brand profile (owner request)
+Current reel titles are inadequate. Introduce a dedicated copywriting layer:
+- **Brand profile**: settings.brand_profile — a free-form plain-text field (Settings gets
+  a "Brand" section with a large textarea + short helper copy) where the user describes
+  their brand, YouTube channel, audience, tone, links, recurring hashtags, CTAs. Passed
+  verbatim to the copywriter agent.
+- **copywriter agent task** (flat schema {title, description, hashtags}): input = the
+  reel's (or full video's) transcript text + video topic + brand profile + target
+  platform hint (reel -> TikTok/Reels/Shorts, video -> YouTube). Output IN THE CONTENT'S
+  LANGUAGE: a scroll-stopping SEO/viral title (<=70 chars, no clickbait lies), a
+  description written for search+watch-through (keywords early, line breaks, CTA aligned
+  with the brand profile, 2-5 relevant hashtags at the end). Titles must reflect actual
+  content.
+- **Where**: reels stage, after picking the top N: copywriter generates title+description
+  per reel (replaces the reel_scorer title; scorer keeps only scores). Project-level:
+  a "Publish" info block (video title suggestion + description for the main cut),
+  generated on demand via a button and stored as project["publish"].
+- **UI**: reel cards show title + collapsible description with a copy-to-clipboard
+  button; a "Regenerate copy" button per reel; the Reel Editor's Reel tab includes
+  editable title/description fields (manual override wins, stored on the reel).
+- Export filenames (previous addendum) use the copywriter title.

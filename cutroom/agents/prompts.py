@@ -39,11 +39,80 @@ Cut a sentence only when it is one of these:
    "en fin, sigamos", "vale, nada, seguimos", "anyway, as I was saying",
    "so, where was I". Cut only the marker sentence itself.
 
-Be conservative: sentences are numbered in the exact protocol you were given
-(id, text) — only put a number in cut_ids if you are confident it matches one
-of the four cases above. When unsure, do NOT cut it; leaving in a minor
-disfluency is far better than cutting real content. Never invent ids that
-were not in the input.
+5. A mistake-reaction comment — the speaker reacts to having messed up,
+   without necessarily using a formal "restart" phrasing, e.g.
+   "ay, me he equivocado", "otra vez", "esto no", "esto no es",
+   "¿cómo se dice?", "como se dice esto", "se me ha ido", "espera",
+   "uy, no", "a ver espera", laughing at their own mistake ("jaja no,
+   perdón", "jajaja a ver"), or a greeting/intro restarted mid-video (the
+   speaker says "hola" or introduces the video a second time partway
+   through). Cut only the reaction/restart sentence itself.
+
+6. A camera/recording check aimed at the equipment or setup, not the
+   audience — e.g. "vale a ver si esto está grabando bien", "espera que
+   miro el móvil", "un segundo que ajusto la cámara", "is this recording?",
+   "let me check the angle". Cut only that sentence.
+
+Be AGGRESSIVE on cases 1, 3, 5, and 6 — these are recording-meta comments
+about the act of filming itself, not content, so when a sentence is clearly
+one of those, cut it even if the exact wording isn't in these examples.
+Be CONSERVATIVE on case 2 (abandoned takes) and on anything that might be
+real content: only put a number in cut_ids if you are confident it matches
+one of the six cases above. When unsure whether something is content, do NOT
+cut it; leaving in a minor disfluency is far better than cutting real
+content. Never invent ids that were not in the input.
+"""
+
+VIDEO_TOPIC_SYSTEM_PROMPT = """
+You read a (possibly truncated) transcript of a spoken-word video and
+summarize what it is about in ONE short line (topic), in the transcript's own
+language. Be concrete and specific to this video's actual subject matter, not
+generic ("a video about X" is fine, but X must be the real subject).
+"""
+
+CONTEXT_CHECK_SYSTEM_PROMPT = """
+You are given the topic of a video and ONE sentence from its transcript
+(with a little neighboring context for reference). Decide: does this sentence
+belong in a video about that topic, i.e. is it on-topic content, or is it a
+meta-comment/aside that has nothing to do with the topic itself (e.g. talking
+about the recording/camera/equipment, greeting the camera again mid-video,
+an unrelated personal tangent, checking on something off-screen)?
+
+Be conservative: `in_context: false` should be reserved for sentences that
+are CLEARLY about something other than the video's content — recording-meta
+comments, camera checks, asides to whoever is filming, or a tangent
+completely unrelated to the topic. If the sentence is plausibly part of the
+content, even if plain, terse, or awkwardly phrased, mark it `in_context:
+true`. When unsure, prefer `true`.
+"""
+
+DEDUP_JUDGE_SYSTEM_PROMPT = """
+You compare two sentences, "a" and "b", that come from DIFFERENT clips of the
+same video project (the speaker re-recorded parts of the video across
+several separate takes/clips). Each is shown with one neighboring sentence of
+context, and you're given the video's overall topic.
+
+Decide:
+- same_content: true if "a" and "b" convey the same underlying content/idea
+  — the speaker saying the same point again, even if worded quite
+  differently. This is SEMANTIC, not string matching.
+- keep: "a" or "b" — whichever reads better as the one that should survive in
+  the final cut (more fluent, complete, natural, better delivery, or simply
+  fits the surrounding context better). Always give a keep pick even if
+  same_content is false (it will only be used when same_content is true).
+- confidence: 1-5, how sure you are that same_content is correct.
+- reason: one short line.
+
+IMPORTANT exception: do NOT flag as duplicate content when the repetition is
+clearly deliberate RHETORICAL EMPHASIS — the speaker restating a point on
+purpose for effect within the same flow of thought (e.g. "it's important...
+I really mean it, it's important"). That is same_content: false. Only flag
+true duplication where the two sentences are separate, redundant attempts to
+say the same content across different clips/takes.
+
+Be conservative with high confidence (4-5): reserve it for sentences you are
+quite sure express the same content. Use confidence 2-3 when the overlap is
+plausible but not certain.
 """
 
 CLIP_ORDER_SYSTEM_PROMPT = """
@@ -60,9 +129,10 @@ NOT decide what to cut yourself — you only SUGGEST possible issues for a
 human editor to review afterwards. Never flag an unambiguous restart/blooper;
 that is already handled elsewhere before you see the transcript.
 
-You will receive the FULL kept transcript, in narrative (clip) order, as a
-list of clips each containing globally numbered sentences (id, text) — ids
-are unique across the WHOLE transcript, not just one clip.
+You will receive the video's one-line TOPIC, then the FULL kept transcript,
+in narrative (clip) order, as a list of clips each containing globally
+numbered sentences (id, text) — ids are unique across the WHOLE transcript,
+not just one clip. Use the topic to judge off-topic/incoherent findings.
 
 Report at most 8 findings, and only when you are reasonably confident. For
 each finding, choose:

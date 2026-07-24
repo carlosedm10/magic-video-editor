@@ -16,6 +16,8 @@ _lock = threading.Lock()
 
 DEFAULT_MODEL = "qwen2.5:14b"
 
+DEFAULT_EXPORT_DIR = str(Path.home() / "Movies" / "Magic Video Editor")
+
 DEFAULTS: dict = {
     "default_model": DEFAULT_MODEL,
     "task_models": {
@@ -24,12 +26,27 @@ DEFAULTS: dict = {
         "clip_order": None,
         "reel_scorer": None,
         "reviewer": None,
+        "dedup_judge": None,
     },
     "whisper_model": config.WHISPER_MODEL,
     "performance": {
         "max_parallel_ffmpeg": 2,
         "ffmpeg_threads": None,
         "min_free_ram_gb": 4,
+    },
+    # v4 section 5: export destination for final renders/reels, and the
+    # subtitles config's passthrough defaults (section 6) -- both merged in
+    # the same backward-compatible way as task_models/performance below.
+    "export_dir": DEFAULT_EXPORT_DIR,
+    "subtitles": {
+        "enabled": False,
+        "style": "clean",
+        "font": "Helvetica Neue",
+        "size": "M",
+        "color": "#ffffff",
+        "outline_color": "#000000",
+        "position": "bottom",
+        "words_per_cue": 4,
     },
 }
 
@@ -54,6 +71,7 @@ def load() -> dict:
     merged.update(data)
     merged["task_models"] = {**DEFAULTS["task_models"], **(data.get("task_models") or {})}
     merged["performance"] = {**DEFAULTS["performance"], **(data.get("performance") or {})}
+    merged["subtitles"] = {**DEFAULTS["subtitles"], **(data.get("subtitles") or {})}
     if not p.exists():
         save(merged)
     return merged

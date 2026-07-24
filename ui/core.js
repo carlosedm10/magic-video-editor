@@ -58,6 +58,11 @@ window.TABS = window.TABS || {};
 let state = {
   pid: null, project: null, tab: null, jobs: {}, watching: new Set(),
   runAllJob: null,
+  // Job queue (spec v4 §2): state.queue mirrors GET /projects/{pid}/queue,
+  // refreshed by the global 2s poll below (queuePoll()) so the top-bar badge
+  // and the stage pills stay live no matter which view is open; the Queue
+  // tab (ui/tabs/jobs.js) reads this same array instead of polling itself.
+  queue: [], queuePolling: false,
 };
 
 /* ---------- projects ---------- */
@@ -77,11 +82,13 @@ async function loadProjects() {
 async function selectProject(pid) {
   state.pid = pid;
   state.runAllJob = null;
+  state.queue = [];
   await refreshProject();
   $("#empty-state").hidden = true;
   $("#project-view").hidden = false;
   updateTopbarForProject();
   loadProjects();
+  ensureQueuePolling();
 }
 
 async function refreshProject() {
@@ -120,8 +127,11 @@ function renderStageBar() {
   const stages = state.project.stages || {};
   $("#stage-bar").innerHTML = STAGES.map(([key, label]) => {
     const st = stages[key];
-    const running = Object.values(state.jobs).some(
-      (j) => j.status === "running" && j.name.startsWith(`${key}:`));
+    // Queue-driven (spec v4 §2): a stage is "running" when its queue item
+    // (kind "stage:<key>") is currently the one the worker picked up, not
+    // via the old jobs.start() naming convention (queue jobs are all named
+    // "queue:<kind>:<pid>" now -- see cutroom/queue.py _run_item).
+    const running = state.queue.some((i) => i.status === "running" && i.kind === `stage:${key}`);
     const cls = running ? "running" : st ? st.status : "";
     const title = st?.detail || "";
     return `<button class="stage ${cls}" data-stage="${key}" title="${esc(title)}">${label}</button>`;
@@ -132,56 +142,44 @@ function renderStageBar() {
 
 async function runStage(stage) {
   try {
-    const { job } = await api(`/projects/${state.pid}/run/${stage}`, { method: "POST" });
-    watchJob(job);
+    await api(`/projects/${state.pid}/queue`, { method: "POST", body: { kind: `stage:${stage}` } });
+    await pollQueue();
     setTab("jobs");
   } catch (e) {
-    if (e.status === 409 && e.detail?.job) {
-      // Already running (repeated click / two tabs) -- don't error, just
-      // start tracking the job that's actually in flight (spec: resource safety).
-      watchJob(e.detail.job);
-      setTab("jobs");
-    } else {
-      alert(e.message);
-    }
+    alert(e.message);
   }
 }
 
 async function runAll() {
-  if (state.runAllJob && state.jobs[state.runAllJob]?.status === "running") return;
   try {
-    const { job } = await api(`/projects/${state.pid}/run-all`, { method: "POST" });
-    state.runAllJob = job;
-    watchJob(job);
+    await api(`/projects/${state.pid}/queue`, { method: "POST", body: { kind: "run-all" } });
+    await pollQueue();
   } catch (e) {
-    if (e.status === 409 && e.detail?.job) {
-      state.runAllJob = e.detail.job;
-      watchJob(e.detail.job);
-    } else {
-      alert(e.message);
-    }
+    alert(e.message);
   }
 }
 
 async function stopRunAll() {
-  const jid = state.runAllJob;
-  if (!jid) return;
+  const item = state.runAllItem;
+  if (!item) return;
   try {
-    await api(`/jobs/${jid}/cancel`, { method: "POST" });
+    await api(`/projects/${state.pid}/queue/${item.id}`, { method: "DELETE" });
+    await pollQueue();
   } catch (e) { alert(e.message); }
 }
 
 function renderRunAllPanel() {
   const panel = $("#run-all-panel");
   const btn = $("#run-all-btn");
-  const job = state.runAllJob ? state.jobs[state.runAllJob] : null;
-  const running = !!job && job.status === "running";
+  const item = state.runAllItem;
+  const job = item?.job_id ? state.jobs[item.job_id] : null;
+  const running = !!item && (item.status === "running" || item.status === "pending");
   if (btn) {
-    // Resource safety: while a pipeline job is running for this project,
-    // the primary button becomes Stop (garnet, same .primary styling) and
-    // calls the cancel endpoint instead of starting a second run. This
-    // button (and the panel below) lives OUTSIDE the editor grid so it
-    // persists no matter which view/drawer is open (spec v3 bug fix).
+    // Resource safety: while a pipeline run is queued/running for this
+    // project, the primary button becomes Stop (garnet, same .primary
+    // styling) and calls the cancel endpoint instead of starting a second
+    // run. This button (and the panel below) lives OUTSIDE the editor grid
+    // so it persists no matter which view/drawer is open (spec v3 bug fix).
     btn.textContent = running ? "■ Stop" : "✦ Run pipeline";
     btn.onclick = running ? stopRunAll : runAll;
     btn.hidden = !state.pid;
@@ -192,7 +190,7 @@ function renderRunAllPanel() {
     panel.innerHTML = "";
     return;
   }
-  const stages = job.stages || {};
+  const stages = job?.stages || {};
   panel.hidden = false;
   panel.innerHTML = STAGES.map(([key]) => {
     const st = stages[key] || { status: "pending", progress: 0 };
@@ -203,6 +201,59 @@ function renderRunAllPanel() {
       <span class="run-all-pct">${st.status === "error" ? "!" : `${pct}%`}</span>
     </div>`;
   }).join("");
+}
+
+/* ---------- job queue polling (spec v4 §2) ----------
+   One global 2s poll drives: the top-bar queue badge (pending count), the
+   stage pills' running state, the run-all progress panel (via the running
+   run-all item's job_id), and -- when the Queue view is open -- its render.
+   ui/tabs/jobs.js reads state.queue directly; it does not poll on its own. */
+
+function ensureQueuePolling() {
+  if (state.queuePolling) return;
+  state.queuePolling = true;
+  pollQueue();
+  setInterval(pollQueue, 2000);
+}
+
+async function pollQueue() {
+  if (!state.pid) return;
+  try {
+    const { queue } = await api(`/projects/${state.pid}/queue`);
+    state.queue = queue;
+  } catch (_e) {
+    // Transient network hiccup -- keep the last known queue rather than
+    // flashing the badge/panel empty.
+    return;
+  }
+  state.runAllItem = state.queue.find(
+    (i) => i.kind === "run-all" && (i.status === "running" || i.status === "pending")) || null;
+  if (state.runAllItem?.job_id) {
+    try { state.jobs[state.runAllItem.job_id] = await api(`/jobs/${state.runAllItem.job_id}`); }
+    catch (_e) { /* job may have just been cancelled/gc'd -- ignore */ }
+  }
+  updateQueueBadge();
+  renderStageBar();
+  renderRunAllPanel();
+  if (state.tab === "jobs") renderTab();
+  if (state.project && (!state.runAllItem || state.runAllItem.status !== "running")) {
+    // A run-all (or any stage) that just finished may have changed
+    // stages/reels/etc -- pick that up without waiting for a manual action.
+    const wasRunning = state._queueHadRunning;
+    const nowRunning = state.queue.some((i) => i.status === "running");
+    if (wasRunning && !nowRunning) refreshProject();
+    state._queueHadRunning = nowRunning;
+  }
+}
+
+function updateQueueBadge() {
+  const badge = $("#queue-badge");
+  if (!badge) return;
+  const pending = state.queue.filter((i) => i.status === "pending").length;
+  const running = state.queue.filter((i) => i.status === "running").length;
+  badge.hidden = !state.pid;
+  $("#queue-badge-count").textContent = pending + running;
+  badge.classList.toggle("active", running > 0);
 }
 
 function watchJob(jid) {
@@ -238,6 +289,23 @@ function closeDrawer() {
   document.querySelectorAll("[data-tab]").forEach((el) => el.classList.remove("active"));
 }
 
+/* ---------- Settings: full-viewport overlay page, not a drawer tab
+   (spec v4 §5) -- opened only from the gear pinned to the bottom of the
+   media bin. Reuses the same #tab-settings container id (and window.TABS.settings
+   renderer) that used to live inside the drawer, so ui/tabs/settings.js
+   needs no changes to keep mounting into it. ---------- */
+
+function openSettings() {
+  state.tab = "settings";
+  $("#settings-overlay").hidden = false;
+  renderTab();
+}
+
+function closeSettings() {
+  state.tab = null;
+  $("#settings-overlay").hidden = true;
+}
+
 function renderTab() {
   if (!state.project || !state.tab) return;
   const fn = window.TABS[state.tab];
@@ -255,7 +323,9 @@ function renderTab() {
    ui/editor/timeline.js, which owns the timeline/player) ---------- */
 
 document.addEventListener("keydown", (e) => {
-  if (e.key === "Escape" && state.tab) closeDrawer();
+  if (e.key !== "Escape") return;
+  if (!$("#settings-overlay").hidden) closeSettings();
+  else if (state.tab) closeDrawer();
 });
 
 /* ---------- boot ---------- */
@@ -266,6 +336,9 @@ async function boot() {
   $("#drawer-overlay").addEventListener("click", (e) => {
     if (e.target.id === "drawer-overlay") closeDrawer();
   });
+  $("#settings-gear").onclick = openSettings;
+  $("#settings-close").onclick = closeSettings;
+  $("#queue-badge").onclick = () => setTab("jobs");
 
   $("#new-project").onclick = async () => {
     const name = prompt("Project name:");

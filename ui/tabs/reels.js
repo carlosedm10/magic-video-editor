@@ -16,8 +16,11 @@ function renderReels() {
         : `<button class="btn primary small" data-reel="${r.id}">Render 9:16</button>`}
     </div>`).join("") + `</div>`;
   document.querySelectorAll("[data-reel]").forEach((el) => el.onclick = async () => {
-    const { job } = await api(`/projects/${p.id}/reels/${el.dataset.reel}/render`, { method: "POST" });
-    watchJob(job);
+    // reels/{rid}/render now enqueues via the job queue (spec v4 §2) and
+    // returns {item}, not {job} — progress shows up in the Queue view
+    // (tabs/jobs.js), which already polls state.queue on its own cadence.
+    await api(`/projects/${p.id}/reels/${el.dataset.reel}/render`, { method: "POST" });
+    await pollQueue();
     setTab("jobs");
   });
 }

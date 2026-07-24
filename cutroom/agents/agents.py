@@ -16,12 +16,24 @@ from pydantic_ai.providers.ollama import OllamaProvider
 from .. import config, settings
 from .prompts import (
     CLIP_ORDER_SYSTEM_PROMPT,
+    CONTEXT_CHECK_SYSTEM_PROMPT,
+    DEDUP_JUDGE_SYSTEM_PROMPT,
     REEL_SCORER_SYSTEM_PROMPT,
     REVIEWER_SYSTEM_PROMPT,
     TAKE_JUDGE_SYSTEM_PROMPT,
     TRANSCRIPT_CLEANER_SYSTEM_PROMPT,
+    VIDEO_TOPIC_SYSTEM_PROMPT,
 )
-from .schemas import ClipOrder, ReelScore, ReviewFindings, TakePick, TranscriptCleanup
+from .schemas import (
+    ClipOrder,
+    ContextCheck,
+    DedupJudge,
+    ReelScore,
+    ReviewFindings,
+    TakePick,
+    TranscriptCleanup,
+    VideoTopic,
+)
 
 _MODEL_SETTINGS = {"temperature": 0.2}
 
@@ -34,6 +46,9 @@ AGENT_SPECS: dict[str, dict] = {
         "output_type": TranscriptCleanup,
     },
     "reviewer": {"prompt": REVIEWER_SYSTEM_PROMPT, "output_type": ReviewFindings},
+    "video_topic": {"prompt": VIDEO_TOPIC_SYSTEM_PROMPT, "output_type": VideoTopic},
+    "context_check": {"prompt": CONTEXT_CHECK_SYSTEM_PROMPT, "output_type": ContextCheck},
+    "dedup_judge": {"prompt": DEDUP_JUDGE_SYSTEM_PROMPT, "output_type": DedupJudge},
 }
 
 _cache: dict[tuple[str, str], Agent] = {}

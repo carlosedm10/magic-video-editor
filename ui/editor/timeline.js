@@ -1,18 +1,40 @@
 /* Bottom timeline: adaptive ruler, zoom (slider + wheel), one video track of
-   blocks (width ∝ duration), selection highlight, playhead synced both ways
-   with the player, drag blocks to reorder, drag block edges to trim (live
-   feedback, 0.05s snap), per-junction transition chips, toolbar (split at
-   playhead / delete / undo / redo / reset / save). All mutations go through
-   `Editor` (ui/editor/state.js), which owns history + autosave. */
+   blocks (width ∝ duration) with filmstrip + waveform art, selection
+   highlight, playhead synced both ways with the player, drag blocks to
+   reorder, drag block edges to trim (live feedback, 0.05s snap, optional
+   snap-to-playhead/edges), per-junction transition chips, markers on the
+   ruler, a render-status bar, media-bin drop-to-append, and the toolbar
+   (split / ripple-delete / undo / redo / reset / save / snap toggle /
+   shortcuts popover). All EDL mutations go through `Editor` (ui/editor/
+   state.js), which owns history + autosave.
+
+   Keyboard map (spec v4 §4 "Timeline pro" + the "?" popover):
+     Space  play/pause      J  jump back 2s       K  pause
+     L      play (2x on 2nd press while playing)  X  split at playhead
+     I/O    set selected segment in/out at playhead (clip-local, clamped)
+     Del    ripple delete   S  toggle snapping     M  add marker
+     ⌘Z/⇧⌘Z undo/redo       +/-  zoom              ?  shortcuts popover
+
+   DOM note: this module injects its own <style> block and a couple of
+   container divs (render bar, markers strip, shortcuts popover) at mount
+   time rather than depending on ui/index.html/ui/style.css (owned by other
+   agents this phase) — see the injectStyles()/_ensureChrome() functions. */
 
 window.EditorUI = window.EditorUI || {};
 
 const Timeline = {
   pxPerSec: 40,
+  snapping: true,
   _drag: null,       // active drag/trim operation, or null
   _wired: false,
+  _dragLeftAnchor: null,   // {index, anchorRightPx} while live-dragging a LEFT edge
+  _lastTrimValue: null,    // last (possibly snapped) value computed during an edge drag
+  _thumbCache: new Map(),  // clip_id -> {meta, peaks, stripUrl, metaFailed, loading}
+  _shortcutsOpen: false,
 
   mount() {
+    this._injectStyles();
+    this._ensureChrome();
     this.render();
     if (this._wired) return;
     this._wired = true;
@@ -40,6 +62,9 @@ const Timeline = {
     const content = document.getElementById("timeline-content");
     if (content) {
       content.addEventListener("pointerdown", (e) => this._onBackgroundPointerDown(e));
+      content.addEventListener("dragover", (e) => this._onBinDragOver(e));
+      content.addEventListener("dragleave", () => this._onBinDragLeave());
+      content.addEventListener("drop", (e) => this._onBinDrop(e));
     }
 
     const bind = (id, fn) => { const el = document.getElementById(id); if (el) el.onclick = fn; };
@@ -53,7 +78,139 @@ const Timeline = {
       await Editor.resetToAiCut();
     });
 
+    // Relabel/retitle two existing v3 toolbar controls in place (index.html
+    // is owned by another agent this phase, but a DOM mutation from here is
+    // fair game): ripple delete is worth calling out explicitly, and the
+    // split shortcut hint is stale now that S means "toggle snapping".
+    const delBtn = document.getElementById("tl-delete");
+    if (delBtn) { delBtn.textContent = "🗑 Ripple delete"; delBtn.title = "Ripple delete (Del) — closes the gap"; }
+    const splitBtn = document.getElementById("tl-split");
+    if (splitBtn) splitBtn.title = "Split at playhead (X)";
+
     document.addEventListener("keydown", (e) => this._onKeydown(e));
+  },
+
+  /* ---------- one-time injected chrome (style + containers this module
+     needs but that don't exist in ui/index.html / ui/style.css) ---------- */
+
+  _injectStyles() {
+    if (document.getElementById("tl-pro-styles")) return;
+    const style = document.createElement("style");
+    style.id = "tl-pro-styles";
+    style.textContent = `
+      .tl-renderbar { height: 6px; margin: 0 0 2px; border-radius: 3px; flex-shrink: 0;
+        background: var(--panel2); border: 1px solid var(--border); cursor: pointer;
+        position: relative; overflow: hidden; transition: background .2s ease, border-color .2s ease; }
+      .tl-renderbar::after { content: ""; position: absolute; inset: 0; opacity: .9; }
+      .tl-renderbar.stale { border-color: var(--accent); }
+      .tl-renderbar.stale::after { background: linear-gradient(90deg, var(--accent), var(--accent-hover)); }
+      .tl-renderbar.fresh { border-color: var(--accent2); }
+      .tl-renderbar.fresh::after { background: var(--accent2); }
+      .tl-renderbar.unknown::after { background: var(--border); }
+      .tl-renderbar-label { position: absolute; right: 6px; top: -1px; font-size: 9px; line-height: 6px;
+        color: var(--dim); }
+      .tl-film { position: absolute; inset: 0; bottom: 16px; z-index: 0; opacity: .6; pointer-events: none; }
+      .tl-wave { position: absolute; left: 0; right: 0; bottom: 0; height: 16px; z-index: 0; pointer-events: none;
+        display: block; width: 100%; }
+      .tl-block .tl-label { position: relative; z-index: 1; text-shadow: 0 1px 3px rgba(0,0,0,.9); }
+      .tl-block .tl-edge { z-index: 2; }
+      .tl-snap-btn.active { border-color: var(--accent2); color: var(--accent2); }
+      .tl-markers-strip { position: absolute; top: 0; left: 0; right: 0; height: 22px; pointer-events: none; }
+      .tl-marker { position: absolute; top: 0; transform: translateX(-50%); pointer-events: auto; cursor: pointer;
+        width: 0; height: 0; border-left: 6px solid transparent; border-right: 6px solid transparent;
+        border-top: 8px solid var(--warn); }
+      .tl-marker:hover { border-top-color: var(--accent-hover); }
+      .tl-shortcuts-pop { position: absolute; bottom: 100%; right: 0; margin-bottom: 6px; width: 280px;
+        background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 10px 12px;
+        backdrop-filter: blur(16px); box-shadow: 0 8px 24px rgba(0,0,0,.4); z-index: 20; font-size: 12px; }
+      .tl-shortcuts-pop table { width: 100%; border-collapse: collapse; }
+      .tl-shortcuts-pop td { padding: 2px 0; color: var(--dim); }
+      .tl-shortcuts-pop td:first-child { color: var(--text); font-variant-numeric: tabular-nums;
+        white-space: nowrap; padding-right: 10px; width: 1%; }
+      #timeline-content.tl-drop-target { outline: 2px dashed var(--accent); outline-offset: -2px; }
+    `;
+    document.head.appendChild(style);
+  },
+
+  _ensureChrome() {
+    const pane = document.getElementById("timeline-pane");
+    const toolbar = document.querySelector("#timeline-pane .timeline-toolbar");
+    const scroll = document.getElementById("timeline-scroll");
+    if (pane && scroll && !document.getElementById("tl-renderbar")) {
+      const bar = document.createElement("div");
+      bar.id = "tl-renderbar";
+      bar.className = "tl-renderbar unknown";
+      bar.title = "Preview render status — click to render a preview";
+      bar.innerHTML = `<span class="tl-renderbar-label" id="tl-renderbar-label"></span>`;
+      bar.onclick = () => this._enqueuePreviewRender();
+      pane.insertBefore(bar, scroll);
+    }
+    if (toolbar && !document.getElementById("tl-snap")) {
+      const snapBtn = document.createElement("button");
+      snapBtn.id = "tl-snap";
+      snapBtn.className = "btn small tl-snap-btn active";
+      snapBtn.title = "Snap to playhead/edges while trimming (S)";
+      snapBtn.textContent = "⟝ Snap";
+      snapBtn.onclick = () => this._toggleSnapping();
+      toolbar.appendChild(snapBtn);
+    }
+    if (toolbar && !document.getElementById("tl-shortcuts-btn")) {
+      const wrap = document.createElement("div");
+      wrap.style.position = "relative";
+      wrap.id = "tl-shortcuts-wrap";
+      const btn = document.createElement("button");
+      btn.id = "tl-shortcuts-btn";
+      btn.className = "btn small";
+      btn.title = "Keyboard shortcuts";
+      btn.textContent = "?";
+      btn.onclick = (e) => { e.stopPropagation(); this._toggleShortcuts(); };
+      wrap.appendChild(btn);
+      toolbar.appendChild(wrap);
+      document.addEventListener("pointerdown", (e) => {
+        if (this._shortcutsOpen && !wrap.contains(e.target)) this._toggleShortcuts(false);
+      });
+    }
+    if (scroll && !document.getElementById("timeline-markers")) {
+      const content = document.getElementById("timeline-content");
+      if (content) {
+        const strip = document.createElement("div");
+        strip.id = "timeline-markers";
+        strip.className = "tl-markers-strip";
+        content.appendChild(strip);
+      }
+    }
+  },
+
+  _toggleSnapping(force) {
+    this.snapping = force != null ? force : !this.snapping;
+    const btn = document.getElementById("tl-snap");
+    if (btn) btn.classList.toggle("active", this.snapping);
+  },
+
+  _toggleShortcuts(force) {
+    this._shortcutsOpen = force != null ? force : !this._shortcutsOpen;
+    const wrap = document.getElementById("tl-shortcuts-wrap");
+    if (!wrap) return;
+    let pop = document.getElementById("tl-shortcuts-pop");
+    if (this._shortcutsOpen) {
+      if (!pop) {
+        pop = document.createElement("div");
+        pop.id = "tl-shortcuts-pop";
+        pop.className = "tl-shortcuts-pop";
+        const rows = [
+          ["Space", "Play / pause"], ["J", "Jump back 2s"], ["K", "Pause"],
+          ["L", "Play (again = 2×)"], ["X", "Split at playhead"],
+          ["I / O", "Set in / out at playhead"], ["Del", "Ripple delete"],
+          ["S", "Toggle snapping"], ["M", "Add marker"],
+          ["⌘Z / ⇧⌘Z", "Undo / redo"], ["+ / -", "Zoom in / out"],
+        ];
+        pop.innerHTML = "<table>" + rows.map(([k, d]) =>
+          `<tr><td>${esc(k)}</td><td>${esc(d)}</td></tr>`).join("") + "</table>";
+        wrap.appendChild(pop);
+      }
+    } else if (pop) {
+      pop.remove();
+    }
   },
 
   _setZoom(v) {
@@ -70,19 +227,40 @@ const Timeline = {
     Editor.splitAt(hit.index, hit.local);
   },
 
+  /* ---------- I/O in/out-at-playhead (spec v4 §4) ---------- */
+  setInOutAtPlayhead(field) {
+    const t = window.EditorUI.player?.currentEdlTime?.() ?? 0;
+    const hit = Editor.segmentAtEdlTime(t);
+    if (!hit) return;
+    Editor.trim(hit.index, field, hit.local); // commit() re-selects hit.index for us
+  },
+
   _onKeydown(e) {
     if (state.tab) return; // a drawer (Takes/Reels/Settings/Activity) is open
     const tag = (document.activeElement?.tagName || "").toLowerCase();
     if (tag === "input" || tag === "textarea" || tag === "select" || document.activeElement?.isContentEditable) return;
     const meta = e.metaKey || e.ctrlKey;
-    if (e.key === " ") { e.preventDefault(); window.EditorUI.player?.togglePlay(); }
-    else if (e.key === "s" || e.key === "S") { e.preventDefault(); this.splitAtPlayhead(); }
+    const player = window.EditorUI.player;
+    if (e.key === " ") { e.preventDefault(); player?.togglePlay(); }
+    else if (e.key === "x" || e.key === "X") { e.preventDefault(); this.splitAtPlayhead(); }
     else if (e.key === "Delete" || e.key === "Backspace") { e.preventDefault(); Editor.deleteSelected(); }
     else if (meta && (e.key === "z" || e.key === "Z")) {
       e.preventDefault();
       if (e.shiftKey) Editor.redo(); else Editor.undo();
     } else if (e.key === "+" || e.key === "=") { e.preventDefault(); this._setZoom(this.pxPerSec * 1.2); }
     else if (e.key === "-" || e.key === "_") { e.preventDefault(); this._setZoom(this.pxPerSec / 1.2); }
+    else if (e.key === "s" || e.key === "S") { e.preventDefault(); this._toggleSnapping(); }
+    else if (e.key === "j" || e.key === "J") { e.preventDefault(); player?.jump?.(-2); }
+    else if (e.key === "k" || e.key === "K") { e.preventDefault(); player?.handleK?.(); }
+    else if (e.key === "l" || e.key === "L") { e.preventDefault(); player?.handleL?.(); }
+    else if (e.key === "i" || e.key === "I") { e.preventDefault(); this.setInOutAtPlayhead("start"); }
+    else if (e.key === "o" || e.key === "O") { e.preventDefault(); this.setInOutAtPlayhead("end"); }
+    else if (e.key === "m" || e.key === "M") {
+      e.preventDefault();
+      const t = player?.currentEdlTime?.() ?? 0;
+      const label = prompt("Marker label (optional):", "") || "";
+      Editor.addMarker(t, label);
+    } else if (e.key === "?") { e.preventDefault(); this._toggleShortcuts(); }
   },
 
   /* ---------- rendering ---------- */
@@ -99,7 +277,9 @@ const Timeline = {
     this._renderRuler(total, widthPx);
     this._renderTrack(segs, px);
     this.renderSelection();
+    this.renderMarkers();
     this.updatePlayhead(window.EditorUI.player?.currentEdlTime?.() ?? 0);
+    this.refreshRenderBar();
   },
 
   _renderRuler(total, widthPx) {
@@ -115,6 +295,106 @@ const Timeline = {
       html += `<div class="tl-tick" style="left:${(t * px).toFixed(1)}px"><span>${fmtT(t)}</span></div>`;
     }
     ruler.innerHTML = html;
+    const markers = document.getElementById("timeline-markers");
+    if (markers) markers.style.width = `${widthPx}px`;
+  },
+
+  /* ---------- markers (spec v4 §4 "M adds a marker") ---------- */
+  renderMarkers() {
+    const strip = document.getElementById("timeline-markers");
+    if (!strip) return;
+    const px = this.pxPerSec;
+    strip.innerHTML = (Editor.markers || []).map((m) => {
+      const label = m.label ? `${fmtT(m.edl_t)} — ${esc(m.label)}` : fmtT(m.edl_t);
+      return `<div class="tl-marker" data-marker="${m.id}" style="left:${(m.edl_t * px).toFixed(1)}px"
+        title="${label} (click: seek, ⌥click: remove)"></div>`;
+    }).join("");
+    strip.querySelectorAll(".tl-marker").forEach((el) => {
+      el.onclick = (e) => {
+        const id = el.dataset.marker;
+        const m = (Editor.markers || []).find((x) => x.id === id);
+        if (!m) return;
+        if (e.altKey) Editor.removeMarker(id);
+        else window.EditorUI.player?.seekToEdlTime?.(m.edl_t);
+      };
+    });
+  },
+
+  /* ---------- render bar (spec v4 §3) ---------- */
+  async refreshRenderBar() {
+    const bar = document.getElementById("tl-renderbar");
+    const label = document.getElementById("tl-renderbar-label");
+    if (!bar) return;
+    const hasPreview = !!state.project?.preview?.manifest;
+    if (!Editor.segments?.length) {
+      bar.className = "tl-renderbar unknown";
+      if (label) label.textContent = "";
+      return;
+    }
+    const token = (this._renderBarToken = (this._renderBarToken || 0) + 1);
+    let stale = true;
+    try { stale = await Editor.previewIsStale(); } catch (_e) { stale = true; }
+    if (token !== this._renderBarToken) return; // a newer check finished first — drop this one
+    bar.className = `tl-renderbar ${stale ? "stale" : "fresh"}`;
+    if (label) label.textContent = stale ? (hasPreview ? "outdated — click to render" : "no preview — click to render") : "preview up to date";
+  },
+
+  async _enqueuePreviewRender() {
+    if (!Editor.pid) return;
+    try {
+      await api(`/projects/${Editor.pid}/queue`, { method: "POST", body: { kind: "preview_render", payload: {} } });
+    } catch (e) {
+      alert(`Couldn't queue preview render: ${e.message}`);
+    }
+  },
+
+  /* ---------- filmstrip + waveform assets (spec v4 §4) ---------- */
+  _getThumbEntry(clipId) {
+    let e = this._thumbCache.get(clipId);
+    if (!e) {
+      e = { meta: null, peaks: null, stripUrl: null, metaFailed: false, loading: false };
+      this._thumbCache.set(clipId, e);
+      this._loadThumbs(clipId, e);
+    }
+    return e;
+  },
+  async _loadThumbs(clipId, entry) {
+    entry.loading = true;
+    const pid = Editor.pid;
+    try {
+      entry.meta = await api(`/projects/${pid}/thumbs/${clipId}/meta`);
+      entry.stripUrl = `/api/projects/${pid}/thumbs/${clipId}/strip`;
+    } catch (_e) {
+      entry.metaFailed = true; // 404: no video track / not generated yet — plain block
+    }
+    try {
+      entry.peaks = await api(`/projects/${pid}/thumbs/${clipId}/peaks`);
+    } catch (_e) {
+      entry.peaks = [];
+    }
+    entry.loading = false;
+    if (Editor.pid === pid) this.render(); // reflow once — subsequent renders hit the cache
+  },
+
+  _drawWaveform(canvas, peaks, clipDuration, segStart, segEnd) {
+    if (!canvas || !peaks?.length || !clipDuration) return;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return;
+    const w = canvas.width, h = canvas.height;
+    ctx.clearRect(0, 0, w, h);
+    const n = peaks.length;
+    const iStart = Math.max(0, Math.floor((segStart / clipDuration) * n));
+    const iEnd = Math.min(n, Math.max(iStart + 1, Math.ceil((segEnd / clipDuration) * n)));
+    const count = iEnd - iStart;
+    if (count <= 0) return;
+    ctx.fillStyle = "rgba(154,163,178,.55)";
+    const mid = h / 2;
+    for (let x = 0; x < w; x++) {
+      const idx = iStart + Math.floor((x / w) * count);
+      const peak = Math.min(1, peaks[Math.min(n - 1, idx)] || 0);
+      const barH = Math.max(1, peak * (h - 2));
+      ctx.fillRect(x, mid - barH / 2, 1, barH);
+    }
   },
 
   _renderTrack(segs, px) {
@@ -124,17 +404,36 @@ const Timeline = {
     let html = "";
     segs.forEach((s, i) => {
       const dur = Math.max(0, s.end - s.start);
-      const leftPx = t * px;
+      let leftPx = t * px;
       const widthPx = Math.max(dur * px, 3);
+      if (this._dragLeftAnchor && this._dragLeftAnchor.index === i) {
+        leftPx = this._dragLeftAnchor.anchorRightPx - widthPx;
+      }
       const clip = Editor.clip(s.clip_id);
       const name = clip?.filename || s.clip_id;
       const trType = s.transition?.type || "none";
+
+      const thumbs = this._getThumbEntry(s.clip_id);
+      let filmHtml = "";
+      if (thumbs.meta && thumbs.stripUrl) {
+        const bgW = Math.max(1, thumbs.meta.count * thumbs.meta.interval_s * px);
+        const bgX = -(s.start * px);
+        filmHtml = `<div class="tl-film" style="background-image:url('${thumbs.stripUrl}');`
+          + `background-repeat:no-repeat;background-size:${bgW.toFixed(1)}px 100%;`
+          + `background-position:${bgX.toFixed(1)}px 0"></div>`;
+      }
+      const waveHtml = thumbs.peaks?.length
+        ? `<canvas class="tl-wave" data-wave="${i}" width="${Math.max(1, Math.round(widthPx))}" height="16"></canvas>`
+        : "";
+
       html += `<div class="tl-chip ${trType}" data-chip="${i}" style="left:${leftPx.toFixed(1)}px"
         title="Transition into this clip — click to cycle">${trType === "none" ? "·" : trType === "fade" ? "F" : "X"}</div>
       <div class="tl-block" data-idx="${i}" style="left:${leftPx.toFixed(1)}px;width:${widthPx.toFixed(1)}px">
+        ${filmHtml}
         <div class="tl-edge tl-edge-l" data-idx="${i}" data-edge="start"></div>
         <span class="tl-label">${esc(name)} · ${fmtT(dur)}</span>
         <div class="tl-edge tl-edge-r" data-idx="${i}" data-edge="end"></div>
+        ${waveHtml}
       </div>`;
       t += dur;
     });
@@ -151,6 +450,13 @@ const Timeline = {
         const next = cur === "none" ? "fade" : cur === "fade" ? "crossfade" : "none";
         Editor.setTransition(i, next);
       };
+    });
+    track.querySelectorAll(".tl-wave").forEach((canvas) => {
+      const i = Number(canvas.dataset.wave);
+      const s = segs[i];
+      const thumbs = this._thumbCache.get(s.clip_id);
+      const clipDur = Editor.clipDuration(s.clip_id);
+      this._drawWaveform(canvas, thumbs?.peaks, clipDur, s.start, s.end);
     });
   },
 
@@ -177,7 +483,7 @@ const Timeline = {
   /* ---------- background click/drag = seek ---------- */
 
   _onBackgroundPointerDown(e) {
-    if (e.target.closest(".tl-block") || e.target.closest(".tl-chip")) return;
+    if (e.target.closest(".tl-block") || e.target.closest(".tl-chip") || e.target.closest(".tl-marker")) return;
     const content = document.getElementById("timeline-content");
     const seekFromEvent = (ev) => {
       const rect = content.getBoundingClientRect();
@@ -192,6 +498,41 @@ const Timeline = {
     };
     window.addEventListener("pointermove", onMove);
     window.addEventListener("pointerup", onUp);
+  },
+
+  /* ---------- media bin drag-drop = insert full clip (spec v4 §4) ---------- */
+
+  _dropIndexForX(trackX) {
+    const segs = Editor.segments || [];
+    const px = this.pxPerSec;
+    let t = 0;
+    for (let k = 0; k < segs.length; k++) {
+      const dur = Math.max(0, segs[k].end - segs[k].start);
+      if (trackX < t + dur / 2) return k;
+      t += dur;
+    }
+    return segs.length;
+  },
+
+  _onBinDragOver(e) {
+    if (!e.dataTransfer?.types?.includes("application/x-mve-clip")) return;
+    e.preventDefault();
+    e.dataTransfer.dropEffect = "copy";
+    document.getElementById("timeline-content")?.classList.add("tl-drop-target");
+  },
+  _onBinDragLeave() {
+    document.getElementById("timeline-content")?.classList.remove("tl-drop-target");
+  },
+  _onBinDrop(e) {
+    document.getElementById("timeline-content")?.classList.remove("tl-drop-target");
+    const clipId = e.dataTransfer?.getData("application/x-mve-clip");
+    if (!clipId) return;
+    e.preventDefault();
+    const content = document.getElementById("timeline-content");
+    const rect = content.getBoundingClientRect();
+    const x = e.clientX - rect.left + content.scrollLeft;
+    const idx = this._dropIndexForX(x);
+    Editor.insertClip(clipId, idx);
   },
 
   /* ---------- block drag = reorder ---------- */
@@ -234,7 +575,16 @@ const Timeline = {
     return segs.length - 1;
   },
 
-  /* ---------- edge drag = trim (live preview, commit on release) ---------- */
+  /* ---------- edge drag = trim (live preview, commit on release) ----------
+     Two things beyond the plain trim math:
+     - LEFT-edge anchor: dragging a block's start must visually extend/
+       shrink from the block's right edge (which stays put on screen) —
+       naturally, layout anchors every block's left edge on the cumulative
+       duration of its predecessors, so a start-trim would otherwise appear
+       to grow/shrink the block from its END. _dragLeftAnchor overrides just
+       this block's rendered leftPx for the duration of the drag.
+     - Snapping: when `this.snapping`, the dragged edge's on-screen position
+       snaps to the playhead or to any OTHER segment's boundary within 8px. */
 
   _onEdgePointerDown(e, blockEl) {
     e.stopPropagation();
@@ -247,23 +597,64 @@ const Timeline = {
     const px = this.pxPerSec;
     const clipDur = Editor.clipDuration(original.clip_id);
 
-    const onMove = (ev) => {
-      const deltaSec = (ev.clientX - startX) / px;
+    const cum = Editor.cumulative();
+    const row = cum[i];
+    const anchorRightPx = row.end * px;
+    const anchorLeftPx = row.start * px;
+    this._dragLeftAnchor = field === "start" ? { index: i, anchorRightPx } : null;
+
+    const SNAP_PX = 8;
+    const snapPx = (rawPx) => {
+      if (!this.snapping) return rawPx;
+      const candidates = [(window.EditorUI.player?.currentEdlTime?.() ?? 0) * px];
+      cum.forEach((r, k) => { if (k !== i) candidates.push(r.start * px, r.end * px); });
+      let best = rawPx, bestD = SNAP_PX;
+      for (const c of candidates) {
+        const d = Math.abs(rawPx - c);
+        if (d < bestD) { bestD = d; best = c; }
+      }
+      return best;
+    };
+
+    const computeValue = (clientX) => {
+      const deltaSec = (clientX - startX) / px;
       let v = Math.round((original[field] + deltaSec) / 0.05) * 0.05;
       v = Math.max(0, Math.min(v, clipDur));
       if (field === "start") v = Math.min(v, original.end - 0.1);
       else v = Math.max(v, original.start + 0.1);
+
+      if (field === "start") {
+        const widthPx = Math.max((original.end - v) * px, 3);
+        const rawLeftPx = anchorRightPx - widthPx;
+        const snapped = snapPx(rawLeftPx);
+        if (snapped !== rawLeftPx) v = original.end - (anchorRightPx - snapped) / px;
+      } else {
+        const rawRightPx = anchorLeftPx + (v - original.start) * px;
+        const snapped = snapPx(rawRightPx);
+        if (snapped !== rawRightPx) v = original.start + (snapped - anchorLeftPx) / px;
+      }
+      v = Math.round(v / 0.05) * 0.05;
+      v = Math.max(0, Math.min(v, clipDur));
+      if (field === "start") v = Math.min(v, original.end - 0.1);
+      else v = Math.max(v, original.start + 0.1);
+      return Math.round(v * 1000) / 1000;
+    };
+
+    const onMove = (ev) => {
+      const v = computeValue(ev.clientX);
+      this._lastTrimValue = v;
       const preview = _cloneForPreview(Editor.segments);
-      preview[i][field] = Math.round(v * 1000) / 1000;
+      preview[i][field] = v;
       this._previewSegments = preview;
       this.render();
     };
-    const onUp = (ev) => {
+    const onUp = () => {
       window.removeEventListener("pointermove", onMove);
       window.removeEventListener("pointerup", onUp);
-      const deltaSec = (ev.clientX - startX) / px;
+      this._dragLeftAnchor = null;
       this._previewSegments = null;
-      Editor.trim(i, field, original[field] + deltaSec);
+      if (this._lastTrimValue != null) Editor.trim(i, field, this._lastTrimValue);
+      this._lastTrimValue = null;
     };
     window.addEventListener("pointermove", onMove);
     window.addEventListener("pointerup", onUp);
