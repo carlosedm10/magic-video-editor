@@ -60,13 +60,21 @@ def list_projects() -> list[dict]:
         f = d / "project.json"
         if f.exists():
             p = json.loads(f.read_text())
-            out.append({"id": p["id"], "name": p["name"], "created_at": p["created_at"],
-                        "clips": len(p["clips"]), "stages": p.get("stages", {})})
+            out.append(
+                {
+                    "id": p["id"],
+                    "name": p["name"],
+                    "created_at": p["created_at"],
+                    "clips": len(p["clips"]),
+                    "stages": p.get("stages", {}),
+                }
+            )
     return out
 
 
 def delete_project(project_id: str) -> None:
     import shutil
+
     d = _pdir(project_id)
     if d.exists():
         shutil.rmtree(d)
@@ -78,7 +86,9 @@ def project_dir(project_id: str) -> Path:
 
 def mark_stage(project: dict, stage: str, status: str, detail: str = "") -> None:
     project.setdefault("stages", {})[stage] = {
-        "status": status, "at": time.strftime("%H:%M:%S"), "detail": detail,
+        "status": status,
+        "at": time.strftime("%H:%M:%S"),
+        "detail": detail,
     }
     save(project)
 

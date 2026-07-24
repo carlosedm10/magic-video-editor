@@ -6,7 +6,19 @@ from pathlib import Path
 
 from .. import ffmpeg_utils, store
 
-MEDIA_EXTS = {".mp4", ".mov", ".m4v", ".mkv", ".avi", ".mts", ".m4a", ".wav", ".mp3", ".aac", ".flac"}
+MEDIA_EXTS = {
+    ".mp4",
+    ".mov",
+    ".m4v",
+    ".mkv",
+    ".avi",
+    ".mts",
+    ".m4a",
+    ".wav",
+    ".mp3",
+    ".aac",
+    ".flac",
+}
 AUDIO_EXTS = {".m4a", ".wav", ".mp3", ".aac", ".flac"}
 
 

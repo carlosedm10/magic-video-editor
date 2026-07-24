@@ -44,10 +44,10 @@ def _fine_offset(wav_a: np.ndarray, wav_b: np.ndarray, coarse_s: float) -> float
     sr = config.ANALYSIS_SR
     pad = sr  # +/-1s search
     win = 30 * sr
-    a_start = max(pad, int(coarse_s * sr))          # b_start position on a, clamped
-    b_start = max(0, int(-coarse_s * sr))           # first overlapped sample in b
-    seg_b = wav_b[b_start: b_start + win]
-    search = wav_a[a_start - pad: a_start + len(seg_b) + pad]
+    a_start = max(pad, int(coarse_s * sr))  # b_start position on a, clamped
+    b_start = max(0, int(-coarse_s * sr))  # first overlapped sample in b
+    seg_b = wav_b[b_start : b_start + win]
+    search = wav_a[a_start - pad : a_start + len(seg_b) + pad]
     if len(seg_b) < sr or len(search) < len(seg_b) + pad:
         return coarse_s
     corr = signal.fftconvolve(search, seg_b[::-1], mode="valid")
@@ -99,7 +99,7 @@ def run(log, project: dict) -> None:
         groups.setdefault(find(c["id"]), []).append(c["id"])
 
     sync_groups = []
-    for gi, (root, members) in enumerate(groups.items()):
+    for gi, members in enumerate(groups.values()):
         if len(members) < 2:
             continue
         # Anchor timeline at the first member; place the rest via pairwise offsets.
@@ -118,8 +118,7 @@ def run(log, project: dict) -> None:
         base = min(pos.values())
         group = {
             "id": f"g{gi}",
-            "members": [{"clip_id": cid, "offset": round(p - base, 3)}
-                        for cid, p in pos.items()],
+            "members": [{"clip_id": cid, "offset": round(p - base, 3)} for cid, p in pos.items()],
         }
         sync_groups.append(group)
         names = ", ".join(store.get_clip(project, m)["filename"] for m in pos)

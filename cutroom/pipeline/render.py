@@ -5,7 +5,7 @@ replaced by the aligned external track."""
 
 import time
 
-from .. import config, ffmpeg_utils, store
+from .. import ffmpeg_utils, store
 from . import ordering, sync
 
 
@@ -41,14 +41,22 @@ def run(log, project: dict) -> None:
                 audio_src, audio_start = None, None  # external track starts later
         out = work / f"seg_{i:04d}.mp4"
         ffmpeg_utils.cut_segment(
-            clip["path"], seg["start"], seg["end"], str(out),
-            width, height, fps, audio_src=audio_src, audio_start=audio_start,
+            clip["path"],
+            seg["start"],
+            seg["end"],
+            str(out),
+            width,
+            height,
+            fps,
+            audio_src=audio_src,
+            audio_start=audio_start,
         )
         seg_paths.append(str(out))
         log.progress((i + 1) / (len(segments) + 1))
-        log(f"seg {i + 1}/{len(segments)}: {clip['filename']} "
-            f"{seg['start']:.1f}-{seg['end']:.1f}s"
-            + (" [external audio]" if audio_src else ""))
+        log(
+            f"seg {i + 1}/{len(segments)}: {clip['filename']} "
+            f"{seg['start']:.1f}-{seg['end']:.1f}s" + (" [external audio]" if audio_src else "")
+        )
 
     stamp = time.strftime("%Y%m%d_%H%M%S")
     final = pdir / f"maincut_{stamp}.mp4"
@@ -56,9 +64,13 @@ def run(log, project: dict) -> None:
     ffmpeg_utils.concat_segments(seg_paths, str(final), work)
 
     total = sum(s["end"] - s["start"] for s in segments)
-    project.setdefault("renders", []).append({
-        "path": str(final), "at": stamp, "segments": len(segments),
-        "duration": round(total, 1),
-    })
+    project.setdefault("renders", []).append(
+        {
+            "path": str(final),
+            "at": stamp,
+            "segments": len(segments),
+            "duration": round(total, 1),
+        }
+    )
     store.save(project)
     log(f"Done: {final.name} ({total:.0f}s from {len(segments)} segments).")

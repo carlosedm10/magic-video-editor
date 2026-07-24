@@ -19,18 +19,18 @@ PORT = int(os.environ.get("CUTROOM_PORT", "8765"))
 ANALYSIS_SR = 16000
 
 # Sync detection
-SYNC_ENV_RATE = 50           # Hz of the loudness envelope used for coarse alignment
-SYNC_MIN_CORR = 0.55         # normalized correlation to consider two clips simultaneous
+SYNC_ENV_RATE = 50  # Hz of the loudness envelope used for coarse alignment
+SYNC_MIN_CORR = 0.55  # normalized correlation to consider two clips simultaneous
 
 # Take/dedup detection
-DUP_SIMILARITY = 82          # rapidfuzz token_sort_ratio threshold (0-100)
+DUP_SIMILARITY = 82  # rapidfuzz token_sort_ratio threshold (0-100)
 DUP_MIN_WORDS = 4
 
 # Rendering
 RENDER_CRF = 18
 RENDER_PRESET = "veryfast"
-SEGMENT_PAD = 0.12           # seconds of padding around kept sentences
-MERGE_GAP = 1.2              # merge adjacent kept sentences closer than this (same clip)
+SEGMENT_PAD = 0.12  # seconds of padding around kept sentences
+MERGE_GAP = 1.2  # merge adjacent kept sentences closer than this (same clip)
 
 # Reels
 REEL_MIN_S = 15.0

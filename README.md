@@ -5,13 +5,17 @@ finds the best takes, orders the story, renders a main cut, and suggests ~20
 Reels/TikTok-ready vertical clips — **everything runs on your machine**:
 
 - **Whisper** (mlx-whisper, Apple Silicon GPU) — transcription with word timestamps
-- **Ollama** (any local model, default `qwen2.5:7b-instruct`) — all editorial *decisions*
+- **Ollama + pydantic_ai** (any local model, default `qwen2.5:7b-instruct`) — all
+  editorial *decisions*, as typed agents in `cutroom/agents/` (prompts.py /
+  schemas.py / agents.py)
 - **ffmpeg** — all cutting/cropping/rendering. No editing app involved.
 - **scipy** — multi-cam / external-audio sync via audio cross-correlation
 - **OpenCV** — face detection for speaker-centered 9:16 crops
 
-The LLM only ever emits JSON decisions (which take, what order, which clip) —
+The LLM only ever emits typed decisions (which take, what order, which clip) —
 it never touches pixels. Every decision is inspectable and overridable in the UI.
+Being pydantic_ai, the agents are provider-agnostic: swap the model/provider in
+config without touching prompts or schemas.
 
 ## Pipeline
 
@@ -40,10 +44,14 @@ it never touches pixels. Every decision is inspectable and overridable in the UI
 ## Run
 
 ```bash
-uv sync
-uv run cutroom          # native app window (pywebview)
-uv run cutroom-server   # or: plain backend, open http://127.0.0.1:8765
+make setup    # uv sync + pull the default ollama model + doctor checks
+make app      # native app window (pywebview)
+make server   # or: plain backend, open http://127.0.0.1:8765
 ```
+
+Other useful targets: `make doctor` (env checks), `make lint` / `make format`,
+`make smoke` (import test), `make health` (ping a running backend),
+`make uv-add PKG=...` etc. for dependencies. See the `Makefile`.
 
 First transcription downloads the whisper model (~1.6 GB) from Hugging Face.
 

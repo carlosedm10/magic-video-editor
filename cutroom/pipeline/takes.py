@@ -32,21 +32,28 @@ def _sentences_from_clip(clip: dict) -> list[dict]:
         gap = words[i + 1]["s"] - w["e"] if i + 1 < len(words) else 99
         text_so_far = " ".join(x["w"] for x in cur)
         if SENT_END.search(w["w"]) or gap > PAUSE_SPLIT or len(cur) >= 60:
-            sentences.append({
+            sentences.append(
+                {
+                    "id": uuid.uuid4().hex[:8],
+                    "clip_id": clip["id"],
+                    "start": round(cur[0]["s"], 3),
+                    "end": round(cur[-1]["e"], 3),
+                    "text": text_so_far,
+                    "words": cur,
+                }
+            )
+            cur = []
+    if cur:
+        sentences.append(
+            {
                 "id": uuid.uuid4().hex[:8],
                 "clip_id": clip["id"],
                 "start": round(cur[0]["s"], 3),
                 "end": round(cur[-1]["e"], 3),
-                "text": text_so_far,
+                "text": " ".join(x["w"] for x in cur),
                 "words": cur,
-            })
-            cur = []
-    if cur:
-        sentences.append({
-            "id": uuid.uuid4().hex[:8], "clip_id": clip["id"],
-            "start": round(cur[0]["s"], 3), "end": round(cur[-1]["e"], 3),
-            "text": " ".join(x["w"] for x in cur), "words": cur,
-        })
+            }
+        )
     return sentences
 
 
@@ -58,7 +65,7 @@ def _norm(text: str) -> str:
 
 def _rms_stability(wav: np.ndarray, start: float, end: float) -> float:
     sr = config.ANALYSIS_SR
-    seg = wav[int(start * sr): int(end * sr)]
+    seg = wav[int(start * sr) : int(end * sr)]
     if len(seg) < sr // 4:
         return 0.0
     hop = sr // 10
@@ -76,8 +83,9 @@ def _score(sent: dict, wav: np.ndarray | None, take_index: int) -> tuple[float, 
     fillers = len(FILLERS.findall(text))
     # word-restarts: "so we- so we can" => repeated bigrams
     toks = _norm(text).split()
-    restarts = sum(1 for k in range(len(toks) - 3)
-                   if toks[k] == toks[k + 2] and toks[k + 1] == toks[k + 3])
+    restarts = sum(
+        1 for k in range(len(toks) - 3) if toks[k] == toks[k + 2] and toks[k + 1] == toks[k + 3]
+    )
     complete = 1.0 if SENT_END.search(text.strip()) else 0.0
     dur = max(0.3, sent["end"] - sent["start"])
     rate = n_words / dur  # ~2-3.3 w/s is comfortable speech
@@ -92,24 +100,23 @@ def _score(sent: dict, wav: np.ndarray | None, take_index: int) -> tuple[float, 
         + 1.5 * stability
         + 0.4 * take_index  # later takes are usually the intended one
     )
-    why = (f"fillers={fillers} restarts={restarts} complete={bool(complete)} "
-           f"rate={rate:.1f}w/s stability={stability:.2f} take#{take_index + 1}")
+    why = (
+        f"fillers={fillers} restarts={restarts} complete={bool(complete)} "
+        f"rate={rate:.1f}w/s stability={stability:.2f} take#{take_index + 1}"
+    )
     return round(score, 2), why
 
 
 def _llm_tiebreak(candidates: list[dict]) -> str | None:
-    """Ask the local LLM which near-tied take reads best. Returns sentence id or None."""
+    """Ask the take-judge agent which near-tied take reads best. Returns
+    sentence id or None."""
+    from ..agents.agents import take_judge_agent
+
     try:
         listing = "\n".join(f'{i}: "{c["text"]}"' for i, c in enumerate(candidates))
-        result = llm.chat_json(
-            "You judge which take of the same spoken line is best for the final video: "
-            "fluent, complete, natural, no false starts. Answer JSON: {\"best\": <index>}.",
-            f"Takes of the same line:\n{listing}",
-            timeout=60,
-        )
-        idx = int(result.get("best", -1))
-        if 0 <= idx < len(candidates):
-            return candidates[idx]["id"]
+        pick = take_judge_agent.run_sync(f"Takes of the same line:\n{listing}").output
+        if 0 <= pick.best < len(candidates):
+            return candidates[pick.best]["id"]
     except Exception:
         pass
     return None
@@ -125,8 +132,7 @@ def run(log, project: dict) -> None:
     grouped_non_main = set()
     for g in project.get("sync_groups", []):
         members = [m["clip_id"] for m in g["members"]]
-        cams = [m for m in members
-                if store.get_clip(project, m)["role"] == "camera"]
+        cams = [m for m in members if store.get_clip(project, m)["role"] == "camera"]
         mains = [m for m in cams if store.get_clip(project, m)["is_main"]]
         keep = mains[0] if mains else (cams[0] if cams else None)
         grouped_non_main.update(m for m in cams if m != keep)
@@ -154,7 +160,7 @@ def run(log, project: dict) -> None:
             continue
         cluster = [s]
         assigned[s["id"]] = s["id"]
-        for t in sentences[i + 1:]:
+        for t in sentences[i + 1 :]:
             if t["id"] in assigned or len(norm[t["id"]].split()) < config.DUP_MIN_WORDS:
                 continue
             if fuzz.token_sort_ratio(norm[s["id"]], norm[t["id"]]) >= config.DUP_SIMILARITY:
@@ -164,7 +170,8 @@ def run(log, project: dict) -> None:
             groups.append(cluster)
 
     use_llm = llm.available()
-    log(f"{len(groups)} repeated-take group(s). LLM tiebreak: {'on' if use_llm else 'off (ollama down)'}")
+    tiebreak = "on" if use_llm else "off (ollama down)"
+    log(f"{len(groups)} repeated-take group(s). LLM tiebreak: {tiebreak}")
 
     # Score everything; pick winners inside duplicate groups.
     take_counter: dict[str, int] = {}
@@ -189,7 +196,9 @@ def run(log, project: dict) -> None:
             s["dup_group"] = f"d{gi}"
             if s["id"] != best["id"]:
                 s["kept"] = False
-                s["reason"] = f"repeated take — kept better version (score {best['score']} vs {s['score']})"
+                s["reason"] = (
+                    f"repeated take — kept better version (score {best['score']} vs {s['score']})"
+                )
 
     # Drop tiny fragments that survived (interjections, aborted starts).
     for s in sentences:

@@ -7,6 +7,7 @@ import time
 import uuid
 
 from .. import config, ffmpeg_utils, llm, store
+from ..agents.agents import reel_scorer_agent
 from . import faces
 
 
@@ -17,9 +18,10 @@ def _candidate_windows(project: dict) -> list[dict]:
     for clip in project["clips"]:
         if clip["role"] != "camera":
             continue
-        sents = sorted((s for s in project["sentences"]
-                        if s["clip_id"] == clip["id"] and s["kept"]),
-                       key=lambda s: s["start"])
+        sents = sorted(
+            (s for s in project["sentences"] if s["clip_id"] == clip["id"] and s["kept"]),
+            key=lambda s: s["start"],
+        )
         for i in range(len(sents)):
             acc, texts = [], []
             for j in range(i, len(sents)):
@@ -31,13 +33,15 @@ def _candidate_windows(project: dict) -> list[dict]:
                 if dur > config.REEL_MAX_S:
                     break
                 if dur >= config.REEL_MIN_S:
-                    out.append({
-                        "clip_id": clip["id"],
-                        "start": acc[0]["start"],
-                        "end": acc[-1]["end"],
-                        "text": " ".join(texts),
-                        "duration": round(dur, 1),
-                    })
+                    out.append(
+                        {
+                            "clip_id": clip["id"],
+                            "start": acc[0]["start"],
+                            "end": acc[-1]["end"],
+                            "text": " ".join(texts),
+                            "duration": round(dur, 1),
+                        }
+                    )
                     if dur >= config.REEL_MAX_S * 0.75:
                         break
     # thin out: keep at most ~80 for the LLM pass, longest-first per start point
@@ -71,35 +75,20 @@ def suggest(log, project: dict) -> None:
     log(f"Scoring {len(candidates)} candidate windows with {config.OLLAMA_MODEL}...")
 
     scored = []
-    batch = 8
-    for bi in range(0, len(candidates), batch):
-        chunk = candidates[bi: bi + batch]
-        listing = "\n\n".join(
-            f'CANDIDATE {i} ({c["duration"]}s):\n"{c["text"][:900]}"'
-            for i, c in enumerate(chunk)
-        )
+    for ci, cand in enumerate(candidates):
+        prompt = f'Candidate window ({cand["duration"]}s):\n"{cand["text"][:1200]}"'
         try:
-            result = llm.chat_json(
-                "You pick short-form clips (Reels/TikTok) from long-form video transcripts. "
-                "Score each candidate 0-10 on: hook (grabs attention in the first line), "
-                "self_contained (understandable without context), payoff (delivers value/punchline). "
-                'Answer JSON: {"scores": [{"i": idx, "hook": n, "self_contained": n, '
-                '"payoff": n, "title": "catchy 5-8 word title"}]}',
-                listing,
-            )
-            for s in result.get("scores", []):
-                i = int(s["i"])
-                if 0 <= i < len(chunk):
-                    c = dict(chunk[i])
-                    c["hook"] = float(s.get("hook", 0))
-                    c["self_contained"] = float(s.get("self_contained", 0))
-                    c["payoff"] = float(s.get("payoff", 0))
-                    c["title"] = str(s.get("title", ""))[:80]
-                    c["score"] = round(c["hook"] * 1.4 + c["self_contained"] + c["payoff"], 1)
-                    scored.append(c)
-        except llm.LLMError as e:
-            log(f"batch {bi // batch}: LLM error, skipping ({e})")
-        log.progress(min(0.95, (bi + batch) / len(candidates)))
+            s = reel_scorer_agent.run_sync(prompt).output
+            c = dict(cand)
+            c["hook"] = float(s.hook)
+            c["self_contained"] = float(s.self_contained)
+            c["payoff"] = float(s.payoff)
+            c["title"] = s.title[:80]
+            c["score"] = round(c["hook"] * 1.4 + c["self_contained"] + c["payoff"], 1)
+            scored.append(c)
+        except Exception as e:
+            log(f"candidate {ci}: LLM error, skipping ({e})")
+        log.progress(min(0.95, (ci + 1) / len(candidates)))
 
     # top N with limited mutual overlap
     scored.sort(key=lambda c: -c["score"])
@@ -110,23 +99,50 @@ def suggest(log, project: dict) -> None:
         if len(picked) >= config.REEL_SUGGESTIONS:
             break
 
-    project["reels"] = [{
-        "id": uuid.uuid4().hex[:8],
-        "rank": i + 1,
-        "clip_id": c["clip_id"],
-        "start": c["start"], "end": c["end"], "duration": c["duration"],
-        "title": c.get("title", ""), "score": c["score"],
-        "hook": c["hook"], "self_contained": c["self_contained"], "payoff": c["payoff"],
-        "text": c["text"],
-        "path": None, "status": "suggested",
-    } for i, c in enumerate(picked)]
+    project["reels"] = [
+        {
+            "id": uuid.uuid4().hex[:8],
+            "rank": i + 1,
+            "clip_id": c["clip_id"],
+            "start": c["start"],
+            "end": c["end"],
+            "duration": c["duration"],
+            "title": c.get("title", ""),
+            "score": c["score"],
+            "hook": c["hook"],
+            "self_contained": c["self_contained"],
+            "payoff": c["payoff"],
+            "text": c["text"],
+            "path": None,
+            "status": "suggested",
+        }
+        for i, c in enumerate(picked)
+    ]
     store.save(project)
     log(f"Suggested {len(picked)} reels (from {len(scored)} scored candidates).")
 
 
-def _srt_for_window(clip: dict, start: float, end: float, srt_path: str) -> None:
+ASS_HEADER = f"""[Script Info]
+ScriptType: v4.00+
+PlayResX: {config.REEL_W}
+PlayResY: {config.REEL_H}
+WrapStyle: 0
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, \
+BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, \
+BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Default,Helvetica,74,&H00FFFFFF,&H00FFFFFF,&H80000000,&H00000000,\
+-1,0,0,0,100,100,0,0,1,4,0,2,60,60,140,1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+"""
+
+
+def _ass_for_window(clip: dict, start: float, end: float, ass_path: str) -> None:
     """Karaoke-ish subtitles: cues of ~4 words from whisper word timestamps,
-    re-based to the reel's local time."""
+    re-based to the reel's local time. .ass so styling needs no filter quoting."""
     words = []
     for seg in clip["transcript"]["segments"]:
         words.extend(w for w in seg["words"] if start <= w["s"] < end)
@@ -135,19 +151,20 @@ def _srt_for_window(clip: dict, start: float, end: float, srt_path: str) -> None
         t = max(0.0, t - start)
         h, rem = divmod(t, 3600)
         m, s = divmod(rem, 60)
-        return f"{int(h):02d}:{int(m):02d}:{int(s):02d},{int((s % 1) * 1000):03d}"
+        return f"{int(h)}:{int(m):02d}:{int(s):02d}.{int((s % 1) * 100):02d}"
 
-    lines, cue = [], []
-    idx = 1
+    events, cue = [], []
     for i, w in enumerate(words):
         cue.append(w)
         nxt_gap = words[i + 1]["s"] - w["e"] if i + 1 < len(words) else 99
         if len(cue) >= 4 or nxt_gap > 0.6:
-            lines.append(f"{idx}\n{ts(cue[0]['s'])} --> {ts(cue[-1]['e'])}\n"
-                         f"{' '.join(x['w'] for x in cue)}\n")
-            cue, idx = [], idx + 1
-    with open(srt_path, "w") as f:
-        f.write("\n".join(lines))
+            text = " ".join(x["w"] for x in cue).replace("\n", " ")
+            events.append(
+                f"Dialogue: 0,{ts(cue[0]['s'])},{ts(cue[-1]['e'])},Default,,0,0,0,,{text}"
+            )
+            cue = []
+    with open(ass_path, "w") as f:
+        f.write(ASS_HEADER + "\n".join(events) + "\n")
 
 
 def render_reel(log, project: dict, reel_id: str) -> None:
@@ -165,18 +182,32 @@ def render_reel(log, project: dict, reel_id: str) -> None:
     log.progress(0.3)
 
     crop = faces.vertical_crop_filter(
-        clip["info"]["width"], clip["info"]["height"], center,
-        config.REEL_W, config.REEL_H)
+        clip["info"]["width"],
+        clip["info"]["height"],
+        center,
+        config.REEL_W,
+        config.REEL_H,
+    )
 
-    srt = str(pdir / "work" / f"reel_{reel_id}.srt")
-    _srt_for_window(clip, reel["start"], reel["end"], srt)
+    ass = None
+    if ffmpeg_utils.supports_subtitles():
+        ass = str(pdir / "work" / f"reel_{reel_id}.ass")
+        _ass_for_window(clip, reel["start"], reel["end"], ass)
+    else:
+        log("ffmpeg has no libass — rendering without burned subtitles")
 
     out = reels_dir / f"reel_{reel['rank']:02d}_{reel_id}.mp4"
     log(f"Rendering {config.REEL_W}x{config.REEL_H} with subtitles...")
     ffmpeg_utils.cut_segment(
-        clip["path"], reel["start"], reel["end"], str(out),
-        config.REEL_W, config.REEL_H, min(clip["info"]["fps"] or 30.0, 60.0),
-        vf_extra=crop, srt_path=srt,
+        clip["path"],
+        reel["start"],
+        reel["end"],
+        str(out),
+        config.REEL_W,
+        config.REEL_H,
+        min(clip["info"]["fps"] or 30.0, 60.0),
+        vf_extra=crop,
+        ass_path=ass,
     )
     reel["path"] = str(out)
     reel["status"] = "rendered"

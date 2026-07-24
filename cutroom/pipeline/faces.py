@@ -17,12 +17,14 @@ def _detector():
     global _cascade
     if _cascade is None:
         _cascade = cv2.CascadeClassifier(
-            cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
+            cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+        )
     return _cascade
 
 
-def face_center(video_path: str, t_start: float, t_end: float,
-                samples: int = 7) -> tuple[float, float] | None:
+def face_center(
+    video_path: str, t_start: float, t_end: float, samples: int = 7
+) -> tuple[float, float] | None:
     """Median face center across sampled frames, as (x, y) fractions of the frame.
     None if no face is found."""
     det = _detector()
@@ -39,8 +41,7 @@ def face_center(video_path: str, t_start: float, t_end: float,
             if img is None:
                 continue
             gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-            faces = det.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5,
-                                         minSize=(60, 60))
+            faces = det.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(60, 60))
             if len(faces) == 0:
                 continue
             # biggest face = the speaker
@@ -54,8 +55,9 @@ def face_center(video_path: str, t_start: float, t_end: float,
     return cx, cy
 
 
-def vertical_crop_filter(src_w: int, src_h: int, center: tuple[float, float] | None,
-                         out_w: int, out_h: int) -> str:
+def vertical_crop_filter(
+    src_w: int, src_h: int, center: tuple[float, float] | None, out_w: int, out_h: int
+) -> str:
     """ffmpeg crop filter string for a 9:16 window centered on the face
     (falls back to frame center), sized to the largest crop that fits."""
     target_ar = out_w / out_h

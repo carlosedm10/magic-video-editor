@@ -1,7 +1,6 @@
 """FastAPI backend: serves the UI, the project API, media streaming (with Range
 support so <video> can seek), and launches pipeline stages as background jobs."""
 
-import os
 import shutil
 from pathlib import Path
 
@@ -10,7 +9,7 @@ from fastapi.responses import FileResponse, HTMLResponse, Response, StreamingRes
 from pydantic import BaseModel
 
 from . import config, jobs, llm, store
-from .pipeline import ingest, ordering, render, reels, sync, takes, transcribe
+from .pipeline import ingest, ordering, reels, render, sync, takes, transcribe
 
 app = FastAPI(title="CutRoom")
 UI_DIR = Path(__file__).parent.parent / "ui"
@@ -29,6 +28,7 @@ STAGE_ORDER = list(STAGES.keys())
 
 # ---------- UI ----------
 
+
 @app.get("/", response_class=HTMLResponse)
 def index():
     return (UI_DIR / "index.html").read_text()
@@ -45,6 +45,7 @@ def ui_asset(name: str):
 
 # ---------- health ----------
 
+
 @app.get("/api/health")
 def health():
     return {
@@ -57,6 +58,7 @@ def health():
 
 
 # ---------- projects ----------
+
 
 class NewProject(BaseModel):
     name: str
@@ -94,7 +96,7 @@ def project_get(pid: str):
     try:
         p = store.load(pid)
     except FileNotFoundError:
-        raise HTTPException(404)
+        raise HTTPException(404) from None
     p["edl_preview"] = ordering.build_edl(p) if p.get("sentences") else []
     return p
 
@@ -158,6 +160,7 @@ def order_update(pid: str, body: OrderUpdate):
 
 # ---------- pipeline ----------
 
+
 @app.post("/api/projects/{pid}/run/{stage}")
 def run_stage(pid: str, stage: str):
     if stage not in STAGES:
@@ -179,8 +182,7 @@ def run_stage(pid: str, stage: str):
 @app.post("/api/projects/{pid}/reels/{rid}/render")
 def reel_render(pid: str, rid: str):
     project = store.load(pid)
-    return {"job": jobs.start(f"reel:{rid}",
-                              lambda log: reels.render_reel(log, project, rid))}
+    return {"job": jobs.start(f"reel:{rid}", lambda log: reels.render_reel(log, project, rid))}
 
 
 @app.get("/api/jobs/{jid}")
@@ -192,6 +194,7 @@ def job_get(jid: str):
 
 
 # ---------- media streaming (Range-aware for <video> seeking) ----------
+
 
 def _stream(path: Path, request: Request):
     if not path.exists():
@@ -218,12 +221,15 @@ def _stream(path: Path, request: Request):
                 yield chunk
 
     return StreamingResponse(
-        reader(), status_code=206, media_type=media,
+        reader(),
+        status_code=206,
+        media_type=media,
         headers={
             "Content-Range": f"bytes {start}-{end}/{size}",
             "Accept-Ranges": "bytes",
             "Content-Length": str(end - start + 1),
-        })
+        },
+    )
 
 
 @app.get("/api/projects/{pid}/media/clip/{cid}")
@@ -243,6 +249,7 @@ def media_file(pid: str, path: str, request: Request):
 
 def main():
     import uvicorn
+
     config.ensure_dirs()
     uvicorn.run(app, host=config.HOST, port=config.PORT, log_level="warning")
 
