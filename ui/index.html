@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>CutRoom</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="/ui/style.css">
+</head>
+<body>
+<div id="app">
+  <aside id="sidebar">
+    <div class="brand">✂️ CutRoom</div>
+    <button id="new-project" class="btn primary">New project</button>
+    <div id="project-list"></div>
+    <div id="health" class="health"></div>
+  </aside>
+  <main id="main">
+    <div id="empty-state" class="empty">Create or select a project to start.</div>
+    <div id="project-view" hidden>
+      <header>
+        <h1 id="p-name"></h1>
+        <div id="stage-bar"></div>
+      </header>
+      <nav id="tabs">
+        <button data-tab="files" class="tab active">Files</button>
+        <button data-tab="takes" class="tab">Takes</button>
+        <button data-tab="edit" class="tab">Edit</button>
+        <button data-tab="reels" class="tab">Reels</button>
+        <button data-tab="jobs" class="tab">Activity</button>
+      </nav>
+      <section id="tab-files" class="tabpane"></section>
+      <section id="tab-takes" class="tabpane" hidden></section>
+      <section id="tab-edit" class="tabpane" hidden></section>
+      <section id="tab-reels" class="tabpane" hidden></section>
+      <section id="tab-jobs" class="tabpane" hidden></section>
+    </div>
+  </main>
+</div>
+<script src="/ui/app.js"></script>
+</body>
+</html>
