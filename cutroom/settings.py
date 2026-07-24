@@ -38,6 +38,9 @@ DEFAULTS: dict = {
     # subtitles config's passthrough defaults (section 6) -- both merged in
     # the same backward-compatible way as task_models/performance below.
     "export_dir": DEFAULT_EXPORT_DIR,
+    # v5 addendum "SEO copywriter + brand profile": free-form text passed
+    # verbatim to the copywriter agent (channel/audience/tone/links/hashtags/CTAs).
+    "brand_profile": "",
     "subtitles": {
         "enabled": False,
         "style": "clean",

@@ -32,6 +32,7 @@ class SettingsIn(BaseModel):
     export_dir: str | None = None
     subtitles: dict | None = None
     performance: dict | None = None
+    brand_profile: str | None = None
 
 
 @router.get("/settings")
@@ -78,6 +79,11 @@ def put_settings(body: SettingsIn):
 
     if body.export_dir is not None:
         current["export_dir"] = _validate_export_dir(body.export_dir)
+
+    if body.brand_profile is not None:
+        if not isinstance(body.brand_profile, str):
+            raise HTTPException(422, "brand_profile must be a string")
+        current["brand_profile"] = body.brand_profile
 
     if body.subtitles is not None:
         subs = dict(current["subtitles"])

@@ -1,12 +1,13 @@
-/* Bottom timeline: adaptive ruler, zoom (slider + wheel), one video track of
-   blocks (width ∝ duration) with filmstrip + waveform art, selection
-   highlight, playhead synced both ways with the player, drag blocks to
-   reorder, drag block edges to trim (live feedback, 0.05s snap, optional
-   snap-to-playhead/edges), per-junction transition chips, markers on the
-   ruler, a render-status bar, media-bin drop-to-append, and the toolbar
-   (split / ripple-delete / undo / redo / reset / save / snap toggle /
-   shortcuts popover). All EDL mutations go through `Editor` (ui/editor/
-   state.js), which owns history + autosave.
+/* Bottom timeline: adaptive ruler, zoom (slider + wheel + min-zoom-fits-all +
+   Fit button), one video track of blocks (width ∝ duration) with filmstrip +
+   waveform art, selection highlight, playhead synced both ways with the
+   player, drag blocks to reorder, drag block edges to trim (live feedback,
+   0.05s snap, optional snap-to-playhead/edges, left-edge drags stay anchored
+   by their right edge on screen), per-junction transition chips, markers on
+   the ruler, a render-status bar, media-bin drop-to-append, a history panel,
+   and the toolbar (split / ripple-delete / undo / redo / reset / save / snap
+   toggle / history / shortcuts popover). All EDL mutations go through
+   `Editor` (ui/editor/state.js), which owns history + autosave.
 
    Keyboard map (spec v4 §4 "Timeline pro" + the "?" popover):
      Space  play/pause      J  jump back 2s       K  pause
@@ -16,9 +17,10 @@
      ⌘Z/⇧⌘Z undo/redo       +/-  zoom              ?  shortcuts popover
 
    DOM note: this module injects its own <style> block and a couple of
-   container divs (render bar, markers strip, shortcuts popover) at mount
-   time rather than depending on ui/index.html/ui/style.css (owned by other
-   agents this phase) — see the injectStyles()/_ensureChrome() functions. */
+   container divs (render bar, markers strip, shortcuts popover, history
+   popover) at mount time rather than depending on ui/index.html/ui/style.css
+   (owned by other agents this phase) — see the injectStyles()/_ensureChrome()
+   functions. */
 
 window.EditorUI = window.EditorUI || {};
 
@@ -31,6 +33,8 @@ const Timeline = {
   _lastTrimValue: null,    // last (possibly snapped) value computed during an edge drag
   _thumbCache: new Map(),  // clip_id -> {meta, peaks, stripUrl, metaFailed, loading}
   _shortcutsOpen: false,
+  _historyOpen: false,
+  _zoomMin: 4,             // recomputed every render() from total duration + viewport (spec v5 addendum "Zoom")
 
   mount() {
     this._injectStyles();
@@ -41,10 +45,18 @@ const Timeline = {
 
     const zoom = document.getElementById("tl-zoom");
     if (zoom) {
+      zoom.max = "220";
       zoom.value = String(this.pxPerSec);
-      zoom.oninput = () => { this.pxPerSec = Number(zoom.value); this.render(); };
+      zoom.oninput = () => { this._setZoom(Number(zoom.value)); };
     }
     const scroll = document.getElementById("timeline-scroll");
+    if (scroll && !this._resizeObserved) {
+      // Viewport width feeds directly into the min-zoom-fits-all computation
+      // (spec v5 addendum "Zoom") — re-render (which recomputes it) whenever
+      // the timeline pane is resized (window resize, sidebar collapse, …).
+      this._resizeObserved = true;
+      new ResizeObserver(() => this.render()).observe(scroll);
+    }
     if (scroll) {
       scroll.addEventListener("wheel", (e) => {
         if (Math.abs(e.deltaY) <= Math.abs(e.deltaX)) return; // let horizontal wheel/trackpad pan normally
@@ -77,6 +89,7 @@ const Timeline = {
       if (!confirm("Discard manual edits and reset the timeline to the AI cut?")) return;
       await Editor.resetToAiCut();
     });
+    bind("tl-fit", () => this.zoomToFit());
 
     // Relabel/retitle two existing v3 toolbar controls in place (index.html
     // is owned by another agent this phase, but a DOM mutation from here is
@@ -128,6 +141,21 @@ const Timeline = {
       .tl-shortcuts-pop td:first-child { color: var(--text); font-variant-numeric: tabular-nums;
         white-space: nowrap; padding-right: 10px; width: 1%; }
       #timeline-content.tl-drop-target { outline: 2px dashed var(--accent); outline-offset: -2px; }
+      .tl-history-pop { position: absolute; bottom: 100%; right: 0; margin-bottom: 6px; width: 260px;
+        max-height: 320px; overflow-y: auto; background: var(--panel); border: 1px solid var(--border);
+        border-radius: 12px; padding: 8px; backdrop-filter: blur(16px); box-shadow: 0 8px 24px rgba(0,0,0,.4);
+        z-index: 20; font-size: 12px; }
+      .tl-history-title { color: var(--dim); font-size: 11px; text-transform: uppercase; letter-spacing: .04em;
+        padding: 2px 6px 6px; }
+      .tl-history-list { list-style: none; margin: 0; padding: 0; }
+      .tl-history-item { display: flex; justify-content: space-between; align-items: baseline; gap: 8px;
+        padding: 6px 6px; border-radius: 8px; cursor: pointer; color: var(--text); }
+      .tl-history-item:hover { background: var(--panel2); }
+      .tl-history-item.active { background: var(--accent); color: #fff; }
+      .tl-history-item.active .tl-history-time { color: rgba(255,255,255,.75); }
+      .tl-history-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      .tl-history-time { color: var(--dim); font-variant-numeric: tabular-nums; flex-shrink: 0; }
+      .tl-history-empty { color: var(--dim); padding: 6px; }
     `;
     document.head.appendChild(style);
   },
@@ -153,6 +181,30 @@ const Timeline = {
       snapBtn.textContent = "⟝ Snap";
       snapBtn.onclick = () => this._toggleSnapping();
       toolbar.appendChild(snapBtn);
+    }
+    if (toolbar && !document.getElementById("tl-fit")) {
+      const fitBtn = document.createElement("button");
+      fitBtn.id = "tl-fit";
+      fitBtn.className = "btn small";
+      fitBtn.title = "Zoom to fit the whole timeline (~20% spare room)";
+      fitBtn.textContent = "⤢ Fit";
+      toolbar.appendChild(fitBtn); // onclick wired in mount() via bind()
+    }
+    if (toolbar && !document.getElementById("tl-history-btn")) {
+      const wrap = document.createElement("div");
+      wrap.style.position = "relative";
+      wrap.id = "tl-history-wrap";
+      const btn = document.createElement("button");
+      btn.id = "tl-history-btn";
+      btn.className = "btn small";
+      btn.title = "Edit history";
+      btn.textContent = "🕐";
+      btn.onclick = (e) => { e.stopPropagation(); this._toggleHistory(); };
+      wrap.appendChild(btn);
+      toolbar.appendChild(wrap);
+      document.addEventListener("pointerdown", (e) => {
+        if (this._historyOpen && !wrap.contains(e.target)) this._toggleHistory(false);
+      });
     }
     if (toolbar && !document.getElementById("tl-shortcuts-btn")) {
       const wrap = document.createElement("div");
@@ -213,8 +265,96 @@ const Timeline = {
     }
   },
 
+  /* ---------- history panel (spec v5 addendum "Undo history panel") ----------
+     Reuses the same button chrome pattern as the "?" shortcuts popover:
+     small toolbar toggle + click-outside-to-close, but the content is
+     re-rendered on every Editor history push/undo/redo (via Editor.
+     _notifyHistory -> renderHistoryPanel) so it never goes stale while open. */
+  _toggleHistory(force) {
+    this._historyOpen = force != null ? force : !this._historyOpen;
+    const wrap = document.getElementById("tl-history-wrap");
+    if (!wrap) return;
+    if (this._historyOpen) {
+      if (!document.getElementById("tl-history-pop")) {
+        const pop = document.createElement("div");
+        pop.id = "tl-history-pop";
+        pop.className = "tl-history-pop";
+        wrap.appendChild(pop);
+      }
+      this.renderHistoryPanel();
+    } else {
+      document.getElementById("tl-history-pop")?.remove();
+    }
+  },
+
+  renderHistoryPanel() {
+    if (!this._historyOpen) return;
+    const pop = document.getElementById("tl-history-pop");
+    if (!pop) return;
+    const hist = Editor.history || [];
+    if (!hist.length) { pop.innerHTML = `<div class="tl-history-empty">No history yet</div>`; return; }
+    // Most recent first; current position highlighted.
+    const rows = hist.map((entry, idx) => ({ idx, entry })).reverse();
+    pop.innerHTML = `<div class="tl-history-title">Edit history</div><ul class="tl-history-list">`
+      + rows.map(({ idx, entry }) => {
+        const active = idx === Editor.historyIndex;
+        const time = entry.ts
+          ? new Date(entry.ts).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" })
+          : "";
+        return `<li class="tl-history-item${active ? " active" : ""}" data-hidx="${idx}">
+          <span class="tl-history-label">${esc(entry.label || "Edit")}</span>
+          <span class="tl-history-time">${esc(time)}</span>
+        </li>`;
+      }).join("")
+      + `</ul>`;
+    pop.querySelectorAll(".tl-history-item").forEach((el) => {
+      el.onclick = () => Editor.restoreToHistoryIndex(Number(el.dataset.hidx));
+    });
+  },
+
+  /* ---------- zoom (spec v5 addendum "Zoom-out must fit everything") ----------
+     Minimum zoom = the level at which the ENTIRE EDL fills ~80% of the
+     visible strip (i.e. ~20% spare room), recomputed every render() from the
+     current total duration and the scroll viewport's live width, so it
+     tracks both EDL edits (trim/split/delete/reset) and viewport resizes
+     (the ResizeObserver in mount() just triggers a render()). The zoom
+     slider's `min` attribute is kept in sync, and _setZoom (used by the
+     slider, wheel-zoom, +/- keys, and the Fit button) clamps to it — so
+     nothing can zoom out further than "everything fits". */
+  _fitZoomValue(segs) {
+    const list = segs || this._previewSegments || Editor.segments || [];
+    const scroll = document.getElementById("timeline-scroll");
+    const viewportW = scroll?.clientWidth || 800;
+    const total = list.reduce((acc, s) => acc + Math.max(0, s.end - s.start), 0);
+    if (total <= 0) return 4;
+    return Math.max(1, Math.min((viewportW * 0.8) / total, 220));
+  },
+
+  _updateZoomBounds(segs) {
+    const min = this._fitZoomValue(segs);
+    this._zoomMin = min;
+    const zoom = document.getElementById("tl-zoom");
+    if (zoom) zoom.min = String(Math.round(min * 100) / 100);
+    // Never force pxPerSec up mid-edge-drag: the left-edge anchor math in
+    // _onEdgePointerDown fixes anchorRightPx in CURRENT-px terms for the
+    // whole gesture, and a trim can transiently shrink total duration enough
+    // to raise the fit-minimum — changing pxPerSec underneath that drag would
+    // make the anchor pixel stale and the block jump. The slider's min
+    // attribute still updates live; the actual pxPerSec clamp is deferred
+    // until the drag's pointerup (next render() call after it ends).
+    if (this.pxPerSec < min && !this._edgeDragging) {
+      this.pxPerSec = min;
+      if (zoom) zoom.value = String(Math.round(this.pxPerSec));
+    }
+  },
+
+  zoomToFit() {
+    this._setZoom(this._fitZoomValue());
+  },
+
   _setZoom(v) {
-    this.pxPerSec = Math.max(4, Math.min(220, v));
+    const min = this._zoomMin ?? this._fitZoomValue();
+    this.pxPerSec = Math.max(min, Math.min(220, v));
     const zoom = document.getElementById("tl-zoom");
     if (zoom) zoom.value = String(Math.round(this.pxPerSec));
     this.render();
@@ -267,6 +407,7 @@ const Timeline = {
 
   render() {
     const segs = this._previewSegments || Editor.segments || [];
+    this._updateZoomBounds(segs);
     const px = this.pxPerSec;
     const total = segs.reduce((acc, s) => acc + Math.max(0, s.end - s.start), 0);
     const widthPx = Math.max(total * px, 40);
@@ -602,6 +743,7 @@ const Timeline = {
     const anchorRightPx = row.end * px;
     const anchorLeftPx = row.start * px;
     this._dragLeftAnchor = field === "start" ? { index: i, anchorRightPx } : null;
+    this._edgeDragging = true;
 
     const SNAP_PX = 8;
     const snapPx = (rawPx) => {
@@ -652,6 +794,7 @@ const Timeline = {
       window.removeEventListener("pointermove", onMove);
       window.removeEventListener("pointerup", onUp);
       this._dragLeftAnchor = null;
+      this._edgeDragging = false;
       this._previewSegments = null;
       if (this._lastTrimValue != null) Editor.trim(i, field, this._lastTrimValue);
       this._lastTrimValue = null;

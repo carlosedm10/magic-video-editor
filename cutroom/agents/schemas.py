@@ -97,6 +97,23 @@ class ReviewFindings(BaseModel):
     findings: list[ReviewFinding] = Field(default_factory=list, max_length=8)
 
 
+class CopywriterOutput(BaseModel):
+    """SEO/viral copy for a reel or the full video. Flat schema, small-model
+    friendly. Written in the content's own language."""
+
+    title: str = Field(
+        ..., description="Scroll-stopping but truthful title, <=70 characters"
+    )
+    description: str = Field(
+        default="",
+        description="SEO-structured description: keywords early, line breaks, "
+        "brand-aligned CTA, hashtags at the end",
+    )
+    hashtags: str = Field(
+        default="", description="2-5 relevant hashtags, space-separated, '#' prefixed"
+    )
+
+
 class ReelScore(BaseModel):
     """Scores for one short-form candidate window. Kept flat and
     single-candidate on purpose: small local models fill this schema far more

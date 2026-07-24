@@ -182,28 +182,77 @@ def _group_words_into_cues(
 
 
 def ass_for_range(
-    clip: dict, start: float, end: float, cfg: dict | None, play_res: tuple[int, int]
+    clip: dict,
+    start: float,
+    end: float,
+    cfg: dict | None,
+    play_res: tuple[int, int],
+    cue_overrides: dict | None = None,
 ) -> str:
     """Full .ass file content for one render segment/reel window [start, end)
     of `clip`'s transcript. Times are re-based (0 == start), matching how the
-    caller will burn it via a `-ss start -t (end-start)` cut."""
+    caller will burn it via a `-ss start -t (end-start)` cut. `cue_overrides`
+    (spec v5 reel data model, {cue_index: text}) substitutes cue TEXT by
+    index — typo fixes from the Reel Editor's Subs tab — keeping timing."""
     cfg = normalize_config(cfg)
     words = _words_in_range(clip, start, end)
     cues = _group_words_into_cues(words, start, cfg["words_per_cue"])
+    cues = _apply_cue_overrides(cues, cue_overrides)
     events = [
-        f"Dialogue: 0,{_ts(t0)},{_ts(t1)},Default,,0,0,0,,{text}" for t0, t1, text in cues
+        f"Dialogue: 0,{_ts(t0)},{_ts(t1)},Default,,0,0,0,,{text}"
+        for t0, t1, text in cues
+        if text
     ]
     return _header(cfg, play_res) + "\n".join(events) + ("\n" if events else "")
 
 
 def write_ass(
-    path: str, clip: dict, start: float, end: float, cfg: dict | None, play_res: tuple[int, int]
+    path: str,
+    clip: dict,
+    start: float,
+    end: float,
+    cfg: dict | None,
+    play_res: tuple[int, int],
+    cue_overrides: dict | None = None,
 ) -> str:
     """ass_for_range(...) written to `path`. Returns `path` for convenience."""
-    content = ass_for_range(clip, start, end, cfg, play_res)
+    content = ass_for_range(clip, start, end, cfg, play_res, cue_overrides)
     with open(path, "w") as f:
         f.write(content)
     return path
+
+
+def _apply_cue_overrides(
+    cues: list[tuple[float, float, str]], cue_overrides: dict | None
+) -> list[tuple[float, float, str]]:
+    """Replace cue text by index. Indices may arrive as JSON-round-tripped
+    strings ("0") as well as ints — both are honored. Unknown/out-of-range
+    indices are ignored rather than raising, since the window/style may have
+    changed since the override was recorded."""
+    if not cue_overrides:
+        return cues
+    out = list(cues)
+    for i, (t0, t1, _text) in enumerate(cues):
+        override = cue_overrides.get(i, cue_overrides.get(str(i)))
+        if override is not None:
+            text = str(override).strip().replace("\n", " ")
+            out[i] = (t0, t1, text)
+    return out
+
+
+def cues_for_range(clip: dict, start: float, end: float, cfg: dict | None = None) -> list[dict]:
+    """[{index, start, end, text}] cues for a clip window using the same
+    word-grouping as `ass_for_range`, WITHOUT rendering an .ass file —
+    exposes the index each cue would have so callers (the Reel Editor's Subs
+    tab, reels.py's cues endpoint) can key `cue_overrides` correctly. Times
+    are re-based so 0 == `start`, matching `ass_for_range`."""
+    cfg = normalize_config(cfg)
+    words = _words_in_range(clip, start, end)
+    cues = _group_words_into_cues(words, start, cfg["words_per_cue"])
+    return [
+        {"index": i, "start": round(t0, 3), "end": round(t1, 3), "text": text}
+        for i, (t0, t1, text) in enumerate(cues)
+    ]
 
 
 def cue_list(project: dict) -> list[dict]:

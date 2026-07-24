@@ -3,9 +3,12 @@
    to size full-viewport (this module renders assuming the container it's
    given covers everything -- no drawer-width styling here).
 
-   Left section nav: General | Models | Performance | Transcription | About.
+   Left section nav: General | Brand | Models | Performance | Transcription | About.
    - General: export_dir (native pick_folder w/ manual-paste fallback) +
      "Open folder" (POST /api/open-folder). Saves via PUT /api/settings.
+   - Brand: settings.brand_profile free-text textarea (spec v5 addendum "SEO
+     copywriter + brand profile"), fed to the copywriter agent. Autosave on
+     blur + explicit Save button, character count.
    - Models: default + per-task dropdowns (GET /api/ollama/models) PLUS the
      Ollama model manager (GET /api/ollama/library, POST /api/ollama/pull
      polled via GET /api/jobs/{id}, DELETE /api/ollama/models/{name}).
@@ -30,6 +33,7 @@ const TASK_INFO = [
 
 const SECTIONS = [
   ["general", "General"],
+  ["brand", "Brand"],
   ["models", "Models"],
   ["performance", "Performance"],
   ["transcription", "Transcription"],
@@ -126,6 +130,13 @@ function _injectStyleOnce() {
     .sfs-about-key { color:var(--dim); }
     .sfs-ok { color:var(--accent2); }
     .sfs-bad { color:var(--danger); }
+    .sfs-textarea {
+      background:var(--panel2); border:1px solid var(--border); color:var(--text);
+      border-radius:10px; padding:12px 14px; width:100%; font:inherit; font-size:14px;
+      line-height:1.5; resize:vertical; min-height:260px;
+    }
+    .sfs-textarea:focus { outline:none; border-color:var(--accent); }
+    .sfs-charcount { color:var(--dim); font-size:12px; margin-top:6px; text-align:right; }
   `;
   document.head.appendChild(style);
 }
@@ -177,6 +188,7 @@ function _sfsRenderShell() {
 
   const host = $("#sfs-section");
   if (_sfs.section === "general") _sfsRenderGeneral(host);
+  else if (_sfs.section === "brand") _sfsRenderBrand(host);
   else if (_sfs.section === "models") _sfsRenderModels(host);
   else if (_sfs.section === "performance") _sfsRenderPerformance(host);
   else if (_sfs.section === "transcription") _sfsRenderTranscription(host);
@@ -248,6 +260,78 @@ function _sfsRenderGeneral(host) {
       feedback.style.color = "var(--danger)";
     }
   };
+}
+
+/* ---------- Brand ---------- */
+
+const BRAND_PLACEHOLDER =
+  `Channel: e.g. "Carlos builds things" (YouTube + TikTok/Reels/Shorts)
+Audience: indie devs and makers who like behind-the-scenes build logs
+Tone: direct, a little dry-humored, no hype/clickbait
+Recurring links: youtube.com/@example, example.com
+Recurring hashtags: #buildinpublic #indiedev #softwareengineering
+CTA: "Subscribe for the next build" / "Full write-up on the blog, link below"`;
+
+function _sfsRenderBrand(host) {
+  const s = _sfs.settings;
+  const value = s.brand_profile || "";
+  host.innerHTML = `
+    <div>
+      <div class="sfs-h1">Brand</div>
+      <div class="sfs-sub">Describe your brand once — the AI copywriter uses it to write
+        titles, descriptions and hashtags for your reels and the main video.</div>
+    </div>
+    <div class="sfs-card">
+      <div class="sfs-field">
+        <label class="sfs-label">Brand profile</label>
+        <textarea class="sfs-textarea" id="sfs-brand-profile"
+          placeholder="${esc(BRAND_PLACEHOLDER)}">${esc(value)}</textarea>
+        <div class="sfs-charcount" id="sfs-brand-charcount">${value.length} characters</div>
+        <div class="sfs-hint">Free-form plain text: your channel/handle, target audience, tone of
+          voice, recurring links, hashtags you always use, and your usual call-to-action. It's
+          passed as-is to the copywriter agent when it writes reel and video titles/descriptions.
+          Saves automatically when you click away, or use Save below.</div>
+      </div>
+      <div class="sfs-row" style="margin-top:6px">
+        <button class="sfs-btn primary" id="sfs-save-brand">Save</button>
+        <span class="sfs-feedback" id="sfs-brand-feedback"></span>
+      </div>
+    </div>`;
+
+  const textarea = $("#sfs-brand-profile");
+  const charcount = $("#sfs-brand-charcount");
+  textarea.oninput = () => {
+    charcount.textContent = `${textarea.value.length} characters`;
+  };
+  textarea.onblur = () => _sfsSaveBrand({ silent: true });
+  $("#sfs-save-brand").onclick = () => _sfsSaveBrand({ silent: false });
+}
+
+async function _sfsSaveBrand({ silent }) {
+  const textarea = $("#sfs-brand-profile");
+  if (!textarea) return;
+  const feedback = $("#sfs-brand-feedback");
+  const value = textarea.value;
+  if (silent && _sfs.settings && (_sfs.settings.brand_profile || "") === value) return;
+  if (feedback) {
+    feedback.textContent = "Saving…";
+    feedback.style.color = "";
+  }
+  try {
+    _sfs.settings = await api("/settings", {
+      method: "PUT",
+      body: { brand_profile: value },
+    });
+    if (feedback) {
+      feedback.textContent = "Saved.";
+      feedback.style.color = "var(--accent2)";
+    }
+  } catch (e) {
+    if (feedback) {
+      feedback.textContent = `Failed to save: ${e.message}`;
+      feedback.style.color = "var(--danger)";
+    }
+  }
 }
 
 /* ---------- Models ---------- */

@@ -4,7 +4,7 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
 from .. import store
-from ..pipeline import ingest, ordering
+from ..pipeline import copywriter, ingest, ordering
 
 router = APIRouter(prefix="/api", tags=["projects"])
 
@@ -105,6 +105,18 @@ def sentence_update(pid: str, sid: str, body: SentenceUpdate):
             store.save(project)
             return s
     raise HTTPException(404)
+
+
+@router.post("/projects/{pid}/publish")
+def publish_generate(pid: str):
+    """v5 addendum "SEO copywriter + brand profile": generate (or
+    regenerate, on demand) the project-level Publish block -- a video title
+    suggestion + SEO description for the main cut -- and store it as
+    project["publish"]. GET /api/projects/{pid} returns it as-is thereafter."""
+    project = store.load(pid)
+    project["publish"] = copywriter.copy_for_video(project)
+    store.save(project)
+    return project["publish"]
 
 
 @router.post("/projects/{pid}/order")

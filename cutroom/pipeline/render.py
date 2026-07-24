@@ -72,6 +72,30 @@ def _safe_folder_name(name: str) -> str:
     return cleaned or "project"
 
 
+def _sanitize_export_title(name: str) -> str:
+    """Filename stem sanitization for exported files (spec v5 addendum
+    "export filenames"): strip /:\\ and control chars, collapse whitespace.
+    Unlike `_safe_folder_name` (folder names, replaces with "_"), separators
+    are simply dropped so "A: B" -> "A B", not "A_ B"."""
+    cleaned = re.sub(r'[/:\\\x00-\x1f]', "", name or "")
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return cleaned or "project"
+
+
+def _unique_export_path(export_dir: Path, stem: str, ext: str = ".mp4") -> Path:
+    """Dedupe an export filename against what's already on disk: "<stem>.mp4",
+    then "<stem> (2).mp4", "<stem> (3).mp4", ... (spec v5 addendum)."""
+    candidate = export_dir / f"{stem}{ext}"
+    if not candidate.exists():
+        return candidate
+    n = 2
+    while True:
+        candidate = export_dir / f"{stem} ({n}){ext}"
+        if not candidate.exists():
+            return candidate
+        n += 1
+
+
 def _export_dir_for(project: dict) -> Path:
     """settings.export_dir (owned/added by the settings agent in parallel) —
     read defensively so this keeps working whether or not that key exists
@@ -374,7 +398,8 @@ def run(log, project: dict) -> None:
     width, height, fps = _target_format(project)
     export_dir = _export_dir_for(project)
     stamp = time.strftime("%Y%m%d_%H%M%S")
-    final = export_dir / f"maincut_{stamp}.mp4"
+    title = _sanitize_export_title(project.get("name") or project["id"])
+    final = _unique_export_path(export_dir, title)
 
     _build(
         log,

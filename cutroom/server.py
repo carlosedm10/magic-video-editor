@@ -21,6 +21,7 @@ from .api import (
     ollama,
     pipeline,
     projects,
+    reels,
     settings,
     subtitles,
     suggestions,
@@ -40,6 +41,7 @@ app.include_router(suggestions.router)
 app.include_router(ollama.router)
 app.include_router(subtitles.router)
 app.include_router(thumbs.router)
+app.include_router(reels.router)
 
 
 # ---------- UI ----------

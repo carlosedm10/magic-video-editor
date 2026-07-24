@@ -55,6 +55,16 @@ def face_center(
     return cx, cy
 
 
+def manual_center(crop_x: float) -> tuple[float, float]:
+    """(x, y) center fraction for a manual `crop_x` override (Reel Editor
+    framing drag, spec v5): x = crop_x clamped to 0..1, y = the same 0.45
+    default used when no face is detected. Callers pass the result straight
+    into `vertical_crop_filter` in place of `face_center(...)`'s output,
+    bypassing face detection entirely when the user has set an explicit
+    horizontal center."""
+    return (max(0.0, min(1.0, float(crop_x))), 0.45)
+
+
 def vertical_crop_filter(
     src_w: int, src_h: int, center: tuple[float, float] | None, out_w: int, out_h: int
 ) -> str:

@@ -412,3 +412,158 @@ Current reel titles are inadequate. Introduce a dedicated copywriting layer:
   button; a "Regenerate copy" button per reel; the Reel Editor's Reel tab includes
   editable title/description fields (manual override wins, stored on the reel).
 - Export filenames (previous addendum) use the copywriter title.
+
+---
+
+# v6 backlog — macOS packaging (.app/.dmg) (owner request 2026-07-25)
+Goal: send the app to other Macs, 100% local.
+- PyInstaller (preferred; py2app fallback) -> "Magic Video Editor.app" bundling python,
+  pywebview, all wheels incl. the imageio-ffmpeg static binary; `make dist` target builds
+  the .app and wraps it in a .dmg (hdiutil/create-dmg, Applications symlink).
+- First-run onboarding: doctor screen — if Ollama is missing, guide install (link) and
+  offer the in-app model manager to pull a starter model; whisper model auto-downloads.
+- Phase 2 option: bundle the ollama binary (MIT) and manage `ollama serve` as a child
+  process for a true single-artifact install.
+- Signing: unsigned initially (document right-click→Open / xattr for recipients);
+  Developer ID + notarization later if distribution gets serious.
+- Intel Macs: mlx unavailable -> faster-whisper fallback path must stay working.
+
+## v6 packaging — Option B CONFIRMED + auto-update (owner decisions 2026-07-25)
+- **Bundle Ollama**: ship the ollama binary (MIT license — include its LICENSE) inside the
+  .app; the app manages `ollama serve` as a child process when no external Ollama is
+  reachable on the configured URL (prefer an already-running system Ollama; fall back to
+  the bundled one with OLLAMA_MODELS under the app data dir). Bundled serve must join the
+  ffmpeg child-registry-style lifecycle (terminate on quit).
+- **Auto-update via GitHub Releases**: on launch (non-blocking), GET
+  api.github.com/repos/carlosedm10/magic-video-editor/releases/latest; if semver > local
+  __version__, show an update banner; "Update now" downloads the release .dmg asset,
+  verifies its sha256 (published as a release asset), mounts/copies the new .app over the
+  current one (helper script handles the swap + relaunch), with user confirmation.
+  Sparkle is the future option once code signing exists — note in README.
+- **Release pipeline**: make dist builds .app (PyInstaller) + .dmg + sha256; a GitHub
+  Actions workflow on tag push builds and attaches assets to the release.
+- ~~Configurable inference endpoint~~ — DROPPED (owner decision 2026-07-25): Ollama is
+  the one and only inference path. Do not build llama-server/MLX endpoint switching.
+
+## v5.1 — Model manager fixes (owner feedback on the live UI, 2026-07-25)
+The library search currently shows junk: every tag reads "latest / size unknown", no
+descriptions. Fix properly:
+1. **Real tag data**: the ollama.com search page lacks sizes — enrich results by fetching
+   each model's tags page (https://ollama.com/library/<name>/tags) lazily (on result
+   expand, or eagerly for the first ~6 results), parsing tag names + sizes (e.g. 7b 4.7GB,
+   14b 9.0GB); cache per model 24h. Show the model DESCRIPTION from the search page (the
+   parser currently drops it). Filter out obviously exotic/non-LLM entries when a query is
+   empty (default view = curated popular list, not whatever the scrape returns first).
+2. **Hardware-aware recommendation block** at the top of "Get more models": read the
+   machine specs (psutil RAM + sysctl machdep.cpu.brand_string for the chip name) and
+   show "Tu Mac: <chip>, <ram>GB" plus two one-click picks from a curated ranking:
+   - "Best overall" — strongest general model that STILL FITS (<= ram*0.5): e.g. 48GB ->
+     qwen2.5:32b (or qwen3 equivalent if listed), 24-32GB -> qwen2.5:14b, 16GB ->
+     qwen2.5:7b-instruct, 8GB -> llama3.2:3b.
+   - "Optimal for this Mac" — best speed/quality balance (one tier below best): 48GB ->
+     qwen2.5:14b, etc.
+   Each with an Install button (existing pull flow) and a one-line why. The curated
+   ranking lives in code with a comment (structured-output-friendly models preferred —
+   they must handle NativeOutput/JSON well, which qwen2.5 does).
+
+## v5.2 — Projects home dashboard (owner request, 2026-07-25)
+Before entering the editor there is a PROJECTS HOME view (the app's landing screen when
+no project is open, replacing the current bare empty-state; a "home" button in the top
+bar returns to it):
+- Grid of project cards: name (inline-renamable), a poster thumbnail (first clip's
+  filmstrip frame via the existing thumbs endpoint; placeholder gradient when missing),
+  clip count, total footage duration, created date.
+- **Delete project** on each card (danger style, confirm dialog "This deletes transcripts
+  and renders, not your original footage"). DELETE endpoint already exists.
+- **Processing level** (AUTOMATIC, derived from stages): "Por empezar" (no stages done),
+  "En proceso" (some done or queue busy), "Finalizado" (render done) — shown as a badge.
+- **Project status** (MANUAL, user-set for organization): todo | in_progress | done |
+  uploaded — a small dropdown/chips on the card, persisted as project["workflow_status"]
+  (new PATCH field on the project update endpoint). Cards filterable by this status
+  (filter chips row on top: All / To do / In progress / Done / Uploaded).
+- Sidebar project switcher stays for quick jumps; "New project" lives prominently here.
+
+## v5.3 — Media import UX: drag & drop + real file picker (owner request)
+The paste-a-path input is a dev artifact — replace it as the browser-mode fallback:
+1. **Drag & drop from Finder** onto the media bin (and onto the Projects Home card area
+   for the open project): accept files AND folders (webkitGetAsEntry traversal; a dropped
+   folder = one camera group named after it). Browser drops don't expose absolute paths,
+   so add a streaming multipart upload endpoint POST /api/projects/{pid}/upload
+   (multiple files, folder-relative names, writes straight into <project>/media/ and
+   registers clips exactly like add_clips; show per-file upload progress in the bin).
+   Big-file friendly (GB iPhone clips over loopback are fast; stream to disk, never
+   buffer whole files in memory).
+2. **Native-style picker in browser mode**: hidden <input type="file" multiple
+   accept="video/*,audio/*"> for + Files and <input webkitdirectory> for + Folder,
+   feeding the same upload endpoint. In pywebview mode keep the true native dialogs
+   (no copy needed — hardlink import stays).
+3. Dropzone affordance: dashed highlight on dragover with "Drop clips or a camera
+   folder"; remove the paste-path input from primary UI (keep it hidden behind a tiny
+   "add by path" link for power users).
+
+## v5.4 — Activity & Export UX redesign (owner feedback: the Queue view is confusing)
+The current Queue drawer mixes launch buttons + queue list + raw logs. Separate the three
+concerns the way FCP/Premiere do:
+1. **Actions move to an Export flow**: a prominent "Export" button top-right (replaces
+   the render buttons inside the queue view) opening a small EXPORT DIALOG: radio choices
+   (Final video / All reels / A specific reel dropdown), destination folder line (from
+   settings, click = open folder), and one primary "Export" CTA that enqueues and closes.
+   "Render preview" is contextual only (render-bar click / preview toggle), never a
+   drawer button.
+2. **Monitoring becomes ambient**: a compact ACTIVITY CHIP in the top bar — invisible
+   when idle; while busy shows spinner + current task label + % (e.g. "Rendering final…
+   38%"). Click = FCP-style **Background Tasks popover** (anchored, ~380px): running item
+   with progress + cancel, pending list (reorder/remove), last 3 finished (subtle). No
+   full-page destination.
+3. **Logs are two clicks away**: each task row in the popover has a "details" disclosure
+   expanding an inline capped-height monospace log. The raw log wall is never the default
+   view.
+4. The "Queue" drawer tab disappears (Takes and Reels drawers stay). The persistent
+   run-all per-stage progress strip stays as-is (it's good) — the chip complements it for
+   non-pipeline tasks.
+
+## v5.5 — Lucide icons (owner request)
+Replace ad-hoc emoji/unicode icons across the UI with Lucide (vanilla UMD build, ISC
+license) — ALREADY VENDORED at ui/vendor/lucide.min.js (v1.26.0, loaded first in
+index.html; fully local, no CDN at runtime). Usage: <i data-lucide="name"> + a shared
+helper that calls lucide.createIcons({attrs:{width:16,height:16}}) after every render
+pass (core.js exposes it; each module calls it after injecting HTML). Swap at minimum:
+toolbar (scissors=split, trash-2, undo-2/redo-2, history=history panel, magnet=snapping,
+maximize-2=fit), transport (play/pause/skip), top bar (sparkles=run pipeline, download=
+export, settings gear, home), media bin (film, folder-plus, file-plus), inspector tabs
+(video, palette, volume-2, captions, wand-2, lightbulb), queue/activity chip (loader-2
+spinning), reels (clapperboard), close (x). Keep sizes consistent (16px chrome, 18px
+transport) and inherit currentColor so the garnet/dim palette applies.
+
+## v6 addendum — native macOS menu bar & app identity (owner note)
+Real editors populate the native menu bar; ours must too:
+1. **App identity**: the menu bar currently reads "python3". In the packaged .app,
+   Info.plist CFBundleName/CFBundleDisplayName = "Magic Video Editor" (+ app icon .icns
+   from the brand mark) fixes it. In dev mode, best-effort process rename via pyobjc
+   (NSBundle infoDictionary CFBundleName trick) — nice-to-have, don't overinvest.
+2. **Native menus via pywebview's menu API** (webview.start(menu=[...])): App menu
+   (About Magic Video Editor -> opens Settings/About, Check for updates -> update flow,
+   Quit), File (New Project cmd+N, Import Files… cmd+I, Import Folder…, Export… cmd+E ->
+   opens the Export dialog), Edit (Undo cmd+Z, Redo shift+cmd+Z, Split S, Delete),
+   View (Fit Timeline, Zoom In/Out, Takes, Reels, Projects Home), Help (Shortcuts,
+   GitHub repo). Menu actions dispatch into the UI through window.evaluate_js calling a
+   single JS entrypoint (window.MenuBus.dispatch(action)) so the web app stays the source
+   of truth. Menus must no-op gracefully when no project is open.
+
+## PRINCIPLE — app-first, not web-first (owner directive 2026-07-25)
+Magic Video Editor is a macOS APP that happens to render its UI in a webview — never
+design for "the browser" as the primary surface. Consequences, binding for all agents:
+- The pywebview native path is the PRIMARY experience: native file/folder dialogs,
+  native menu bar (v6 addendum), dock presence, window title. Browser access stays a
+  dev/debug convenience only — fallbacks (v5.3 upload path etc.) must work but never
+  drive design decisions or add browser-ish chrome.
+- No web-page patterns: no page reload as flow, no visible URLs, no external links
+  opening inside the app window (use the OS default browser via pywebview), context
+  menus should feel native (disable the default webview right-click menu where it leaks
+  "Reload"-style items).
+- App lifecycle: quitting with renders in progress warns ("A render is running — quit
+  anyway?"); window size/position persist across launches (pywebview save/restore);
+  the fullscreen behavior of the player must use the window, not browser fullscreen
+  quirks.
+- Dock: app icon (v6), and while rendering set the dock badge/progress when pywebview
+  exposes it (best-effort via pyobjc; skip quietly if brittle).

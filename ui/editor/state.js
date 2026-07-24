@@ -12,7 +12,15 @@
 
 window.EditorUI = window.EditorUI || {};
 
-const HISTORY_DEPTH = 50;
+/* History is capped at 30 LABELED entries (spec v5 addendum "Undo history
+   panel"): each entry is a full {label, ts, segments, markers} snapshot (not
+   just segments) so restoring an arbitrary entry from the panel — not just
+   linear undo/redo — puts markers back in sync too. historyIndex is the
+   currently-active entry; the panel highlights it and clicking any other
+   entry jumps straight there (still funnels through the same restore path
+   Cmd+Z/Shift+Cmd+Z use, so the panel and the keyboard shortcuts can never
+   drift out of sync). */
+const HISTORY_DEPTH = 30;
 
 function _withClientId(s) {
   return { ...s, _id: `s${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}` };
@@ -126,10 +134,11 @@ const Editor = {
     this.pid = pid;
     this.segments = segments.map(_withClientId);
     this.selected = 0;
-    this.history = [_cloneSegments(this.segments)];
-    this.historyIndex = 0;
-    this.dirty = false;
     this._loadMarkers();
+    this.history = [];
+    this.historyIndex = -1;
+    this._pushHistory("Opened project");
+    this.dirty = false;
     _setSaveState("");
     this._notify();
   },
@@ -158,11 +167,13 @@ const Editor = {
     });
     this.markers.sort((a, b) => a.edl_t - b.edl_t);
     this._saveMarkers();
+    this._pushHistory(label ? `Marker: ${label}` : "Marker");
     try { window.EditorUI.timeline?.renderMarkers?.(); } catch (e) { console.error(e); }
   },
   removeMarker(id) {
     this.markers = this.markers.filter((m) => m.id !== id);
     this._saveMarkers();
+    this._pushHistory("Remove marker");
     try { window.EditorUI.timeline?.renderMarkers?.(); } catch (e) { console.error(e); }
   },
 
@@ -179,7 +190,8 @@ const Editor = {
     const segs = _cloneSegments(this.segments || []);
     const idx = Math.max(0, Math.min(atIndex, segs.length));
     segs.splice(idx, 0, seg);
-    this.commit(segs, { select: idx });
+    const name = clip?.filename || clipId;
+    this.commit(segs, { select: idx, label: `Insert ${name}` });
   },
 
   /* ---------- preview-render staleness (spec v4 §3 render bar) ----------
@@ -209,37 +221,63 @@ const Editor = {
     }
   },
 
-  _pushHistory() {
+  /* Pushes a new labeled snapshot as the current position, dropping any redo
+     tail (standard undo-stack semantics) and capping to HISTORY_DEPTH oldest-
+     first. Used both by commit() (EDL-affecting edits) and directly by the
+     marker functions above (markers aren't part of `segments`/the EDL, but
+     the spec's example label list includes "Marker", so they get an entry
+     too — with a full snapshot so restoring it is still correct). */
+  _pushHistory(label) {
     this.history = this.history.slice(0, this.historyIndex + 1);
-    this.history.push(_cloneSegments(this.segments));
+    this.history.push({
+      label: label || "Edit",
+      ts: Date.now(),
+      segments: _cloneSegments(this.segments || []),
+      markers: (this.markers || []).map((m) => ({ ...m })),
+    });
     if (this.history.length > HISTORY_DEPTH) this.history.shift();
     this.historyIndex = this.history.length - 1;
+    this._notifyHistory();
   },
 
-  commit(newSegments, { select } = {}) {
+  commit(newSegments, { select, label } = {}) {
     this.segments = newSegments;
     if (select != null) this.selected = select;
     if (this.selected >= this.segments.length) this.selected = Math.max(0, this.segments.length - 1);
-    this._pushHistory();
+    this._pushHistory(label);
     this._scheduleSave();
     this._notify();
   },
 
-  undo() {
-    if (this.historyIndex <= 0) return;
-    this.historyIndex--;
-    this.segments = _cloneSegments(this.history[this.historyIndex]);
+  /* Shared restore path for undo(), redo(), and clicking an arbitrary entry
+     in the history panel — one code path so the panel and the keyboard
+     shortcuts can never disagree about what "current" means. */
+  _restoreHistoryIndex(idx) {
+    const entry = this.history[idx];
+    if (!entry) return;
+    this.historyIndex = idx;
+    this.segments = _cloneSegments(entry.segments);
+    this.markers = (entry.markers || []).map((m) => ({ ...m }));
+    this._saveMarkers();
     if (this.selected >= this.segments.length) this.selected = Math.max(0, this.segments.length - 1);
     this._scheduleSave();
     this._notify();
+    this._notifyHistory();
+    try { window.EditorUI.timeline?.renderMarkers?.(); } catch (e) { console.error(e); }
+  },
+  undo() {
+    if (this.historyIndex <= 0) return;
+    this._restoreHistoryIndex(this.historyIndex - 1);
   },
   redo() {
     if (this.historyIndex >= this.history.length - 1) return;
-    this.historyIndex++;
-    this.segments = _cloneSegments(this.history[this.historyIndex]);
-    if (this.selected >= this.segments.length) this.selected = Math.max(0, this.segments.length - 1);
-    this._scheduleSave();
-    this._notify();
+    this._restoreHistoryIndex(this.historyIndex + 1);
+  },
+  /* Entry point for the history panel (spec v5 addendum "Undo history
+     panel") — clicking any entry, not just the immediate neighbor. */
+  restoreToHistoryIndex(idx) {
+    if (idx < 0 || idx >= this.history.length || idx === this.historyIndex) return;
+    this._restoreHistoryIndex(idx);
   },
 
   select(i) {
@@ -258,7 +296,8 @@ const Editor = {
     if (field === "start") v = Math.min(v, s.end - 0.1);
     else v = Math.max(v, s.start + 0.1);
     s[field] = Math.round(v * 1000) / 1000;
-    this.commit(segs, { select: i });
+    const name = this.clip(s.clip_id)?.filename || s.clip_id;
+    this.commit(segs, { select: i, label: `Trim ${name} ${field}` });
   },
 
   setTransition(i, type) {
@@ -267,13 +306,13 @@ const Editor = {
     const s = segs[i];
     s.transition = s.transition || { type: "none", duration: 0.5 };
     s.transition.type = type;
-    this.commit(segs, { select: i });
+    this.commit(segs, { select: i, label: type === "none" ? "Remove transition" : `Transition ${type}` });
   },
   setTransitionDuration(i, dur) {
     if (!this.segments?.[i] || this.segments[i].transition?.type === "none") return;
     const segs = _cloneSegments(this.segments);
     segs[i].transition.duration = Math.max(0.2, Math.min(1.5, dur));
-    this.commit(segs, { select: i });
+    this.commit(segs, { select: i, label: "Transition duration" });
   },
 
   reorder(fromIndex, toIndex) {
@@ -281,15 +320,16 @@ const Editor = {
     const segs = _cloneSegments(this.segments);
     const [moved] = segs.splice(fromIndex, 1);
     segs.splice(toIndex, 0, moved);
-    this.commit(segs, { select: toIndex });
+    this.commit(segs, { select: toIndex, label: "Reorder" });
   },
 
   deleteSelected() {
     if (!this.segments?.length) return;
     const i = this.selected;
+    const name = this.clip(this.segments[i]?.clip_id)?.filename || this.segments[i]?.clip_id;
     const segs = _cloneSegments(this.segments);
     segs.splice(i, 1);
-    this.commit(segs, { select: Math.min(i, segs.length - 1) });
+    this.commit(segs, { select: Math.min(i, segs.length - 1), label: name ? `Delete ${name}` : "Delete" });
   },
 
   splitAt(i, at) {
@@ -300,7 +340,7 @@ const Editor = {
     const first = { ...segs[i], end: at };
     const second = _withClientId({ ...segs[i], start: at, text, transition: { type: "none", duration: 0.5 } });
     segs.splice(i, 1, first, second);
-    this.commit(segs, { select: i + 1 });
+    this.commit(segs, { select: i + 1, label: "Split" });
   },
 
   async resetToAiCut() {
@@ -308,8 +348,9 @@ const Editor = {
     const { segments } = await api(`/projects/${this.pid}/edl/reset`, { method: "POST" });
     this.segments = segments.map(_withClientId);
     this.selected = 0;
-    this.history = [_cloneSegments(this.segments)];
-    this.historyIndex = 0;
+    this.history = [];
+    this.historyIndex = -1;
+    this._pushHistory("Reset to AI cut");
     this.dirty = false;
     _setSaveState("Reset to AI cut.");
     this._notify();
@@ -376,6 +417,12 @@ const Editor = {
       () => window.EditorUI.timeline?.renderSelection(),
       () => window.EditorUI.inspector?.renderVideo(),
     ].forEach((fn) => { try { fn(); } catch (e) { console.error("EditorUI selection error", e); } });
+  },
+  /* Keeps the history panel (if open) in sync with every push/undo/redo/
+     restore — cheap no-op when the panel is closed (renderHistoryPanel
+     checks its own open flag first). */
+  _notifyHistory() {
+    try { window.EditorUI.timeline?.renderHistoryPanel?.(); } catch (e) { console.error("EditorUI history error", e); }
   },
 };
 
