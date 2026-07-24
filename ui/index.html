@@ -7,6 +7,7 @@
 <link rel="stylesheet" href="/ui/style.css">
 </head>
 <body>
+<canvas id="fx"></canvas>
 <div id="app">
   <aside id="sidebar">
     <div class="brand">✂️ CutRoom</div>
@@ -20,22 +21,35 @@
       <header>
         <h1 id="p-name"></h1>
         <div id="stage-bar"></div>
+        <button id="run-all-btn" class="btn primary run-all-btn">✦ Run pipeline</button>
       </header>
+      <div id="run-all-panel" class="run-all-panel" hidden></div>
       <nav id="tabs">
         <button data-tab="files" class="tab active">Files</button>
         <button data-tab="takes" class="tab">Takes</button>
-        <button data-tab="edit" class="tab">Edit</button>
+        <button data-tab="edit" class="tab">Studio</button>
         <button data-tab="reels" class="tab">Reels</button>
+        <button data-tab="settings" class="tab">Settings</button>
         <button data-tab="jobs" class="tab">Activity</button>
       </nav>
       <section id="tab-files" class="tabpane"></section>
       <section id="tab-takes" class="tabpane" hidden></section>
       <section id="tab-edit" class="tabpane" hidden></section>
       <section id="tab-reels" class="tabpane" hidden></section>
+      <section id="tab-settings" class="tabpane" hidden></section>
       <section id="tab-jobs" class="tabpane" hidden></section>
     </div>
   </main>
 </div>
-<script src="/ui/app.js"></script>
+<script src="/ui/core.js"></script>
+<script src="/ui/tabs/files.js"></script>
+<script src="/ui/tabs/takes.js"></script>
+<script src="/ui/tabs/edit.js"></script>
+<script src="/ui/tabs/reels.js"></script>
+<script src="/ui/tabs/jobs.js"></script>
+<script src="/ui/tabs/settings.js"></script>
+<script src="/ui/panels/color.js"></script>
+<script src="/ui/panels/audio.js"></script>
+<script src="/ui/fx.js"></script>
 </body>
 </html>

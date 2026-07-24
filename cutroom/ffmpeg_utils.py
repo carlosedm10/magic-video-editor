@@ -226,6 +226,34 @@ def cut_segment(
     run(cmd)
 
 
+def mux_audio(video_path: str, audio_path: str, dst_path: str) -> None:
+    """Remux video_path's video stream (copied, no re-encode) with
+    audio_path's audio (re-encoded to AAC). Used by the voice-enhancement
+    hook: extract -> enhance -> mux back onto the rendered file."""
+    run(
+        [
+            ffmpeg_bin(),
+            "-y",
+            "-i",
+            video_path,
+            "-i",
+            audio_path,
+            "-map",
+            "0:v:0",
+            "-map",
+            "1:a:0",
+            "-c:v",
+            "copy",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "192k",
+            "-shortest",
+            dst_path,
+        ]
+    )
+
+
 def concat_segments(segment_paths: list[str], dst: str, workdir: Path) -> None:
     """Concat identically-encoded segments without re-encoding."""
     lst = workdir / "concat.txt"

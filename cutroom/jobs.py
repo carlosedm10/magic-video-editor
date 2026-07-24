@@ -22,6 +22,19 @@ class JobLog:
         with _lock:
             self._job["progress"] = round(min(1.0, max(0.0, frac)), 3)
 
+    def stage(self, name: str, status: str | None = None, progress: float | None = None) -> None:
+        """Maintain job["stages"][name] = {"status", "progress"} for
+        multi-stage jobs (e.g. run-all). status one of pending/running/done/error;
+        either argument may be omitted to leave it unchanged."""
+        with _lock:
+            st = self._job.setdefault("stages", {}).setdefault(
+                name, {"status": "pending", "progress": 0.0}
+            )
+            if status is not None:
+                st["status"] = status
+            if progress is not None:
+                st["progress"] = round(min(1.0, max(0.0, progress)), 3)
+
 
 def start(name: str, fn, *args) -> str:
     job = {
@@ -32,6 +45,7 @@ def start(name: str, fn, *args) -> str:
         "log": [],
         "error": None,
         "started_at": time.time(),
+        "stages": {},
     }
     with _lock:
         _jobs[job["id"]] = job

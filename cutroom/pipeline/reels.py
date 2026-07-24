@@ -7,8 +7,8 @@ import time
 import uuid
 
 from .. import config, ffmpeg_utils, llm, store
-from ..agents.agents import reel_scorer_agent
-from . import faces
+from ..agents.agents import get_agent
+from . import audio_enhance, faces, filters
 
 
 def _candidate_windows(project: dict) -> list[dict]:
@@ -72,7 +72,8 @@ def suggest(log, project: dict) -> None:
     candidates = _candidate_windows(project)
     if not candidates:
         raise RuntimeError("No candidate windows (need >=15s of continuous kept speech).")
-    log(f"Scoring {len(candidates)} candidate windows with {config.OLLAMA_MODEL}...")
+    reel_scorer_agent = get_agent("reel_scorer")
+    log(f"Scoring {len(candidates)} candidate windows...")
 
     scored = []
     for ci, cand in enumerate(candidates):
@@ -188,6 +189,8 @@ def render_reel(log, project: dict, reel_id: str) -> None:
         config.REEL_W,
         config.REEL_H,
     )
+    color_vf = filters.build_vf(project.get("color"))
+    vf_extra = ",".join(v for v in (color_vf, crop) if v)
 
     ass = None
     if ffmpeg_utils.supports_subtitles():
@@ -206,9 +209,21 @@ def render_reel(log, project: dict, reel_id: str) -> None:
         config.REEL_W,
         config.REEL_H,
         min(clip["info"]["fps"] or 30.0, 60.0),
-        vf_extra=crop,
+        vf_extra=vf_extra,
         ass_path=ass,
     )
+
+    if project.get("audio_enhance"):
+        log("Enhancing voice audio...")
+        work = pdir / "work"
+        raw_wav = work / f"reel_{reel_id}_audio.wav"
+        enhanced_wav = work / f"reel_{reel_id}_audio_enhanced.wav"
+        remuxed = work / f"reel_{reel_id}_remuxed.mp4"
+        ffmpeg_utils.extract_wav(str(out), str(raw_wav))
+        audio_enhance.enhance(str(raw_wav), str(enhanced_wav))
+        ffmpeg_utils.mux_audio(str(out), str(enhanced_wav), str(remuxed))
+        remuxed.replace(out)
+
     reel["path"] = str(out)
     reel["status"] = "rendered"
     reel["rendered_at"] = time.strftime("%H:%M:%S")

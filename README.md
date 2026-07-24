@@ -5,9 +5,9 @@ finds the best takes, orders the story, renders a main cut, and suggests ~20
 Reels/TikTok-ready vertical clips — **everything runs on your machine**:
 
 - **Whisper** (mlx-whisper, Apple Silicon GPU) — transcription with word timestamps
-- **Ollama + pydantic_ai** (any local model, default `qwen2.5:7b-instruct`) — all
-  editorial *decisions*, as typed agents in `cutroom/agents/` (prompts.py /
-  schemas.py / agents.py)
+- **Ollama + pydantic_ai** (any local model, default `qwen2.5:14b`, configurable
+  per task in Settings) — all editorial *decisions*, as typed agents in
+  `cutroom/agents/` (prompts.py / schemas.py / agents.py)
 - **ffmpeg** — all cutting/cropping/rendering. No editing app involved.
 - **scipy** — multi-cam / external-audio sync via audio cross-correlation
 - **OpenCV** — face detection for speaker-centered 9:16 crops
@@ -38,7 +38,8 @@ config without touching prompts or schemas.
 
 - macOS (Apple Silicon recommended), ffmpeg (`brew install ffmpeg`)
 - [Ollama](https://ollama.com) running with a model pulled
-  (`ollama pull qwen2.5:7b-instruct` — or `qwen2.5:14b` if you have ≥32GB RAM)
+  (`ollama pull qwen2.5:14b` — or a smaller model like `qwen2.5:7b-instruct`
+  if you have <32GB RAM; per-task overrides live in the Settings tab)
 - [uv](https://docs.astral.sh/uv/)
 
 ## Run
@@ -61,7 +62,7 @@ Projects and renders live in `~/CutRoom/projects/`.
 
 | Var | Default | |
 |---|---|---|
-| `CUTROOM_LLM` | `qwen2.5:7b-instruct` | any Ollama model |
+| `CUTROOM_LLM` | `qwen2.5:14b` | any Ollama model (fallback only — Settings tab / `~/CutRoom/settings.json` wins) |
 | `CUTROOM_WHISPER` | `mlx-community/whisper-large-v3-turbo` | any mlx whisper repo |
 | `CUTROOM_DATA` | `~/CutRoom` | projects dir |
 | `OLLAMA_URL` | `http://localhost:11434` | |

@@ -8,7 +8,7 @@ install:
 #   make models                        # pull the default local LLM
 #   make models MODEL=qwen2.5:14b      # pull a specific model
 models:
-	ollama pull $(or $(MODEL),qwen2.5:7b-instruct)
+	ollama pull $(or $(MODEL),qwen2.5:14b)
 
 doctor:
 	@command -v ffmpeg >/dev/null && echo "ffmpeg      ✓" || echo "ffmpeg      ✗  -> brew install ffmpeg"
@@ -83,8 +83,9 @@ health:
 		|| echo "server not running — start it with: make server"
 
 smoke:
-	uv run python -c "import cutroom.server, cutroom.app; \
-		from cutroom.pipeline import ingest, sync, transcribe, takes, ordering, render, reels, faces; \
+	uv run python -c "import cutroom.server, cutroom.app, cutroom.settings; \
+		from cutroom.api import projects, pipeline, settings, audio, filters, edl; \
+		from cutroom.pipeline import ingest, sync, transcribe, takes, ordering, render, reels, faces, filters as pfilters, audio_enhance; \
 		from cutroom.agents import agents; \
 		print('all modules import OK')"
 

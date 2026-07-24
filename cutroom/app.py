@@ -14,8 +14,12 @@ class Api:
     def pick_files(self):
         import webview
 
+        # pywebview >=5 moved OPEN_DIALOG under webview.FileDialog.OPEN and
+        # deprecated the module-level constant.
+        file_dialog = getattr(webview, "FileDialog", None)
+        open_dialog = file_dialog.OPEN if file_dialog is not None else webview.OPEN_DIALOG
         result = webview.windows[0].create_file_dialog(
-            webview.OPEN_DIALOG,
+            open_dialog,
             allow_multiple=True,
             file_types=(
                 "Media files (*.mp4;*.mov;*.m4v;*.mkv;*.avi;*.mts;*.m4a;*.wav;*.mp3;*.aac;*.flac)",

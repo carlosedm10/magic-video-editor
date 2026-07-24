@@ -7,7 +7,9 @@ DATA_DIR = Path(os.environ.get("CUTROOM_DATA", Path.home() / "CutRoom")).expandu
 PROJECTS_DIR = DATA_DIR / "projects"
 
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434")
-OLLAMA_MODEL = os.environ.get("CUTROOM_LLM", "qwen2.5:7b-instruct")
+# Env fallback only — cutroom/settings.py (per-task model settings) wins
+# whenever it has an opinion; see cutroom/agents/agents.py:get_agent.
+OLLAMA_MODEL = os.environ.get("CUTROOM_LLM", "qwen2.5:14b")
 
 # mlx-community whisper repo (Apple Silicon). Downloaded on first use by mlx-whisper.
 WHISPER_MODEL = os.environ.get("CUTROOM_WHISPER", "mlx-community/whisper-large-v3-turbo")

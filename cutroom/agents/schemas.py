@@ -9,6 +9,19 @@ class TakePick(BaseModel):
     best: int = Field(..., ge=0, description="Index of the best take in the given list")
 
 
+class TranscriptCleanup(BaseModel):
+    """Sentence ids to cut from one clip's transcript: restart markers,
+    abandoned takes superseded by a later retake, or meta-asides to the
+    camera/editor. Kept flat and small-model friendly."""
+
+    cut_ids: list[int] = Field(
+        default_factory=list,
+        description="Sentence numbers to cut (restarts, abandoned takes, meta-asides). "
+        "Empty list if nothing should be cut.",
+    )
+    reason: str = Field(default="", description="One-line rationale for the cuts")
+
+
 class ClipOrder(BaseModel):
     """Narrative order for separately recorded clips."""
 

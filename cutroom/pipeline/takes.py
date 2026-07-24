@@ -107,14 +107,58 @@ def _score(sent: dict, wav: np.ndarray | None, take_index: int) -> tuple[float, 
     return round(score, 2), why
 
 
+CLEANER_CHUNK_SIZE = 40
+CLEANER_CHUNK_OVERLAP = 5
+
+
+def _transcript_cleanup_chunk(log, chunk: list[dict]) -> set[str]:
+    """Ask the transcript_cleaner agent which sentences in this chunk are
+    restart markers / abandoned takes / meta-asides. Fail-open: on any error,
+    log and return an empty set so the pipeline keeps going untouched."""
+    from ..agents.agents import get_agent
+
+    numbered = "\n".join(f'{i + 1}: "{s["text"]}"' for i, s in enumerate(chunk))
+    try:
+        result = get_agent("transcript_cleaner").run_sync(
+            f"Numbered sentences from one clip, in order:\n{numbered}"
+        ).output
+        cut: set[str] = set()
+        for n in result.cut_ids:
+            idx = n - 1
+            if 0 <= idx < len(chunk):
+                cut.add(chunk[idx]["id"])
+        return cut
+    except Exception as exc:
+        log(f"transcript_cleaner chunk failed, skipping: {exc}")
+        return set()
+
+
+def _transcript_cleanup(log, clip_sentences: list[dict]) -> set[str]:
+    """Chunk one clip's sentences (<=40, 5-sentence overlap) and union the
+    cut ids the transcript_cleaner agent flags across all chunks."""
+    if not clip_sentences:
+        return set()
+    cut_ids: set[str] = set()
+    step = CLEANER_CHUNK_SIZE - CLEANER_CHUNK_OVERLAP
+    i = 0
+    n = len(clip_sentences)
+    while i < n:
+        chunk = clip_sentences[i : i + CLEANER_CHUNK_SIZE]
+        cut_ids |= _transcript_cleanup_chunk(log, chunk)
+        if i + CLEANER_CHUNK_SIZE >= n:
+            break
+        i += step
+    return cut_ids
+
+
 def _llm_tiebreak(candidates: list[dict]) -> str | None:
     """Ask the take-judge agent which near-tied take reads best. Returns
     sentence id or None."""
-    from ..agents.agents import take_judge_agent
+    from ..agents.agents import get_agent
 
     try:
         listing = "\n".join(f'{i}: "{c["text"]}"' for i, c in enumerate(candidates))
-        pick = take_judge_agent.run_sync(f"Takes of the same line:\n{listing}").output
+        pick = get_agent("take_judge").run_sync(f"Takes of the same line:\n{listing}").output
         if 0 <= pick.best < len(candidates):
             return candidates[pick.best]["id"]
     except Exception:
@@ -149,6 +193,22 @@ def run(log, project: dict) -> None:
         if clip.get("wav"):
             wavs[clip["id"]] = ffmpeg_utils.load_wav_mono(clip["wav"])
         log(f"{clip['filename']}: {len(sents)} sentences")
+
+    # LLM pass BEFORE fuzzy dedup: catch restart markers / abandoned takes
+    # retaken with different wording / meta-asides that string-similarity
+    # dedup below can't see. Fail-open, skipped entirely when ollama is down.
+    cleaner_cut_ids: set[str] = set()
+    if llm.available():
+        log("Running transcript cleaner (restarts / abandoned takes)...")
+        by_clip: dict[str, list[dict]] = {}
+        for s in sentences:
+            by_clip.setdefault(s["clip_id"], []).append(s)
+        for clip_sentences in by_clip.values():
+            cleaner_cut_ids |= _transcript_cleanup(log, clip_sentences)
+        if cleaner_cut_ids:
+            log(f"transcript cleaner flagged {len(cleaner_cut_ids)} sentence(s)")
+    else:
+        log("transcript cleaner skipped (ollama unavailable)")
 
     # Cluster near-duplicate sentences (repeated takes), greedy by similarity.
     log("Detecting repeated takes...")
@@ -200,6 +260,13 @@ def run(log, project: dict) -> None:
                     f"repeated take — kept better version (score {best['score']} vs {s['score']})"
                 )
 
+    # Apply the transcript-cleaner verdicts (restart markers / abandoned
+    # takes / meta-asides) — after scoring/dedup so nothing re-flips them.
+    for s in sentences:
+        if s["id"] in cleaner_cut_ids:
+            s["kept"] = False
+            s["reason"] = "restart/abandoned take (AI)"
+
     # Drop tiny fragments that survived (interjections, aborted starts).
     for s in sentences:
         if s["kept"] and len(norm[s["id"]].split()) < 3 and (s["end"] - s["start"]) < 1.2:
@@ -210,6 +277,7 @@ def run(log, project: dict) -> None:
         s.pop("words", None)  # words stay in the clip transcript; keep project.json light
 
     project["sentences"] = sentences
+    project["edl"] = None  # re-analyzed takes invalidate any previously computed EDL
     kept = sum(1 for s in sentences if s["kept"])
     store.save(project)
     log(f"Kept {kept}/{len(sentences)} sentences.")

@@ -18,6 +18,7 @@ def _clip_summary_text(project: dict, clip_id: str, max_chars: int = 1200) -> st
 def run(log, project: dict) -> None:
     if not project.get("sentences"):
         raise RuntimeError("Run Take analysis first.")
+    project["edl"] = None  # reordering invalidates any previously computed EDL
 
     clip_ids = [
         c["id"]
@@ -45,11 +46,11 @@ def run(log, project: dict) -> None:
         f"{_clip_summary_text(project, cid)}"
         for i, cid in enumerate(clip_ids)
     )
-    from ..agents.agents import clip_order_agent
+    from ..agents.agents import get_agent
 
     log(f"Asking the clip-order agent to order {len(clip_ids)} clips by narrative flow...")
     try:
-        result = clip_order_agent.run_sync(listing).output
+        result = get_agent("clip_order").run_sync(listing).output
         order = [int(x) for x in result.order]
         if sorted(order) != list(range(len(clip_ids))):
             raise ValueError(f"not a permutation: {order}")

@@ -6,7 +6,7 @@ replaced by the aligned external track."""
 import time
 
 from .. import ffmpeg_utils, store
-from . import ordering, sync
+from . import audio_enhance, filters, ordering, sync
 
 
 def _target_format(project: dict) -> tuple[int, int, float]:
@@ -19,7 +19,11 @@ def _target_format(project: dict) -> tuple[int, int, float]:
 
 
 def run(log, project: dict) -> None:
-    segments = ordering.build_edl(project)
+    segments = project.get("edl")
+    if not segments:
+        segments = ordering.build_edl(project)
+        project["edl"] = segments
+        store.save(project)
     if not segments:
         raise RuntimeError("EDL is empty — no kept sentences to render.")
 
@@ -27,6 +31,8 @@ def run(log, project: dict) -> None:
     pdir = store.project_dir(project["id"])
     work = pdir / "work" / f"render_{int(time.time())}"
     work.mkdir(parents=True, exist_ok=True)
+
+    color_vf = filters.build_vf(project.get("color"))
 
     log(f"Rendering {len(segments)} segments at {width}x{height}@{fps:g}...")
     seg_paths = []
@@ -50,6 +56,7 @@ def run(log, project: dict) -> None:
             fps,
             audio_src=audio_src,
             audio_start=audio_start,
+            vf_extra=color_vf,
         )
         seg_paths.append(str(out))
         log.progress((i + 1) / (len(segments) + 1))
@@ -62,6 +69,16 @@ def run(log, project: dict) -> None:
     final = pdir / f"maincut_{stamp}.mp4"
     log("Concatenating...")
     ffmpeg_utils.concat_segments(seg_paths, str(final), work)
+
+    if project.get("audio_enhance"):
+        log("Enhancing voice audio...")
+        raw_wav = work / "final_audio.wav"
+        enhanced_wav = work / "final_audio_enhanced.wav"
+        remuxed = work / "final_remuxed.mp4"
+        ffmpeg_utils.extract_wav(str(final), str(raw_wav))
+        audio_enhance.enhance(str(raw_wav), str(enhanced_wav))
+        ffmpeg_utils.mux_audio(str(final), str(enhanced_wav), str(remuxed))
+        remuxed.replace(final)
 
     total = sum(s["end"] - s["start"] for s in segments)
     project.setdefault("renders", []).append(

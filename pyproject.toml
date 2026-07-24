@@ -16,6 +16,9 @@ dependencies = [
     "mlx-whisper>=0.4; platform_machine == 'arm64'",
     "imageio-ffmpeg>=0.5",
     "pydantic-ai-slim[openai]>=2.17.0",
+    "noisereduce>=3.0.3",
+    "pyloudnorm>=0.2.0",
+    "soundfile>=0.14.0",
 ]
 
 [project.scripts]
