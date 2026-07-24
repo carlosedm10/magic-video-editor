@@ -4,7 +4,8 @@ run-all job, reel rendering, and job status polling."""
 from fastapi import APIRouter, HTTPException
 
 from .. import jobs, store
-from ..pipeline import ingest, ordering, reels, render, sync, takes, transcribe
+from ..jobs import JobBusyError, JobCancelled
+from ..pipeline import ingest, ordering, reels, render, review, sync, takes, transcribe
 
 router = APIRouter(prefix="/api", tags=["pipeline"])
 
@@ -14,6 +15,7 @@ STAGES = {
     "transcribe": transcribe.run,
     "takes": takes.run,
     "order": ordering.run,
+    "review": review.run,
     "render": render.run,
     "reels": reels.suggest,
 }
@@ -26,9 +28,17 @@ STAGE_LABELS = {
     "transcribe": "Transcribing",
     "takes": "Analyzing takes",
     "order": "Ordering the story",
+    "review": "Checking for suggestions",
     "render": "Editing the video",
     "reels": "Making shorts",
 }
+
+
+def _busy(e: JobBusyError) -> HTTPException:
+    return HTTPException(
+        409,
+        detail={"message": "a job is already running for this project", "job": e.job_id},
+    )
 
 
 @router.post("/projects/{pid}/run/{stage}")
@@ -42,11 +52,17 @@ def run_stage(pid: str, stage: str):
         try:
             fn(log, project)
             store.mark_stage(project, stage, "done")
+        except JobCancelled:
+            store.mark_stage(project, stage, "error", "cancelled")
+            raise
         except Exception as e:
             store.mark_stage(project, stage, "error", str(e)[:300])
             raise
 
-    return {"job": jobs.start(f"{stage}:{pid}", task)}
+    try:
+        return {"job": jobs.start(f"{stage}:{pid}", task, lock_key=pid)}
+    except JobBusyError as e:
+        raise _busy(e) from e
 
 
 class _StageLogProxy:
@@ -90,6 +106,10 @@ def run_all(pid: str):
                 store.mark_stage(project, stage, "done")
                 log.stage(stage, status="done", progress=1.0)
                 log.progress((i + 1) / total)
+            except JobCancelled:
+                store.mark_stage(project, stage, "error", "cancelled")
+                log.stage(stage, status="error", progress=1.0)
+                raise
             except Exception as e:
                 store.mark_stage(project, stage, "error", str(e)[:300])
                 log.stage(stage, status="error", progress=1.0)
@@ -101,13 +121,27 @@ def run_all(pid: str):
                     return
                 raise
 
-    return {"job": jobs.start(f"run-all:{pid}", task)}
+    try:
+        return {"job": jobs.start(f"run-all:{pid}", task, lock_key=pid)}
+    except JobBusyError as e:
+        raise _busy(e) from e
 
 
 @router.post("/projects/{pid}/reels/{rid}/render")
 def reel_render(pid: str, rid: str):
     project = store.load(pid)
-    return {"job": jobs.start(f"reel:{rid}", lambda log: reels.render_reel(log, project, rid))}
+    # Same per-project lock as run/{stage} and run-all: without it, a reel
+    # render can race a concurrent pipeline job's store.save() on the same
+    # project.json (last-write-wins), the same class of bug as two servers
+    # sharing a project directory.
+    try:
+        return {
+            "job": jobs.start(
+                f"reel:{rid}", lambda log: reels.render_reel(log, project, rid), lock_key=pid
+            )
+        }
+    except JobBusyError as e:
+        raise _busy(e) from e
 
 
 @router.get("/jobs/{jid}")
@@ -116,3 +150,13 @@ def job_get(jid: str):
     if not job:
         raise HTTPException(404)
     return job
+
+
+@router.post("/jobs/{jid}/cancel")
+def job_cancel(jid: str):
+    job = jobs.get(jid)
+    if not job:
+        raise HTTPException(404)
+    if not jobs.cancel(jid):
+        raise HTTPException(409, detail="job is not running")
+    return {"status": "cancelling"}

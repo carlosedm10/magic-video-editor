@@ -2,54 +2,143 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>CutRoom</title>
+<title>Magic Video Editor</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <link rel="stylesheet" href="/ui/style.css">
 </head>
 <body>
 <canvas id="fx"></canvas>
 <div id="app">
-  <aside id="sidebar">
-    <div class="brand">✂️ CutRoom</div>
-    <button id="new-project" class="btn primary">New project</button>
-    <div id="project-list"></div>
-    <div id="health" class="health"></div>
-  </aside>
-  <main id="main">
-    <div id="empty-state" class="empty">Create or select a project to start.</div>
-    <div id="project-view" hidden>
-      <header>
-        <h1 id="p-name"></h1>
-        <div id="stage-bar"></div>
-        <button id="run-all-btn" class="btn primary run-all-btn">✦ Run pipeline</button>
-      </header>
-      <div id="run-all-panel" class="run-all-panel" hidden></div>
-      <nav id="tabs">
-        <button data-tab="files" class="tab active">Files</button>
-        <button data-tab="takes" class="tab">Takes</button>
-        <button data-tab="edit" class="tab">Studio</button>
-        <button data-tab="reels" class="tab">Reels</button>
-        <button data-tab="settings" class="tab">Settings</button>
-        <button data-tab="jobs" class="tab">Activity</button>
-      </nav>
-      <section id="tab-files" class="tabpane"></section>
-      <section id="tab-takes" class="tabpane" hidden></section>
-      <section id="tab-edit" class="tabpane" hidden></section>
-      <section id="tab-reels" class="tabpane" hidden></section>
-      <section id="tab-settings" class="tabpane" hidden></section>
-      <section id="tab-jobs" class="tabpane" hidden></section>
+
+  <header id="topbar">
+    <div class="brand">
+      <span class="brand-mark">✦ Magic Video Editor</span>
+      <span class="brand-sub">by carlosedm10</span>
+    </div>
+    <div class="proj-switch row">
+      <select id="project-select" title="Switch project">
+        <option value="">Select project…</option>
+      </select>
+      <button id="new-project" class="btn small">＋ New</button>
+    </div>
+    <div id="stage-bar" class="stage-bar"></div>
+    <button id="run-all-btn" class="btn primary run-all-btn" hidden>✦ Run pipeline</button>
+    <div class="rail" id="icon-rail">
+      <button class="rail-btn" data-tab="takes" title="Takes">🎬<span>Takes</span></button>
+      <button class="rail-btn" data-tab="reels" title="Reels">📱<span>Reels</span></button>
+      <button class="rail-btn" data-tab="jobs" title="Activity">🕒<span>Activity</span></button>
+    </div>
+  </header>
+
+  <div id="run-all-panel" class="run-all-panel" hidden></div>
+
+  <main id="content">
+    <div id="empty-state" class="empty">
+      <div class="empty-inner">
+        <div class="empty-brand">✦ Magic Video Editor</div>
+        <div class="dim">Create or select a project to start.</div>
+      </div>
+    </div>
+
+    <div id="project-view" class="editor-grid" hidden>
+      <aside id="media-bin">
+        <div class="bin-head row">
+          <b>Media</b>
+          <span class="grow"></span>
+          <button class="btn small" id="add-files">＋ Files</button>
+          <button class="btn small" id="add-folder">＋ Folder</button>
+        </div>
+        <input type="text" id="path-input" class="path-input"
+          placeholder="…or paste absolute file/folder paths, comma separated, Enter">
+        <div id="media-bin-list" class="bin-list"></div>
+        <div class="bin-footer row">
+          <button class="icon-btn" id="settings-gear" data-tab="settings" title="Settings">⚙️</button>
+          <div id="health" class="health"></div>
+        </div>
+      </aside>
+
+      <section id="player-pane">
+        <div id="player-stage">
+          <video id="video-a" class="player-video active" preload="auto" playsinline></video>
+          <video id="video-b" class="player-video" preload="auto" playsinline></video>
+          <div id="player-empty" class="dim player-empty">No segments yet — add clips and run the
+            pipeline, or build the timeline below.</div>
+        </div>
+        <div class="player-controls row">
+          <button id="pp-playpause" class="btn small" title="Space">▶</button>
+          <span id="pp-time" class="dim mono">0:00 / 0:00</span>
+          <span class="grow"></span>
+          <button id="pp-fullscreen" class="btn small" title="Fullscreen">⛶</button>
+        </div>
+      </section>
+
+      <aside id="inspector-pane">
+        <div id="insp-video" class="insp-section"></div>
+        <div id="insp-color" class="insp-section"></div>
+        <div id="insp-audio" class="insp-section"></div>
+        <div id="insp-suggestions" class="insp-section"></div>
+      </aside>
+
+      <section id="timeline-pane">
+        <div class="timeline-toolbar row">
+          <button id="tl-split" class="btn small" title="Split at playhead (S)">✂ Split</button>
+          <button id="tl-delete" class="btn small danger" title="Delete selected (Del)">🗑 Delete</button>
+          <button id="tl-undo" class="btn small" title="Undo (⌘Z)">↶</button>
+          <button id="tl-redo" class="btn small" title="Redo (⇧⌘Z)">↷</button>
+          <span class="grow"></span>
+          <span id="tl-save-state" class="dim"></span>
+          <button id="tl-save" class="btn small">Save</button>
+          <button id="tl-reset" class="btn small">Reset to AI cut</button>
+          <span class="grow"></span>
+          <span class="dim">Zoom (+/-)</span>
+          <input type="range" id="tl-zoom" min="4" max="220" value="40">
+        </div>
+        <div id="timeline-scroll">
+          <div id="timeline-content">
+            <div id="timeline-ruler"></div>
+            <div id="timeline-track"></div>
+            <div id="timeline-playhead"></div>
+          </div>
+        </div>
+      </section>
     </div>
   </main>
+
+  <div id="drawer-overlay" class="drawer-overlay" hidden>
+    <div class="drawer">
+      <div class="drawer-head row">
+        <nav class="drawer-tabs">
+          <button data-tab="takes" class="tab">Takes</button>
+          <button data-tab="reels" class="tab">Reels</button>
+          <button data-tab="settings" class="tab">Settings</button>
+          <button data-tab="jobs" class="tab">Activity</button>
+        </nav>
+        <span class="grow"></span>
+        <button class="btn small" id="drawer-close">✕ Close</button>
+      </div>
+      <div class="drawer-body">
+        <section id="tab-takes" class="tabpane"></section>
+        <section id="tab-reels" class="tabpane" hidden></section>
+        <section id="tab-settings" class="tabpane" hidden></section>
+        <section id="tab-jobs" class="tabpane" hidden></section>
+      </div>
+    </div>
+  </div>
+
 </div>
 <script src="/ui/core.js"></script>
-<script src="/ui/tabs/files.js"></script>
 <script src="/ui/tabs/takes.js"></script>
-<script src="/ui/tabs/edit.js"></script>
 <script src="/ui/tabs/reels.js"></script>
 <script src="/ui/tabs/jobs.js"></script>
 <script src="/ui/tabs/settings.js"></script>
 <script src="/ui/panels/color.js"></script>
 <script src="/ui/panels/audio.js"></script>
+<script src="/ui/editor/state.js"></script>
+<script src="/ui/editor/mediabin.js"></script>
+<script src="/ui/editor/player.js"></script>
+<script src="/ui/editor/timeline.js"></script>
+<script src="/ui/editor/inspector.js"></script>
+<script src="/ui/editor/suggestions.js"></script>
 <script src="/ui/fx.js"></script>
 </body>
 </html>

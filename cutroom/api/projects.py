@@ -15,6 +15,7 @@ class NewProject(BaseModel):
 
 class AddClips(BaseModel):
     paths: list[str]
+    camera_group: str | None = None
 
 
 class ClipUpdate(BaseModel):
@@ -59,8 +60,16 @@ def project_delete(pid: str):
 @router.post("/projects/{pid}/clips")
 def clips_add(pid: str, body: AddClips):
     project = store.load(pid)
-    added = ingest.add_clips(project, body.paths)
+    added = ingest.add_clips(project, body.paths, camera_group=body.camera_group)
     return {"added": len(added), "clips": project["clips"]}
+
+
+@router.post("/projects/{pid}/groups/{name}/main")
+def group_set_main(pid: str, name: str):
+    project = store.load(pid)
+    ingest.set_main_group(project, name)
+    store.save(project)
+    return {"ok": True, "clips": project["clips"]}
 
 
 @router.post("/projects/{pid}/clips/{cid}")

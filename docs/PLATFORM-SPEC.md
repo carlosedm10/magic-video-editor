@@ -121,3 +121,85 @@ fuzzy dedup misses these. New LLM pass (task `transcript_cleaner`) runs inside t
 - ffmpeg only through cutroom/ffmpeg_utils.py (`ffmpeg_bin()` handles the libass fallback).
 - Never `git commit` — the orchestrator handles git.
 - File ownership per task is strict (listed in each task brief) to allow parallel work.
+
+---
+
+# v3 — "Magic Video Editor" (editor-first rebuild)
+
+Owner direction (2026-07-24 evening). Supersedes conflicting v2 points.
+
+## Naming
+Product name: **Magic Video Editor** — "by carlosedm10" visible in the UI (sidebar/brand
+area) and window title. Repo/package names unchanged.
+
+## The mental model changed: it IS a video editor
+Design like CapCut, not like a pipeline dashboard. The AI first pass is the "magic import"
+that pre-builds your timeline; after that the user lives in a real editor:
+- **Layout**: left = media bin (clips/camera groups); center = player with playhead,
+  play/pause, time display, virtual preview of the CURRENT EDL (no render needed — seek
+  the source <video> per segment, auto-advance across segments/files); right = inspector
+  (Video / Color / Audio / Suggestions panels); bottom = **timeline**: horizontal track,
+  clip blocks with width ∝ duration, ruler + zoom, playhead synced with player,
+  drag-to-reorder, drag block EDGES to trim, split-at-playhead button, delete,
+  per-junction transition chips. Toolbar: select, split, delete, undo (client-side
+  history), zoom in/out. Keep the garnet/navy branding and fx aurora.
+- Tabs (Takes / Reels / Settings / Activity) remain reachable but secondary (icon rail or
+  top-right). The old "Files" flow becomes the media bin + an import dialog.
+- The run-all progress panel must live OUTSIDE tab panes and stay visible whatever view is
+  active while a pipeline job runs (v2 bug: it collapsed when switching tabs).
+
+## Ingestion model: camera groups, not per-file cameras
+Real projects = MANY loose clips of the SAME camera (session shared here: IMG_9232–9237).
+- Import accepts files AND folders. A folder = one **camera group** (its clips share
+  clip["camera_group"]); loose files default to group "main" unless assigned. One group is
+  the main camera. UI: group headers in the media bin, "set main" per group.
+- **Sync (cross-correlation) only runs BETWEEN different camera groups** — never between
+  clips of the same group (same-camera clips are different takes by definition).
+- Ordering/narrative works across the whole set of same-camera clips (this is the main
+  case now): understand the full transcript, order clips coherently.
+
+## Suggest, don't delete
+Only auto-cut what is unambiguous: explicit restart/blooper patterns ("ay, me he vuelto a
+equivocar. Bueno, continúo. Ahora sí que sí", "venga, va, otra vez") and their abandoned
+takes — the existing transcript_cleaner behavior. Everything else that is merely suspect
+(redundant across clips, repeated idea, off-topic tangent, doesn't fit the narrative)
+becomes a **suggestion**, never a silent cut:
+- New `reviewer` agent task (runs as its own stage after `order`): reads the full kept
+  transcript across all clips and emits project["suggestions"] =
+  [{id, kind: redundant|repeated_idea|off_topic|incoherent, refs: [sentence ids],
+    message (user language!), proposed_action: cut|merge|reorder}].
+- API: list / accept (applies the proposed cut/edit) / dismiss. UI: Suggestions panel in
+  the inspector with accept/dismiss per card.
+- Reviewer + cleaner default to the biggest configured model; per-task override in Settings.
+
+## Transitions (junction-level)
+EDL gains per-junction transitions: {type: none|fade|crossfade, duration<=1.5s} stored on
+the segment that FOLLOWS the junction. Render implements: fade = fade-out/fade-in via
+per-segment fade filters (cheap); crossfade = ffmpeg xfade between adjacent segment files
+(re-encode at junctions only where feasible). Timeline UI: clickable chip between blocks.
+
+## Resource safety (MANDATORY — the app froze a 48GB M4 Pro)
+Root causes found: unlimited concurrent jobs per project (no 409 guard → repeated clicks
+spawned parallel pipelines), each ffmpeg unbounded threads, no child-process registry (
+orphaned ffmpeg survived Ctrl-C ~2min), no RAM guard.
+- Global ffmpeg **semaphore** (settings.performance.max_parallel_ffmpeg, default 2).
+- `-threads` cap per encode: settings.performance.ffmpeg_threads, default max(2, cores//2).
+- All ffmpeg children spawned via a tracked Popen wrapper (registry); SIGINT/SIGTERM/atexit
+  and pywebview window-close terminate the whole registry (terminate → kill after 5s).
+- Per-project job lock: starting a stage/run-all while one runs → HTTP 409; UI disables the
+  Run button while running and shows a **Stop** button (job cancel endpoint: cooperative
+  flag + terminate that job's registered children).
+- RAM guard via psutil: before spawning a heavy step, if available RAM < settings guard
+  (default 4GB) wait/queue with a log line instead of spawning.
+- Prefer graceful degradation: slower renders are fine; freezing the Mac is not.
+
+## Settings placement (owner request, 2026-07-24)
+Settings access lives at the BOTTOM of the app: a gear icon/button pinned to the bottom of
+the left sidebar (media bin column), like typical desktop apps — NOT in the top icon rail.
+Clicking it opens the existing Settings view (overlay/drawer). The health line (ffmpeg/
+ollama/model) sits next to it at the bottom.
+
+## Known regression to verify (observed mid-build)
+Opening the secondary views (Takes/Reels/Settings/Activity overlay/drawer) rendered an
+EMPTY panel. Integrator + UI verification must confirm each overlay actually mounts its
+module content (TABS.* renderers get a valid container) and Close restores the editor.

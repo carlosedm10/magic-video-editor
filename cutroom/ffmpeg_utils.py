@@ -1,18 +1,146 @@
-"""Thin ffmpeg/ffprobe wrappers. All pixel/sample work in the app goes through here."""
+"""Thin ffmpeg/ffprobe wrappers. All pixel/sample work in the app goes through here.
+
+Resource safety (spec: "Resource safety"): every ffmpeg child is spawned via a
+tracked Popen (registry + terminate_all()), heavy encodes go through a
+lazily-resized concurrency gate (settings.performance.max_parallel_ffmpeg) and
+a per-process -threads cap (settings.performance.ffmpeg_threads), and a RAM
+guard delays encodes while available memory is below
+settings.performance.min_free_ram_gb."""
 
 import functools
 import json
 import os
 import subprocess
+import threading
+import time
 from pathlib import Path
 
 import numpy as np
+import psutil
 
-from . import config
+from . import config, settings
 
 
 class FFmpegError(RuntimeError):
     pass
+
+
+# ---------- child-process registry + shutdown ----------
+
+_procs: set[subprocess.Popen] = set()
+_procs_lock = threading.Lock()
+
+
+def _spawn(cmd: list[str], **kwargs) -> subprocess.Popen:
+    kwargs.setdefault("stdout", subprocess.PIPE)
+    kwargs.setdefault("stderr", subprocess.PIPE)
+    proc = subprocess.Popen(cmd, **kwargs)
+    with _procs_lock:
+        _procs.add(proc)
+    return proc
+
+
+def _unregister(proc: subprocess.Popen) -> None:
+    with _procs_lock:
+        _procs.discard(proc)
+
+
+def terminate_all() -> None:
+    """SIGTERM every tracked ffmpeg child, wait up to 5s, then SIGKILL any
+    still alive. Called on server shutdown (atexit/SIGTERM/SIGINT) and on
+    job cancel."""
+    with _procs_lock:
+        procs = list(_procs)
+    for p in procs:
+        try:
+            p.terminate()
+        except Exception:
+            pass
+    deadline = time.time() + 5
+    for p in procs:
+        try:
+            p.wait(timeout=max(0.0, deadline - time.time()))
+        except Exception:
+            try:
+                p.kill()
+            except Exception:
+                pass
+
+
+# ---------- concurrency gate + RAM guard ----------
+
+
+class _EncodeGate:
+    """Caps concurrent heavy ffmpeg encodes. Sized from
+    settings.performance.max_parallel_ffmpeg, re-read on every acquire so a
+    settings change applies without a restart (a plain threading.Semaphore
+    can't be resized once constructed)."""
+
+    def __init__(self) -> None:
+        self._cond = threading.Condition()
+        self._active = 0
+
+    def _limit(self) -> int:
+        try:
+            n = int(settings.load().get("performance", {}).get("max_parallel_ffmpeg", 2))
+        except Exception:
+            return 2
+        return max(1, n)
+
+    def acquire(self) -> None:
+        with self._cond:
+            while self._active >= self._limit():
+                self._cond.wait(timeout=1)
+            self._active += 1
+
+    def release(self) -> None:
+        with self._cond:
+            self._active = max(0, self._active - 1)
+            self._cond.notify_all()
+
+
+_gate = _EncodeGate()
+
+
+def _ffmpeg_threads() -> int:
+    perf = settings.load().get("performance", {})
+    n = perf.get("ffmpeg_threads")
+    if n:
+        try:
+            return max(1, int(n))
+        except Exception:
+            pass
+    return max(2, (os.cpu_count() or 4) // 2)
+
+
+def ffmpeg_threads() -> int:
+    """Public accessor for the configured -threads cap (settings.performance.
+    ffmpeg_threads), for callers outside this module building their own
+    ffmpeg command (e.g. render.py's fade/crossfade re-encodes)."""
+    return _ffmpeg_threads()
+
+
+def _wait_for_ram() -> None:
+    """Block (log-waiting in 5s increments) while available RAM is below the
+    configured guard, up to 10 minutes total, then proceed anyway --
+    graceful degradation over refusing to run."""
+    min_gb = settings.load().get("performance", {}).get("min_free_ram_gb", 4)
+    threshold = min_gb * 2**30
+    waited = 0.0
+    max_wait = 600.0
+    while True:
+        try:
+            available = psutil.virtual_memory().available
+        except Exception:
+            return
+        if available >= threshold or waited >= max_wait:
+            return
+        print(
+            f"[ffmpeg_utils] low memory ({available / 2**30:.1f}GB free < "
+            f"{min_gb}GB): waiting 5s before encoding..."
+        )
+        time.sleep(5)
+        waited += 5
 
 
 @functools.cache
@@ -52,10 +180,23 @@ def supports_subtitles() -> bool:
     return _supports_ass(ffmpeg_bin())
 
 
-def run(cmd: list[str]) -> None:
-    proc = subprocess.run(cmd, capture_output=True, text=True)
-    if proc.returncode != 0:
-        raise FFmpegError(f"{' '.join(cmd[:6])}... failed:\n{proc.stderr[-2000:]}")
+def run(cmd: list[str], heavy: bool = False) -> None:
+    """Run an ffmpeg command via a tracked Popen. `heavy=True` (real
+    video encodes) gates on the RAM guard + the concurrency gate first."""
+    if heavy:
+        _wait_for_ram()
+        _gate.acquire()
+    try:
+        proc = _spawn(cmd, text=True)
+        try:
+            _, stderr = proc.communicate()
+        finally:
+            _unregister(proc)
+        if proc.returncode != 0:
+            raise FFmpegError(f"{' '.join(cmd[:6])}... failed:\n{(stderr or '')[-2000:]}")
+    finally:
+        if heavy:
+            _gate.release()
 
 
 def probe(path: str) -> dict:
@@ -94,6 +235,8 @@ def clip_info(path: str) -> dict:
         "has_video": v is not None,
         "has_audio": a is not None,
         "size_bytes": int(data["format"].get("size", 0)),
+        "codec_name": v.get("codec_name") if v else None,
+        "pix_fmt": v.get("pix_fmt") if v else None,
     }
 
 
@@ -119,7 +262,7 @@ def extract_wav(src: str, dst: str, sr: int = config.ANALYSIS_SR) -> None:
 
 def load_wav_mono(path: str) -> np.ndarray:
     """Read a pcm_s16le wav as float32 in [-1, 1] (skips the header via ffmpeg pipe)."""
-    proc = subprocess.run(
+    proc = _spawn(
         [
             ffmpeg_bin(),
             "-v",
@@ -133,12 +276,15 @@ def load_wav_mono(path: str) -> np.ndarray:
             "-ar",
             str(config.ANALYSIS_SR),
             "-",
-        ],
-        capture_output=True,
+        ]
     )
+    try:
+        stdout, _ = proc.communicate()
+    finally:
+        _unregister(proc)
     if proc.returncode != 0:
         raise FFmpegError(f"decode failed for {path}")
-    return np.frombuffer(proc.stdout, dtype=np.int16).astype(np.float32) / 32768.0
+    return np.frombuffer(stdout, dtype=np.int16).astype(np.float32) / 32768.0
 
 
 def extract_frame(src: str, t: float, dst: str) -> None:
@@ -221,9 +367,47 @@ def cut_segment(
         "2",
         "-video_track_timescale",
         "90000",
+        "-threads",
+        str(_ffmpeg_threads()),
         dst,
     ]
-    run(cmd)
+    run(cmd, heavy=True)
+
+
+def make_proxy(src: str, dst: str, fps: float) -> None:
+    """H.264/yuv420p preview proxy for browser playback (Chrome can't decode
+    HEVC 10-bit iPhone footage, so the <video> preview player needs a
+    guaranteed-decodable stand-in; see docs/PLATFORM-SPEC.md streaming
+    section). 720p-tall, fps capped at 30, faststart for immediate seeking."""
+    capped_fps = min(fps, 30) if fps else 30
+    run(
+        [
+            ffmpeg_bin(),
+            "-y",
+            "-i",
+            src,
+            "-vf",
+            f"scale=-2:720,fps={capped_fps}",
+            "-c:v",
+            "libx264",
+            "-crf",
+            "23",
+            "-preset",
+            "veryfast",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "128k",
+            "-movflags",
+            "+faststart",
+            "-threads",
+            str(_ffmpeg_threads()),
+            dst,
+        ],
+        heavy=True,
+    )
 
 
 def mux_audio(video_path: str, audio_path: str, dst_path: str) -> None:

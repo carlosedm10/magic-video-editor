@@ -55,6 +55,19 @@ def _fine_offset(wav_a: np.ndarray, wav_b: np.ndarray, coarse_s: float) -> float
     return a_pos / sr - b_start / sr
 
 
+def _cross_group_pairs(clips: list[dict]) -> list[tuple[dict, dict]]:
+    """Only pairs of clips from DIFFERENT camera_groups are candidates for
+    sync correlation — same-camera clips are different takes, never
+    simultaneous recordings, so correlating them would be meaningless."""
+    pairs = []
+    for i in range(len(clips)):
+        for j in range(i + 1, len(clips)):
+            a, b = clips[i], clips[j]
+            if a.get("camera_group", "main") != b.get("camera_group", "main"):
+                pairs.append((a, b))
+    return pairs
+
+
 def run(log, project: dict) -> None:
     clips = [c for c in project["clips"] if c.get("wav")]
     if len(clips) < 2:
@@ -62,6 +75,15 @@ def run(log, project: dict) -> None:
         store.mark_stage(project, "sync", "done", "single clip / nothing to sync")
         log("Fewer than 2 clips with audio — nothing to sync.")
         return
+
+    groups_present = {c.get("camera_group", "main") for c in clips}
+    if len(groups_present) < 2:
+        project["sync_groups"] = []
+        store.mark_stage(project, "sync", "done", "single camera group — nothing to sync")
+        log("Single camera group — nothing to sync.")
+        return
+
+    pairs = _cross_group_pairs(clips)
 
     log("Loading audio envelopes...")
     wavs, envs = {}, {}
@@ -79,20 +101,15 @@ def run(log, project: dict) -> None:
         return x
 
     offsets: dict[tuple[str, str], float] = {}
-    n = len(clips)
-    pair_i = 0
-    total_pairs = n * (n - 1) // 2
-    for i in range(n):
-        for j in range(i + 1, n):
-            a, b = clips[i], clips[j]
-            off, score = _coarse_offset(envs[a["id"]], envs[b["id"]])
-            pair_i += 1
-            log.progress(pair_i / max(1, total_pairs))
-            log(f"{a['filename']} vs {b['filename']}: corr={score:.2f} offset={off:.2f}s")
-            if score >= config.SYNC_MIN_CORR:
-                off = _fine_offset(wavs[a["id"]], wavs[b["id"]], off)
-                offsets[(a["id"], b["id"])] = off
-                parent[find(a["id"])] = find(b["id"])
+    total_pairs = len(pairs)
+    for pair_i, (a, b) in enumerate(pairs, start=1):
+        off, score = _coarse_offset(envs[a["id"]], envs[b["id"]])
+        log.progress(pair_i / max(1, total_pairs))
+        log(f"{a['filename']} vs {b['filename']}: corr={score:.2f} offset={off:.2f}s")
+        if score >= config.SYNC_MIN_CORR:
+            off = _fine_offset(wavs[a["id"]], wavs[b["id"]], off)
+            offsets[(a["id"], b["id"])] = off
+            parent[find(a["id"])] = find(b["id"])
 
     groups: dict[str, list[str]] = {}
     for c in clips:

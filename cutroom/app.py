@@ -5,7 +5,7 @@ import socket
 import threading
 import time
 
-from . import config
+from . import config, ffmpeg_utils
 
 
 class Api:
@@ -25,6 +25,15 @@ class Api:
                 "Media files (*.mp4;*.mov;*.m4v;*.mkv;*.avi;*.mts;*.m4a;*.wav;*.mp3;*.aac;*.flac)",
             ),
         )
+        return list(result or [])
+
+    def pick_folder(self):
+        import webview
+
+        # Same pywebview >=5 constant relocation as pick_files above.
+        file_dialog = getattr(webview, "FileDialog", None)
+        folder_dialog = file_dialog.FOLDER if file_dialog is not None else webview.FOLDER_DIALOG
+        result = webview.windows[0].create_file_dialog(folder_dialog)
         return list(result or [])
 
 
@@ -52,14 +61,17 @@ def main():
     threading.Thread(target=server.run, daemon=True).start()
     _wait_for_server()
 
-    webview.create_window(
-        "CutRoom",
+    window = webview.create_window(
+        "Magic Video Editor",
         f"http://{config.HOST}:{config.PORT}/",
         js_api=Api(),
         width=1440,
         height=920,
         min_size=(1100, 700),
     )
+    # Resource safety: no ffmpeg child must survive the window closing (spec:
+    # "Resource safety" -- pywebview window-close must terminate the registry).
+    window.events.closing += ffmpeg_utils.terminate_all
     webview.start()
 
 

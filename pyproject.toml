@@ -19,6 +19,7 @@ dependencies = [
     "noisereduce>=3.0.3",
     "pyloudnorm>=0.2.0",
     "soundfile>=0.14.0",
+    "psutil>=7.2.2",
 ]
 
 [project.scripts]

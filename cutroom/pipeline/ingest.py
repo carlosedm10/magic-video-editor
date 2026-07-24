@@ -51,32 +51,54 @@ def _import_into_project(src: Path, project_id: str) -> Path:
     return dst
 
 
-def add_clips(project: dict, paths: list[str]) -> list[dict]:
+def set_main_group(project: dict, group: str) -> None:
+    """Mark every clip whose camera_group == `group` as the main camera,
+    clearing is_main on every other clip (exactly one GROUP is main)."""
+    for c in project["clips"]:
+        c["is_main"] = c.get("camera_group") == group
+
+
+def add_clips(project: dict, paths: list[str], camera_group: str | None = None) -> list[dict]:
+    """paths may be files or directories. A directory expands to its media
+    files (sorted by name) and — unless `camera_group` is given — uses the
+    directory NAME as the camera_group for all of them. Loose files default
+    to camera_group "main" (or the explicit override)."""
     added = []
     existing = {c["path"] for c in project["clips"]}
     for raw in paths:
         p = Path(raw).expanduser()
-        if not p.exists() or p.suffix.lower() not in MEDIA_EXTS or str(p) in existing:
-            continue
-        imported = _import_into_project(p, project["id"])
-        clip = {
-            "id": uuid.uuid4().hex[:8],
-            "path": str(imported),
-            "source_path": str(p),
-            "filename": p.name,
-            "role": "audio" if p.suffix.lower() in AUDIO_EXTS else "camera",
-            "is_main": False,
-            "info": None,
-            "wav": None,
-            "transcript": None,
-            "language": None,
-        }
-        project["clips"].append(clip)
-        added.append(clip)
+        if p.is_dir():
+            files = sorted(
+                f for f in p.iterdir() if f.is_file() and f.suffix.lower() in MEDIA_EXTS
+            )
+            group = camera_group or p.name
+        else:
+            files = [p]
+            group = camera_group or "main"
+        for f in files:
+            if not f.exists() or f.suffix.lower() not in MEDIA_EXTS or str(f) in existing:
+                continue
+            imported = _import_into_project(f, project["id"])
+            clip = {
+                "id": uuid.uuid4().hex[:8],
+                "path": str(imported),
+                "source_path": str(f),
+                "filename": f.name,
+                "role": "audio" if f.suffix.lower() in AUDIO_EXTS else "camera",
+                "camera_group": group,
+                "is_main": False,
+                "info": None,
+                "wav": None,
+                "transcript": None,
+                "language": None,
+            }
+            project["clips"].append(clip)
+            added.append(clip)
+            existing.add(str(f))
     if added and not any(c["is_main"] for c in project["clips"]):
         cams = [c for c in project["clips"] if c["role"] == "camera"]
         if cams:
-            cams[0]["is_main"] = True
+            set_main_group(project, cams[0]["camera_group"])
     store.save(project)
     return added
 
@@ -124,11 +146,36 @@ def repair_clip_paths(log, project: dict) -> None:
         store.save(project)
 
 
+def _backfill_camera_groups(project: dict) -> None:
+    """Legacy clips created before camera_group existed default to "main"."""
+    changed = False
+    for clip in project["clips"]:
+        if not clip.get("camera_group"):
+            clip["camera_group"] = "main"
+            changed = True
+    if changed:
+        store.save(project)
+
+
+def _proxy_needed(info: dict) -> bool:
+    """Skip proxy generation for clips already safely browser-playable:
+    h264 + yuv420p + <=1080p tall. Anything else (HEVC, 10-bit, 4K, etc.)
+    gets an H.264 preview proxy so Chrome's <video> player can decode it."""
+    return not (
+        info.get("codec_name") == "h264"
+        and info.get("pix_fmt") == "yuv420p"
+        and info.get("height", 0) <= 1080
+    )
+
+
 def run(log, project: dict) -> None:
     repair_clip_paths(log, project)
+    _backfill_camera_groups(project)
     pdir = store.project_dir(project["id"])
     wav_dir = pdir / "wav"
+    media_dir = pdir / "media"
     wav_dir.mkdir(exist_ok=True)
+    media_dir.mkdir(exist_ok=True)
     clips = project["clips"]
     if not clips:
         raise RuntimeError("No clips added yet.")
@@ -141,6 +188,14 @@ def run(log, project: dict) -> None:
             wav = wav_dir / f"{clip['id']}.wav"
             ffmpeg_utils.extract_wav(clip["path"], str(wav))
             clip["wav"] = str(wav)
+        if clip["info"]["has_video"] and "proxy" not in clip:
+            if _proxy_needed(clip["info"]):
+                log(f"Generating preview proxy for {clip['filename']}")
+                proxy_path = media_dir / f"{clip['id']}_proxy.mp4"
+                ffmpeg_utils.make_proxy(clip["path"], str(proxy_path), clip["info"]["fps"])
+                clip["proxy"] = str(proxy_path)
+            else:
+                clip["proxy"] = None
         log.progress((i + 1) / len(clips))
         store.save(project)
     n_video = sum(1 for c in clips if c["info"]["has_video"])

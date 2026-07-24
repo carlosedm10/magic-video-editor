@@ -12,6 +12,8 @@ const TASK_INFO = [
     "Decides the narrative order of clips. Wants a bigger model to judge well."],
   ["reel_scorer", "Reel scoring",
     "Scores candidate moments for short-form reels. Wants a bigger model to judge well."],
+  ["reviewer", "Suggestions review",
+    "Reads the full kept transcript and proposes non-destructive suggestions (redundant/off-topic/etc). Wants a bigger model to judge well."],
 ];
 
 const selectStyle = `background:var(--panel2);border:1px solid var(--border);color:var(--text);

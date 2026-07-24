@@ -23,8 +23,14 @@ DEFAULTS: dict = {
         "transcript_cleaner": None,
         "clip_order": None,
         "reel_scorer": None,
+        "reviewer": None,
     },
     "whisper_model": config.WHISPER_MODEL,
+    "performance": {
+        "max_parallel_ffmpeg": 2,
+        "ffmpeg_threads": None,
+        "min_free_ram_gb": 4,
+    },
 }
 
 
@@ -47,6 +53,7 @@ def load() -> dict:
     merged = dict(DEFAULTS)
     merged.update(data)
     merged["task_models"] = {**DEFAULTS["task_models"], **(data.get("task_models") or {})}
+    merged["performance"] = {**DEFAULTS["performance"], **(data.get("performance") or {})}
     if not p.exists():
         save(merged)
     return merged

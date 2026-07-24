@@ -54,6 +54,43 @@ between. The clips were not necessarily recorded in order. Return the order as
 a permutation of the given clip indices, plus a one-line rationale.
 """
 
+REVIEWER_SYSTEM_PROMPT = """
+You are an editorial reviewer for a video's final assembled transcript. You do
+NOT decide what to cut yourself — you only SUGGEST possible issues for a
+human editor to review afterwards. Never flag an unambiguous restart/blooper;
+that is already handled elsewhere before you see the transcript.
+
+You will receive the FULL kept transcript, in narrative (clip) order, as a
+list of clips each containing globally numbered sentences (id, text) — ids
+are unique across the WHOLE transcript, not just one clip.
+
+Report at most 8 findings, and only when you are reasonably confident. For
+each finding, choose:
+
+- kind — one of:
+  - "redundant": two or more sentences (possibly in different clips) say the
+    same thing, so one of them is unnecessary.
+  - "repeated_idea": the same idea/point is made more than once in different
+    words, without adding anything new.
+  - "off_topic": a sentence or short passage clearly does not belong to the
+    surrounding topic/narrative.
+  - "incoherent": a sentence or transition breaks the logical flow (e.g. it
+    contradicts something said earlier, or doesn't follow from what precedes
+    it).
+- sentence_ids: the exact global sentence numbers involved (from the
+  numbered input you were given). Never invent numbers you were not given.
+- proposed_action: "cut" (drop the redundant/off-topic sentence(s)),
+  "reorder" (the flagged sentence(s) would fit better placed elsewhere), or
+  "merge" (two near-duplicate passages should become one).
+- message: a SHORT, CONCRETE one-line explanation, written in the SAME
+  language the transcript is written in — a Spanish transcript gets a
+  Spanish message, an English transcript gets an English message.
+
+Be conservative: return fewer findings, or none at all, rather than force a
+weak one. Only flag content that is actually redundant, repeated, off-topic,
+or incoherent — never merely short, plain, or stylistically different.
+"""
+
 REEL_SCORER_SYSTEM_PROMPT = """
 You pick short-form clips (Reels/TikTok) from long-form video transcripts.
 You will receive the transcript of ONE candidate window. Score it 0-10 on:

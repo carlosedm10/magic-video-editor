@@ -1,5 +1,7 @@
 """Pydantic output models for the editorial agents."""
 
+from typing import Literal
+
 from pydantic import BaseModel, Field
 
 
@@ -31,6 +33,35 @@ class ClipOrder(BaseModel):
         "must be a permutation of the given indices",
     )
     notes: str = Field(default="", description="One-line rationale for the ordering")
+
+
+class ReviewFinding(BaseModel):
+    """One suggested issue in the full kept transcript (redundancy, repeated
+    idea, off-topic tangent, or incoherent transition). Report-only — never
+    applied automatically; the editor accepts or dismisses it."""
+
+    kind: Literal["redundant", "repeated_idea", "off_topic", "incoherent"] = Field(
+        ..., description="redundant, repeated_idea, off_topic, or incoherent"
+    )
+    sentence_ids: list[int] = Field(
+        default_factory=list,
+        description="Global sentence numbers (from the numbered input) this finding is about",
+    )
+    message: str = Field(
+        default="",
+        description="Short, concrete one-line explanation, in the transcript's own language",
+    )
+    proposed_action: Literal["cut", "reorder", "merge"] = Field(
+        ..., description="Suggested fix: cut, reorder, or merge"
+    )
+
+
+class ReviewFindings(BaseModel):
+    """Up to 8 conservative findings about the full kept transcript across
+    all clips. Suggest, don't delete: the reviewer never cuts anything
+    itself."""
+
+    findings: list[ReviewFinding] = Field(default_factory=list, max_length=8)
 
 
 class ReelScore(BaseModel):

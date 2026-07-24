@@ -84,8 +84,8 @@ health:
 
 smoke:
 	uv run python -c "import cutroom.server, cutroom.app, cutroom.settings; \
-		from cutroom.api import projects, pipeline, settings, audio, filters, edl; \
-		from cutroom.pipeline import ingest, sync, transcribe, takes, ordering, render, reels, faces, filters as pfilters, audio_enhance; \
+		from cutroom.api import projects, pipeline, settings, audio, filters, edl, suggestions; \
+		from cutroom.pipeline import ingest, sync, transcribe, takes, ordering, render, reels, faces, filters as pfilters, audio_enhance, review; \
 		from cutroom.agents import agents; \
 		print('all modules import OK')"
 

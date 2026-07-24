@@ -1,14 +1,37 @@
 """Studio (manual editor) EDL API: read/write the persisted project["edl"]
 (the ordered list of render segments render.run consumes), reset it back to
-the AI-computed cut, and split a segment at a given absolute clip time."""
+the AI-computed cut, and split a segment at a given absolute clip time.
+
+Each segment may carry an optional "transition": the transition INTO that
+segment (junction-level, chip sits between blocks in the timeline UI). For
+the first segment, "fade" means fade-from-black; "crossfade" has no
+predecessor and is ignored by the renderer. render.run (cutroom/pipeline/
+render.py) is the only consumer of this field."""
+
+from typing import Literal
 
 from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from .. import store
 from ..pipeline import ordering
 
 router = APIRouter(prefix="/api", tags=["edl"])
+
+TRANSITION_MIN_D = 0.2
+TRANSITION_MAX_D = 1.5
+
+
+class Transition(BaseModel):
+    type: Literal["none", "fade", "crossfade"] = "none"
+    duration: float = 0.5
+
+
+def _normalize_transition(t: Transition) -> Transition:
+    if t.type == "none":
+        return Transition(type="none", duration=0.5)
+    duration = min(TRANSITION_MAX_D, max(TRANSITION_MIN_D, t.duration))
+    return Transition(type=t.type, duration=duration)
 
 
 class EdlSegment(BaseModel):
@@ -16,6 +39,7 @@ class EdlSegment(BaseModel):
     start: float
     end: float
     text: str | None = ""
+    transition: Transition = Field(default_factory=Transition)
 
 
 class EdlUpdate(BaseModel):
@@ -63,7 +87,12 @@ def edl_put(pid: str, body: EdlUpdate):
     except FileNotFoundError:
         raise HTTPException(404) from None
     _validate_segments(project, body.segments)
-    project["edl"] = [s.model_dump() for s in body.segments]
+    normalized = []
+    for s in body.segments:
+        d = s.model_dump()
+        d["transition"] = _normalize_transition(s.transition).model_dump()
+        normalized.append(d)
+    project["edl"] = normalized
     store.save(project)
     return {"segments": project["edl"]}
 
@@ -97,8 +126,15 @@ def edl_split(pid: str, body: EdlSplit):
             400, f"split point {body.at} must be strictly inside {seg['start']}-{seg['end']}"
         )
     text = seg.get("text", "") or ""
+    # The transition INTO seg belongs to the first half (same junction before
+    # it); the new mid-clip cut has no transition of its own.
     first = {**seg, "end": body.at}
-    second = {**seg, "start": body.at, "text": text}
+    second = {
+        **seg,
+        "start": body.at,
+        "text": text,
+        "transition": {"type": "none", "duration": 0.5},
+    }
     segments = segments[: body.index] + [first, second] + segments[body.index + 1 :]
     project["edl"] = segments
     store.save(project)

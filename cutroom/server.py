@@ -3,14 +3,15 @@ routers, and keeps UI serving, health, and Range-aware media streaming (so
 <video> can seek) directly here. Project/clip/sentence/order endpoints live
 in api/projects.py, stage-running endpoints in api/pipeline.py."""
 
+import atexit
 import shutil
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse, Response, StreamingResponse
 
-from . import config, llm, store
-from .api import audio, edl, filters, pipeline, projects, settings
+from . import config, ffmpeg_utils, llm, store
+from .api import audio, edl, filters, pipeline, projects, settings, suggestions
 
 app = FastAPI(title="CutRoom")
 UI_DIR = Path(__file__).parent.parent / "ui"
@@ -21,6 +22,7 @@ app.include_router(settings.router)
 app.include_router(audio.router)
 app.include_router(filters.router)
 app.include_router(edl.router)
+app.include_router(suggestions.router)
 
 
 # ---------- UI ----------
@@ -99,6 +101,17 @@ def media_clip(pid: str, cid: str, request: Request):
     return _stream(Path(store.get_clip(project, cid)["path"]), request)
 
 
+@app.get("/api/projects/{pid}/media/preview/{cid}")
+def media_preview(pid: str, cid: str, request: Request):
+    """Browser-safe preview stream: the per-clip H.264 proxy when one exists
+    (HEVC/10-bit/4K sources Chrome can't decode — see docs/PLATFORM-SPEC.md),
+    else the original file (already browser-playable)."""
+    project = store.load(pid)
+    clip = store.get_clip(project, cid)
+    path = clip.get("proxy") or clip["path"]
+    return _stream(Path(path), request)
+
+
 @app.get("/api/projects/{pid}/media/file")
 def media_file(pid: str, path: str, request: Request):
     pdir = store.project_dir(pid).resolve()
@@ -109,10 +122,40 @@ def media_file(pid: str, path: str, request: Request):
 
 
 def main():
+    import asyncio
+    import signal
+
     import uvicorn
 
     config.ensure_dirs()
-    uvicorn.run(app, host=config.HOST, port=config.PORT, log_level="warning")
+
+    # Resource safety: no ffmpeg child must survive the server (spec:
+    # "Resource safety" -- orphaned ffmpeg used to outlive Ctrl-C by ~2min).
+    # atexit is the fallback for any normal interpreter exit; the explicit
+    # SIGTERM/SIGINT handlers below make sure the registry is torn down
+    # *before* uvicorn's own graceful shutdown runs, and chain to uvicorn's
+    # handle_exit so its shutdown still happens (never swallowed).
+    atexit.register(ffmpeg_utils.terminate_all)
+
+    cfg = uvicorn.Config(app, host=config.HOST, port=config.PORT, log_level="warning")
+    server = uvicorn.Server(cfg)
+    # We install our own signal handlers below (chaining to server.handle_exit),
+    # so prevent uvicorn's serve() from installing (and overriding) its own.
+    server.install_signal_handlers = lambda: None
+
+    async def run_server():
+        loop = asyncio.get_event_loop()
+
+        def _handle_exit(sig, _frame=None):
+            ffmpeg_utils.terminate_all()
+            server.handle_exit(sig, _frame)
+
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            loop.add_signal_handler(sig, _handle_exit, sig, None)
+
+        await server.serve()
+
+    asyncio.run(run_server())
 
 
 if __name__ == "__main__":

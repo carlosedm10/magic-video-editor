@@ -17,10 +17,11 @@ from .. import config, settings
 from .prompts import (
     CLIP_ORDER_SYSTEM_PROMPT,
     REEL_SCORER_SYSTEM_PROMPT,
+    REVIEWER_SYSTEM_PROMPT,
     TAKE_JUDGE_SYSTEM_PROMPT,
     TRANSCRIPT_CLEANER_SYSTEM_PROMPT,
 )
-from .schemas import ClipOrder, ReelScore, TakePick, TranscriptCleanup
+from .schemas import ClipOrder, ReelScore, ReviewFindings, TakePick, TranscriptCleanup
 
 _MODEL_SETTINGS = {"temperature": 0.2}
 
@@ -32,6 +33,7 @@ AGENT_SPECS: dict[str, dict] = {
         "prompt": TRANSCRIPT_CLEANER_SYSTEM_PROMPT,
         "output_type": TranscriptCleanup,
     },
+    "reviewer": {"prompt": REVIEWER_SYSTEM_PROMPT, "output_type": ReviewFindings},
 }
 
 _cache: dict[tuple[str, str], Agent] = {}
