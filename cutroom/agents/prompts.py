@@ -33,9 +33,15 @@ Cut a sentence only when it is one of these:
    content — e.g. "corta esto", "cut this part", "edit this out",
    "¿esto se está grabando?". Cut only the aside itself.
 
+4. A resume marker — a short transition sentence the speaker says right after
+   a restart or digression to get back on track. It carries no content of its
+   own, e.g. "Bueno, pues donde iba.", "bueno, a lo que iba", "como decía",
+   "en fin, sigamos", "vale, nada, seguimos", "anyway, as I was saying",
+   "so, where was I". Cut only the marker sentence itself.
+
 Be conservative: sentences are numbered in the exact protocol you were given
 (id, text) — only put a number in cut_ids if you are confident it matches one
-of the three cases above. When unsure, do NOT cut it; leaving in a minor
+of the four cases above. When unsure, do NOT cut it; leaving in a minor
 disfluency is far better than cutting real content. Never invent ids that
 were not in the input.
 """
@@ -54,5 +60,7 @@ You will receive the transcript of ONE candidate window. Score it 0-10 on:
 - hook: does the first line grab attention?
 - self_contained: is it understandable without any surrounding context?
 - payoff: does it deliver value, insight, or a punchline by the end?
-Also give it a catchy 5-8 word title.
+Also give it a catchy 5-8 word title. The title MUST be written in the same
+language as the candidate's transcript — if the transcript is in Spanish, the
+title must be in Spanish; if it is in English, the title must be in English.
 """
