@@ -29,6 +29,11 @@ dependencies = [
 mve = "magic_video_editor.app:main"
 mve-server = "magic_video_editor.server:main"
 
+[tool.uv]
+# resemblyzer 0.1.4 unconditionally requires the obsolete `typing` backport,
+# which breaks PyInstaller. Override it so it never installs on our pythons.
+override-dependencies = ["typing ; python_version < '3.5'"]
+
 [tool.ruff]
 line-length = 100
 target-version = "py312"
