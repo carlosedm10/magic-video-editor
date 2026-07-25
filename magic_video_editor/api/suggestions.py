@@ -3,11 +3,20 @@
 a "cut" suggestion applies it (marks the referenced sentences kept=False and
 invalidates the cached EDL so it's rebuilt); accepting "reorder"/"merge" only
 flips the suggestion's status — per spec ("suggest, don't delete") the actual
-reordering/merging stays a manual Studio edit."""
+reordering/merging stays a manual Studio edit.
+
+Accepting a "placement" or "duplicate_clip" suggestion (spec v7.3, populated
+by magic_video_editor/pipeline/placement.py for incrementally-added clips) instead
+splices the clip into project["clip_order"] + project["edl"] via
+placement.apply_placement; dismissing either just flips status, leaving the
+clip out of clip_order/EDL (still in the media bin). The import below also
+registers placement's "analyze_clip:*" queue runner as a side effect, the
+same way api/thumbs.py registers the "thumbs" runner."""
 
 from fastapi import APIRouter, HTTPException
 
 from .. import store
+from ..pipeline import placement
 
 router = APIRouter(prefix="/api", tags=["suggestions"])
 
@@ -36,7 +45,9 @@ def suggestions_list(pid: str):
 def suggestions_accept(pid: str, sid: str):
     project = _load(pid)
     suggestion = _find(project, sid)
-    if suggestion["proposed_action"] == "cut":
+    if suggestion["kind"] in ("placement", "duplicate_clip"):
+        placement.apply_placement(project, suggestion)
+    elif suggestion["proposed_action"] == "cut":
         ids = set(suggestion["sentence_ids"])
         for s in project["sentences"]:
             if s["id"] in ids:

@@ -72,6 +72,13 @@ class ReelPatch(BaseModel):
     # module docstring for the segments/transitions shape.
     segments: list[SegmentInput] | None = None
     transitions: list[TransitionInput] | None = None
+    # Fit mode / safe-zone one-click fix (spec v7.7) — see
+    # magic_video_editor/pipeline/reels.py's DEFAULT_FIT_MODE/DEFAULT_FIT_SCALE
+    # and _fit_blur_vf. Range matches pipeline/safezones.py's
+    # FIT_SCALE_MIN/MAX exactly (that module's `suggested_fit_scale` values
+    # are meant to be PATCHed straight back here).
+    fit_mode: Literal["fill", "fit_blur"] | None = None
+    fit_scale: float | None = Field(default=None, ge=0.6, le=1.0)
 
 
 def _load_reel(pid: str, rid: str) -> tuple[dict, dict]:
@@ -157,6 +164,16 @@ def reel_patch(pid: str, rid: str, body: ReelPatch):
 
     if "crop_x" in fields:
         reel["crop_x"] = fields["crop_x"]
+
+    if "fit_mode" in fields or "fit_scale" in fields:
+        if "fit_mode" in fields and fields["fit_mode"] is not None:
+            reel["fit_mode"] = fields["fit_mode"]
+        if "fit_scale" in fields and fields["fit_scale"] is not None:
+            reel["fit_scale"] = fields["fit_scale"]
+        # Re-clamp/default via the same normalization ensure_segments already
+        # applies on read, so a partial PATCH (e.g. fit_scale only, before a
+        # fit_mode has ever been set) still lands on a valid pair.
+        reels._normalize_fit(reel)
 
     if "cue_overrides" in fields:
         merged = dict(reel.get("cue_overrides") or {})

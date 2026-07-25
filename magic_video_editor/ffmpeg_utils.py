@@ -158,10 +158,43 @@ def _supports_ass(binary: str) -> bool:
 
 
 @functools.cache
+def _bin_works(binary: str) -> bool:
+    """True if `binary -version` actually runs. Used to skip a candidate
+    that isn't installed/on PATH rather than blow up ffprobe_bin()."""
+    try:
+        return (
+            subprocess.run([binary, "-version"], capture_output=True, timeout=10).returncode == 0
+        )
+    except Exception:
+        return False
+
+
+def _static_ffmpeg_exes() -> tuple[str | None, str | None]:
+    """Lazily fetch (ffmpeg, ffprobe) from the `static-ffmpeg` package. On a
+    machine that has never run this before, this downloads the platform's
+    static build once (cached under the package's own install dir after
+    that) -- see the report for how `make dist-app` should pre-warm this so
+    the packaged .app never needs network access at runtime. Returns
+    (None, None) if the package/build is unavailable."""
+    try:
+        import static_ffmpeg.run as static_ffmpeg_run
+
+        ffmpeg_path, ffprobe_path = static_ffmpeg_run.get_or_fetch_platform_executables_else_raise()
+        return ffmpeg_path, ffprobe_path
+    except Exception:
+        return None, None
+
+
+@functools.cache
 def ffmpeg_bin() -> str:
     """Prefer an ffmpeg that can burn subtitles (libass). Homebrew's ffmpeg 8
     formula ships without libass, so fall back to the static build bundled
-    with imageio-ffmpeg when the system one can't."""
+    with imageio-ffmpeg, and finally to the `static-ffmpeg` package's build
+    (both bundled statics were verified to ship libass) when the system one
+    can't. A clean machine with neither Homebrew ffmpeg nor a system ffprobe
+    still resolves via static-ffmpeg -- what makes the packaged .app
+    self-contained (field bug: packaged app shelling out to system
+    ffmpeg/ffprobe that isn't there)."""
     candidates = [config.env_with_legacy_fallback("MVE_FFMPEG", "CUTROOM_FFMPEG"), "ffmpeg"]
     try:
         import imageio_ffmpeg
@@ -169,15 +202,71 @@ def ffmpeg_bin() -> str:
         candidates.append(imageio_ffmpeg.get_ffmpeg_exe())
     except Exception:
         pass
+    static_ffmpeg_exe, _ = _static_ffmpeg_exes()
+    if static_ffmpeg_exe:
+        candidates.append(static_ffmpeg_exe)
     candidates = [c for c in candidates if c]
-    for cand in candidates:
-        if _supports_ass(cand):
-            return cand
-    return candidates[0]
+    if not candidates:
+        raise FFmpegError(
+            "no ffmpeg binary found (system, imageio-ffmpeg, static-ffmpeg all unavailable)"
+        )
+    chosen = next((cand for cand in candidates if _supports_ass(cand)), candidates[0])
+    print(f"[ffmpeg_utils] using ffmpeg binary: {chosen} (libass={_supports_ass(chosen)})")
+    return chosen
+
+
+@functools.cache
+def ffprobe_bin() -> str:
+    """Resolve ffprobe: env override -> system ffprobe -> the `static-ffmpeg`
+    package's bundled ffprobe. imageio-ffmpeg ships ffmpeg only (no ffprobe),
+    so it is NOT a candidate here -- static-ffmpeg is the only fallback that
+    makes probe() work with no system ffmpeg/ffprobe install at all (the
+    packaged-app field bug this function exists to fix)."""
+    candidates = [
+        config.env_with_legacy_fallback("MVE_FFPROBE", "CUTROOM_FFPROBE"),
+        "ffprobe",
+    ]
+    _, static_ffprobe_exe = _static_ffmpeg_exes()
+    if static_ffprobe_exe:
+        candidates.append(static_ffprobe_exe)
+    candidates = [c for c in candidates if c]
+    if not candidates:
+        raise FFmpegError(
+            "no ffprobe binary found (system ffprobe and static-ffmpeg both unavailable)"
+        )
+    chosen = next((cand for cand in candidates if _bin_works(cand)), candidates[0])
+    print(f"[ffmpeg_utils] using ffprobe binary: {chosen}")
+    return chosen
 
 
 def supports_subtitles() -> bool:
     return _supports_ass(ffmpeg_bin())
+
+
+def binaries_status() -> dict:
+    """Summary for the health endpoint (field bug: health/doctor checked
+    `shutil.which("ffmpeg")`, which is always False for the packaged .app on
+    a machine with no Homebrew ffmpeg even though the app bundles its own
+    static ffmpeg+ffprobe and works fine). Resolves the same lazy/cached
+    binaries the rest of this module actually runs, so "healthy" means "the
+    binary this app will really use", not "something named ffmpeg happens to
+    be on PATH". See report for the 3-line server.py patch that should call
+    this instead of shutil.which("ffmpeg")."""
+    try:
+        ffmpeg_path = ffmpeg_bin()
+    except Exception:
+        ffmpeg_path = None
+    try:
+        ffprobe_path = ffprobe_bin()
+    except Exception:
+        ffprobe_path = None
+    return {
+        "ffmpeg": ffmpeg_path is not None,
+        "ffprobe": ffprobe_path is not None,
+        "ffmpeg_path": ffmpeg_path,
+        "ffprobe_path": ffprobe_path,
+        "ffmpeg_libass": _supports_ass(ffmpeg_path) if ffmpeg_path else False,
+    }
 
 
 def run(cmd: list[str], heavy: bool = False) -> None:
@@ -202,7 +291,7 @@ def run(cmd: list[str], heavy: bool = False) -> None:
 def probe(path: str) -> dict:
     proc = subprocess.run(
         [
-            "ffprobe",
+            ffprobe_bin(),
             "-v",
             "error",
             "-print_format",

@@ -6,8 +6,12 @@ replaced by the aligned external track.
 Junction transitions (project["edl"][i]["transition"]): "fade" is baked into
 the per-segment encode as a video fade + audio afade on the outgoing tail of
 the previous segment and the incoming head of this one (cheap, no extra
-pass). "crossfade" is applied after all segments are encoded by merging each
-crossfade junction's two adjacent files with ffmpeg xfade/acrossfade,
+pass). Every OTHER non-"none" type -- legacy "crossfade" plus any named
+xfade transition from the catalog (spec v7.5, GET /api/transitions; see
+`CATALOG_SPEC`/`get_catalog` below) -- is applied after all segments are
+encoded by merging each junction's two adjacent files with ffmpeg
+`xfade=transition=<name>` + `acrossfade` (name resolved by `_xfade_name_for`,
+which maps the legacy "crossfade" alias to xfade's own "fade" transition),
 processing junctions left-to-right so a merged file can chain into the next
 junction.
 
@@ -39,6 +43,7 @@ manifest only after that rename — so a concurrently-playing <video> pointed
 at preview.mp4 never observes a truncated/half-written file.
 """
 
+import functools
 import hashlib
 import json
 import os
@@ -64,14 +69,154 @@ def _target_format(project: dict) -> tuple[int, int, float]:
     return info["width"], info["height"], info["fps"] or 30.0
 
 
+# ---------- transitions catalog (spec v7.5) ----------
+# Source of truth for the xfade transitions catalog lives HERE (the render
+# pipeline is what actually needs to know which xfade names exist, to build
+# the `xfade=transition=<name>` filter at junction-merge time) rather than in
+# api/transitions.py, so the dependency runs the normal api -> pipeline way:
+# api/transitions.py's GET /api/transitions just re-exports get_catalog(),
+# and api/edl.py / api/reels.py validate against valid_type_names() from
+# here rather than the other way around.
+
+CATALOG_SPEC: list[tuple[str, str, str]] = [
+    # (xfade_name, label_es, category)
+    # Fundidos
+    ("fade", "Fundido", "Fundidos"),
+    ("fadeblack", "Fundido a negro", "Fundidos"),
+    ("fadewhite", "Fundido a blanco", "Fundidos"),
+    ("fadegrays", "Fundido a grises", "Fundidos"),
+    ("fadefast", "Fundido rápido", "Fundidos"),
+    ("fadeslow", "Fundido lento", "Fundidos"),
+    ("dissolve", "Disolvencia", "Fundidos"),
+    # Barridos
+    ("wipeleft", "Barrido izquierda", "Barridos"),
+    ("wiperight", "Barrido derecha", "Barridos"),
+    ("wipeup", "Barrido arriba", "Barridos"),
+    ("wipedown", "Barrido abajo", "Barridos"),
+    ("wipetl", "Barrido esquina superior izq.", "Barridos"),
+    ("wipetr", "Barrido esquina superior der.", "Barridos"),
+    ("wipebl", "Barrido esquina inferior izq.", "Barridos"),
+    ("wipebr", "Barrido esquina inferior der.", "Barridos"),
+    ("vertopen", "Apertura vertical", "Barridos"),
+    ("vertclose", "Cierre vertical", "Barridos"),
+    ("horzopen", "Apertura horizontal", "Barridos"),
+    ("horzclose", "Cierre horizontal", "Barridos"),
+    # Deslizamientos
+    ("slideleft", "Deslizar izquierda", "Deslizamientos"),
+    ("slideright", "Deslizar derecha", "Deslizamientos"),
+    ("slideup", "Deslizar arriba", "Deslizamientos"),
+    ("slidedown", "Deslizar abajo", "Deslizamientos"),
+    ("smoothleft", "Deslizar suave izquierda", "Deslizamientos"),
+    ("smoothright", "Deslizar suave derecha", "Deslizamientos"),
+    ("smoothup", "Deslizar suave arriba", "Deslizamientos"),
+    ("smoothdown", "Deslizar suave abajo", "Deslizamientos"),
+    ("coverleft", "Cubrir hacia la izquierda", "Deslizamientos"),
+    ("coverright", "Cubrir hacia la derecha", "Deslizamientos"),
+    ("coverup", "Cubrir hacia arriba", "Deslizamientos"),
+    ("coverdown", "Cubrir hacia abajo", "Deslizamientos"),
+    ("revealleft", "Revelar hacia la izquierda", "Deslizamientos"),
+    ("revealright", "Revelar hacia la derecha", "Deslizamientos"),
+    ("revealup", "Revelar hacia arriba", "Deslizamientos"),
+    ("revealdown", "Revelar hacia abajo", "Deslizamientos"),
+    ("hlwind", "Viento horizontal izq.", "Deslizamientos"),
+    ("hrwind", "Viento horizontal der.", "Deslizamientos"),
+    ("vuwind", "Viento vertical arriba", "Deslizamientos"),
+    ("vdwind", "Viento vertical abajo", "Deslizamientos"),
+    # Geométricas
+    ("circleopen", "Círculo abriendo", "Geométricas"),
+    ("circleclose", "Círculo cerrando", "Geométricas"),
+    ("circlecrop", "Recorte circular", "Geométricas"),
+    ("rectcrop", "Recorte rectangular", "Geométricas"),
+    ("distance", "Distancia", "Geométricas"),
+    ("diagtl", "Diagonal superior izq.", "Geométricas"),
+    ("diagtr", "Diagonal superior der.", "Geométricas"),
+    ("diagbl", "Diagonal inferior izq.", "Geométricas"),
+    ("diagbr", "Diagonal inferior der.", "Geométricas"),
+    ("squeezeh", "Compresión horizontal", "Geométricas"),
+    ("squeezev", "Compresión vertical", "Geométricas"),
+    ("zoomin", "Zoom in", "Geométricas"),
+    # Píxel
+    ("pixelize", "Pixelado", "Píxel"),
+    ("hblur", "Desenfoque horizontal", "Píxel"),
+    ("radial", "Radial", "Píxel"),
+    ("hlslice", "Corte horizontal izq.", "Píxel"),
+    ("hrslice", "Corte horizontal der.", "Píxel"),
+    ("vuslice", "Corte vertical arriba", "Píxel"),
+    ("vdslice", "Corte vertical abajo", "Píxel"),
+]
+
+_XFADE_LINE_RE = re.compile(r"^\s*([a-z][a-z0-9]*)\s+-?\d+\s+\.+\s*.*transition", re.IGNORECASE)
+
+
+def _probe_xfade_names() -> set[str] | None:
+    """Parse `ffmpeg -h filter=xfade` for the named-transition AVOption enum
+    lines (e.g. "circleopen   19  ..FV....... circleopen transition").
+    Returns None (probe unavailable/unparseable) rather than an empty set on
+    any failure, so callers fall back to trusting CATALOG_SPEC outright
+    instead of silently emptying the catalog."""
+    import subprocess
+
+    try:
+        out = subprocess.run(
+            [ffmpeg_utils.ffmpeg_bin(), "-hide_banner", "-h", "filter=xfade"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        ).stdout
+    except Exception:
+        return None
+    names = set()
+    for line in out.splitlines():
+        m = _XFADE_LINE_RE.match(line)
+        if m and m.group(1) not in ("custom", "transition"):
+            names.add(m.group(1))
+    return names or None
+
+
+@functools.cache
+def get_catalog() -> list[dict]:
+    """The intersection of CATALOG_SPEC and what the bundled ffmpeg actually
+    reports (or all of CATALOG_SPEC if the probe itself is unavailable).
+    Cached: the bundled ffmpeg binary is fixed for the process lifetime."""
+    probed = _probe_xfade_names()
+    entries = []
+    for name, label_es, category in CATALOG_SPEC:
+        if probed is not None and name not in probed:
+            continue
+        entries.append(
+            {"name": name, "label_es": label_es, "category": category, "xfade_name": name}
+        )
+    return entries
+
+
+def valid_type_names() -> set[str]:
+    """Every transition.type value an EDL/reel junction may store: the
+    non-xfade specials ("none", the legacy "crossfade" alias, which this
+    module maps internally to xfade=transition=fade) plus every catalog
+    xfade name -- which also includes the literal "fade" as an xfade name,
+    distinct in meaning from the special cheap per-segment "fade" path (same
+    string, disambiguated by the renderer, not by the catalog)."""
+    return {"none", "crossfade"} | {e["name"] for e in get_catalog()}
+
+
+def _xfade_name_for(ttype: str) -> str:
+    """Map a persisted transition.type to the literal ffmpeg xfade
+    transition name used in `xfade=transition=<name>`. Legacy "crossfade"
+    keeps its pre-v7.5 behavior (a plain fade-style cross-blend); any other
+    catalog name (including the catalog's own "fade" entry) passes through
+    unchanged."""
+    return "fade" if ttype == "crossfade" else ttype
+
+
 def _normalize_transition(t: dict | None) -> dict:
     """Defensive normalization mirroring api/edl.py's validation, in case the
-    persisted EDL predates the transition field or was written some other
-    way."""
+    persisted EDL predates the transition field, was written some other way,
+    or names a transition the CURRENT bundled ffmpeg doesn't have (falls
+    back to "none" rather than failing the whole render)."""
     if not t:
         return {"type": "none", "duration": 0.5}
     ttype = t.get("type") or "none"
-    if ttype not in ("none", "fade", "crossfade"):
+    if ttype not in valid_type_names():
         ttype = "none"
     if ttype == "none":
         return {"type": "none", "duration": 0.5}
@@ -225,9 +370,11 @@ def _encode_segment(
 def _merge_crossfades(
     seg_paths: list[str], transitions: list[dict], work: Path, log, crf: int, preset: str
 ) -> list[str]:
-    """Merge crossfade junctions left-to-right. transitions[i] is the
-    transition INTO seg_paths[i]; a crossfade at index i merges paths[i-1]
-    and paths[i] via xfade+acrossfade, offset = prevDuration - duration. The
+    """Merge every xfade-style junction left-to-right: transitions[i] is the
+    transition INTO seg_paths[i]; any type other than "none"/"fade" (the
+    legacy "crossfade" alias, or any named catalog transition — spec v7.5)
+    merges paths[i-1] and paths[i] via `xfade=transition=<name>` (name from
+    `_xfade_name_for`) + acrossfade, offset = prevDuration - duration. The
     merged file replaces both entries and can itself be the left side of the
     next junction (chaining), so durations are re-probed off disk each time."""
     paths = list(seg_paths)
@@ -235,9 +382,11 @@ def _merge_crossfades(
     merge_idx = 0
     i = 1
     while i < len(paths):
-        if trans[i].get("type") != "crossfade":
+        ttype = trans[i].get("type")
+        if ttype in (None, "none", "fade"):
             i += 1
             continue
+        xfade_name = _xfade_name_for(ttype)
         left, right = paths[i - 1], paths[i]
         d = trans[i]["duration"]
         left_dur = ffmpeg_utils.clip_info(left)["duration"]
@@ -246,7 +395,7 @@ def _merge_crossfades(
         offset = max(0.0, left_dur - d)
         merged = work / f"xfade_{merge_idx:04d}.mp4"
         merge_idx += 1
-        log(f"Crossfading junction ({d:.2f}s)...")
+        log(f"Applying '{xfade_name}' transition at junction ({d:.2f}s)...")
         cmd = [
             ffmpeg_utils.ffmpeg_bin(),
             "-y",
@@ -255,7 +404,7 @@ def _merge_crossfades(
             "-i",
             right,
             "-filter_complex",
-            f"[0:v][1:v]xfade=transition=fade:duration={d:.3f}:offset={offset:.3f}[v];"
+            f"[0:v][1:v]xfade=transition={xfade_name}:duration={d:.3f}:offset={offset:.3f}[v];"
             f"[0:a][1:a]acrossfade=d={d:.3f}[a]",
             "-map",
             "[v]",

@@ -6,15 +6,24 @@ Each segment may carry an optional "transition": the transition INTO that
 segment (junction-level, chip sits between blocks in the timeline UI). For
 the first segment, "fade" means fade-from-black; "crossfade" has no
 predecessor and is ignored by the renderer. render.run (magic_video_editor/pipeline/
-render.py) is the only consumer of this field."""
+render.py) is the only consumer of this field.
 
-from typing import Literal
+Transitions catalog (spec v7.5): `type` now accepts, besides the legacy
+"none"/"fade"/"crossfade", any named ffmpeg xfade transition from
+GET /api/transitions (e.g. "circleopen", "dissolve", "pixelize", ...) —
+validated against pipeline.render.valid_type_names() (the SAME source of
+truth the catalog endpoint serves from — see that module's "transitions
+catalog" section — so the accepted set can never drift from what's actually
+advertised to the UI). render.py maps "fade" to the cheap per-segment
+fade-to-black path and every other non-"none" type (including legacy
+"crossfade") to an xfade merge at the junction."""
 
 from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from .. import store
 from ..pipeline import ordering
+from ..pipeline import render as render_mod
 
 router = APIRouter(prefix="/api", tags=["edl"])
 
@@ -23,8 +32,16 @@ TRANSITION_MAX_D = 1.5
 
 
 class Transition(BaseModel):
-    type: Literal["none", "fade", "crossfade"] = "none"
+    type: str = "none"
     duration: float = 0.5
+
+    @field_validator("type")
+    @classmethod
+    def _valid_type(cls, v: str) -> str:
+        valid = render_mod.valid_type_names()
+        if v not in valid:
+            raise ValueError(f"unknown transition type {v!r} (not in the transitions catalog)")
+        return v
 
 
 def _normalize_transition(t: Transition) -> Transition:

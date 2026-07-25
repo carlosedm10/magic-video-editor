@@ -55,6 +55,32 @@ def face_center(
     return cx, cy
 
 
+def face_bbox_at(video_path: str, t: float) -> tuple[float, float, float, float] | None:
+    """Single-frame biggest-face bounding box as (x, y, w, h) fractions of the
+    SOURCE frame, at time `t`. A single-sample sibling of `face_center`'s
+    multi-sample median center — added for pipeline/safezones.py (spec v7.7),
+    which needs the actual box (not just a center point) to intersect against
+    platform safe zones per sampled frame. None if no face is found or the
+    frame can't be extracted."""
+    det = _detector()
+    with tempfile.TemporaryDirectory() as td:
+        frame_path = Path(td) / "f.jpg"
+        try:
+            ffmpeg_utils.extract_frame(video_path, float(t), str(frame_path))
+        except ffmpeg_utils.FFmpegError:
+            return None
+        img = cv2.imread(str(frame_path))
+        if img is None:
+            return None
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        found = det.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(60, 60))
+        if len(found) == 0:
+            return None
+        x, y, w, h = max(found, key=lambda f: f[2] * f[3])
+        H, W = img.shape[:2]
+        return (x / W, y / H, w / W, h / H)
+
+
 def manual_center(crop_x: float) -> tuple[float, float]:
     """(x, y) center fraction for a manual `crop_x` override (Reel Editor
     framing drag, spec v5): x = crop_x clamped to 0..1, y = the same 0.45

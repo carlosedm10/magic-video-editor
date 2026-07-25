@@ -35,6 +35,7 @@ binaries = []
 hiddenimports = []
 
 _COLLECT_ALL_PACKAGES = [
+    "static_ffmpeg",
     "mlx",
     "mlx_whisper",
     "resemblyzer",
@@ -56,6 +57,13 @@ _COLLECT_ALL_PACKAGES = [
     "imageio_ffmpeg",
     "scipy",
 ]
+
+try:
+    import static_ffmpeg.run as _static_ffmpeg_run
+
+    _static_ffmpeg_run.get_or_fetch_platform_executables_else_raise()
+except Exception as exc:  # surfaced at build time
+    print(f"[mve.spec] static-ffmpeg pre-fetch failed: {exc}")
 
 for pkg in _COLLECT_ALL_PACKAGES:
     try:

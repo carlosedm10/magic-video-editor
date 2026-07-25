@@ -75,6 +75,18 @@ from . import audio_enhance, faces, filters, subtitles
 from . import render as render_mod
 
 DEFAULT_TRANSITION = {"type": "crossfade", "duration": 0.4}
+
+# Fit mode (spec v7.7 "Zoom out con fondo blur"): "fill" (default, current
+# face-centered 9:16 crop behavior, unchanged) vs "fit_blur" (background =
+# same video scaled to fill + blurred/darkened, foreground = video scaled to
+# fit_scale centered -- the classic vertical-video treatment, and the
+# one-click fix a safety-zone warning offers). Range/default match
+# pipeline/safezones.py's FIT_SCALE_MIN/MAX (0.6..1.0) exactly, since that
+# module computes `suggested_fit_scale` values in this same range.
+DEFAULT_FIT_MODE = "fill"
+DEFAULT_FIT_SCALE = 0.82
+FIT_SCALE_MIN = 0.6
+FIT_SCALE_MAX = 1.0
 _COMPOSER_TOP_WINDOWS = 15
 _COMPOSER_MAX_PAIR_CALLS = 10
 _COMPOSER_MIN_GAP_S = 3.0
@@ -353,6 +365,9 @@ def suggest(log, project: dict) -> None:
             "crop_x": None,
             "cue_overrides": {},
             "subtitle_style": {},
+            # Fit mode / safe-zone fix (spec v7.7) — see module constants above.
+            "fit_mode": DEFAULT_FIT_MODE,
+            "fit_scale": DEFAULT_FIT_SCALE,
             # Multi-segment reels (spec v5.8b) — see module docstring.
             "segments": segments,
             "transitions": transitions,
@@ -487,13 +502,31 @@ def _sync_legacy_fields(reel: dict) -> None:
     reel["out_override"] = seg0.get("out_override")
 
 
+def _normalize_fit(reel: dict) -> None:
+    """Defensive normalization for fit_mode/fit_scale (spec v7.7), mirroring
+    the pattern of `_normalize_transition`/`_normalize_transitions` above:
+    an unknown/missing fit_mode falls back to "fill", fit_scale is clamped
+    to FIT_SCALE_MIN..FIT_SCALE_MAX and only meaningful once fit_mode is
+    "fit_blur" (kept/clamped regardless so a mode toggle back to fit_blur
+    remembers the last value)."""
+    mode = reel.get("fit_mode") or DEFAULT_FIT_MODE
+    if mode not in ("fill", "fit_blur"):
+        mode = DEFAULT_FIT_MODE
+    reel["fit_mode"] = mode
+    try:
+        scale = float(reel.get("fit_scale") or DEFAULT_FIT_SCALE)
+    except (TypeError, ValueError):
+        scale = DEFAULT_FIT_SCALE
+    reel["fit_scale"] = min(FIT_SCALE_MAX, max(FIT_SCALE_MIN, scale))
+
+
 def ensure_segments(reel: dict) -> None:
     """Migrate a legacy single-window reel (pre spec v5.8b, no "segments"
     key) to the multi-segment shape IN PLACE: reel["segments"] = [{clip_id,
     start, end, in_override, out_override}] (from the reel's own top-level
     fields), reel["transitions"] = [] (a single segment has no junctions).
     Idempotent -- a no-op (besides re-syncing legacy fields/normalizing
-    transitions) once "segments" is already present. Callers: render_reel
+    transitions/fit) once "segments" is already present. Callers: render_reel
     and api/reels.py's `_load_reel`."""
     if not reel.get("segments"):
         reel["segments"] = [
@@ -509,6 +542,7 @@ def ensure_segments(reel: dict) -> None:
     reel.setdefault("composed", False)
     _normalize_transitions(reel)
     _sync_legacy_fields(reel)
+    _normalize_fit(reel)
 
 
 # ---------- override resolution (spec v5 data model, per segment) ----------
@@ -581,6 +615,31 @@ def _segment_cue_overrides(
     return local, len(cues)
 
 
+def _fit_blur_vf(width: int, height: int, fit_scale: float) -> str:
+    """Classic "zoom out with blurred background" vertical-video treatment
+    (spec v7.7): background = the SAME source scaled to FILL the 9:16 frame
+    (force_original_aspect_ratio=increase + center crop) with a strong
+    boxblur and a slight darken; foreground = the source scaled to fit
+    within `fit_scale` of the frame (preserving its own aspect ratio),
+    centered on top. Built as one filtergraph string (split -> two labeled
+    chains -> overlay) so it slots into `_encode_segment`'s vf_extra exactly
+    like the plain crop filter `faces.vertical_crop_filter` returns for the
+    default "fill" mode: `_encode_segment` appends its own
+    scale=width:height,pad=width:height,fps=... chain right after via a
+    plain comma, which becomes a no-op once the overlay output is already
+    exactly width x height."""
+    fit_scale = min(FIT_SCALE_MAX, max(FIT_SCALE_MIN, fit_scale))
+    fg_w = max(2, round(width * fit_scale) // 2 * 2)
+    fg_h = max(2, round(height * fit_scale) // 2 * 2)
+    return (
+        "split=2[fbbg][fbfg];"
+        f"[fbbg]scale={width}:{height}:force_original_aspect_ratio=increase,"
+        f"crop={width}:{height},boxblur=20:1,eq=brightness=-0.08[fbbgout];"
+        f"[fbfg]scale={fg_w}:{fg_h}:force_original_aspect_ratio=decrease[fbfgout];"
+        "[fbbgout][fbfgout]overlay=(W-w)/2:(H-h)/2"
+    )
+
+
 def render_reel(log, project: dict, reel_id: str) -> None:
     """Renders every segment of the reel (crop/subs/color/overrides apply
     per segment; face-crop resolved once from segment 0 unless crop_x is
@@ -600,9 +659,16 @@ def render_reel(log, project: dict, reel_id: str) -> None:
     work = pdir / "work" / f"reel_{reel_id}"
     work.mkdir(parents=True, exist_ok=True)
 
+    fit_mode = reel.get("fit_mode") or DEFAULT_FIT_MODE
+    fit_scale = float(reel.get("fit_scale") or DEFAULT_FIT_SCALE)
+
     first_clip = store.get_clip(project, segments[0]["clip_id"])
     start0, end0 = _effective_segment_window(first_clip, segments[0])
-    center = _effective_crop_center(log, first_clip, reel, start0, end0)
+    center = None
+    if fit_mode != "fit_blur":
+        # fit_blur has no crop -- skip face detection entirely (spec: the
+        # background/foreground scale treatment doesn't need a crop center).
+        center = _effective_crop_center(log, first_clip, reel, start0, end0)
     log.progress(0.2)
 
     color_vf = filters.build_vf(project.get("color"))
@@ -625,10 +691,14 @@ def render_reel(log, project: dict, reel_id: str) -> None:
         clip = store.get_clip(project, seg["clip_id"])
         start, end = _effective_segment_window(clip, seg)
 
-        crop = faces.vertical_crop_filter(
-            clip["info"]["width"], clip["info"]["height"], center, config.REEL_W, config.REEL_H
-        )
-        vf_extra = ",".join(v for v in (color_vf, crop) if v)
+        if fit_mode == "fit_blur":
+            fit_vf = _fit_blur_vf(config.REEL_W, config.REEL_H, fit_scale)
+            vf_extra = ",".join(v for v in (color_vf, fit_vf) if v)
+        else:
+            crop = faces.vertical_crop_filter(
+                clip["info"]["width"], clip["info"]["height"], center, config.REEL_W, config.REEL_H
+            )
+            vf_extra = ",".join(v for v in (color_vf, crop) if v)
 
         ass_path = None
         if burn_subs:

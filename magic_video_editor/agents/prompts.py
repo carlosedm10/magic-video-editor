@@ -244,6 +244,36 @@ between. The clips were not necessarily recorded in order. Return the order as
 a permutation of the given clip indices, plus a one-line rationale.
 """
 
+CLIP_PLACEMENT_SYSTEM_PROMPT = """
+You help incorporate a NEWLY RECORDED clip into an already-edited video.
+Recordings are in Spanish or English (or mixed). You will receive the
+video's one-line TOPIC, an ORDERED list of the existing clips already in the
+story (each as "CLIP <index>: <one-line summary of its kept content>"), and
+the NEW CLIP's transcript (only the sentences that survived cleanup).
+
+Decide where the new clip belongs:
+
+- placement_after_clip_index: the existing clip index it should play AFTER,
+  based on topical continuity (what it explains, sets up, or follows on
+  from). Use -1 if it belongs at the very START, before every existing clip.
+- duplicate_of_clip_index: if the new clip clearly repeats the SAME content
+  (semantically, not just similar wording) already covered by one specific
+  existing clip, its index; otherwise -1. Only flag a duplicate when you are
+  confident the new clip adds nothing beyond what that existing clip already
+  says.
+- confidence: 1-5, how sure you are of this placement/duplicate judgement.
+- message: a SHORT, CONCRETE one-line explanation for a human editor, written
+  in the SAME language as the transcript (a Spanish transcript gets a
+  Spanish message, an English transcript gets an English message). If
+  duplicate_of_clip_index is set, the message must say what it repeats, e.g.
+  "Repite el contenido del clip 2". Otherwise explain what it adds and where
+  it fits, e.g. "Encaja después del clip 3 (explica X antes de Y)".
+
+Be conservative flagging duplicates: only when confident the new clip is
+genuinely redundant, not merely on a related topic. When in doubt, prefer a
+placement suggestion over a duplicate one.
+"""
+
 REVIEWER_SYSTEM_PROMPT = """
 You are an editorial reviewer for a video's final assembled transcript. You do
 NOT decide what to cut yourself — you only SUGGEST possible issues for a

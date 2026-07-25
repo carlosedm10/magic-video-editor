@@ -140,6 +140,27 @@ class CopywriterOutput(BaseModel):
     )
 
 
+class ClipPlacement(BaseModel):
+    """Where a newly added clip fits into the already-edited narrative (spec
+    v7.3 "Incremental clip addition"). Flat schema, small-model friendly."""
+
+    placement_after_clip_index: int = Field(
+        ...,
+        description="Existing clip index (0-based) the new clip should play AFTER, "
+        "or -1 to place it at the very start, before every existing clip",
+    )
+    duplicate_of_clip_index: int = Field(
+        default=-1,
+        description="Existing clip index (0-based) whose content the new clip clearly "
+        "repeats, or -1 if it is not a duplicate",
+    )
+    confidence: int = Field(..., ge=1, le=5, description="Confidence in this judgement, 1-5")
+    message: str = Field(
+        default="",
+        description="Short, concrete one-line explanation, in the transcript's own language",
+    )
+
+
 class ReelComposer(BaseModel):
     """Verdict on whether two high-scoring short-form windows continue the
     SAME idea apart in time (setup+payoff, question+answer, ...) and should

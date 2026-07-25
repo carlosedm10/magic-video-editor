@@ -298,6 +298,11 @@ async function renderSettings() {
   } catch (e) {
     _sfs.modelsError = e.message;
   }
+  try {
+    _sfs.health = await api("/health");
+  } catch (e) {
+    _sfs.health = null;
+  }
 
   _sfsRenderShell();
 }
@@ -555,6 +560,29 @@ function _sfsTaskOptions(selected) {
   return `<option value="" ${nullSel}>(use default)</option>` + _sfsModelOptions(selected || "");
 }
 
+// Ollama mode -> one-line status shown at the top of Models (field-bug
+// follow-up: the packaged app used to never spawn its bundled Ollama at all
+// when the system one wasn't running -- this makes which path is actually
+// serving requests visible instead of silently invisible).
+const _OLLAMA_MODE_LABELS = {
+  system: "Ollama: usando instalación del sistema",
+  bundled: "Ollama: integrado",
+  downloaded: "Ollama: descargado automáticamente",
+  starting: "Ollama: iniciando…",
+  downloading: "Ollama: descargando runtime…",
+  unreachable: "Ollama: no disponible",
+};
+
+function _sfsOllamaStatusLine() {
+  const mode = _sfs.health && _sfs.health.ollama_mode;
+  if (!mode) return "";
+  const label = _OLLAMA_MODE_LABELS[mode] || `Ollama: ${mode}`;
+  const busy = mode === "starting" || mode === "downloading";
+  const bad = mode === "unreachable";
+  const cls = bad ? "sfs-bad" : busy ? "" : "sfs-ok";
+  return `<div class="sfs-hint ${cls}" style="margin-bottom:12px">${esc(label)}</div>`;
+}
+
 function _sfsInstalledChipsHtml() {
   if (_sfs.modelsError) return `<div class="sfs-hint">Unavailable — Ollama isn't reachable.</div>`;
   if (!_sfs.models.length) return `<div class="sfs-hint">No models installed yet.</div>`;
@@ -583,6 +611,7 @@ function _sfsRenderModels(host) {
     </div>
 
     <div class="sfs-card">
+      ${_sfsOllamaStatusLine()}
       ${_sfs.modelsError ? `<div class="sfs-hint" style="color:var(--warn)">
         Couldn't reach Ollama: ${esc(_sfs.modelsError)}</div>` : ""}
       <div class="sfs-label" style="margin-bottom:12px">Your models</div>

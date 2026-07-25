@@ -86,6 +86,35 @@ def _finalize_main_group(project: dict, added: list[dict]) -> None:
             set_main_group(project, cams[0]["camera_group"])
 
 
+def _completed_pipeline(project: dict) -> bool:
+    """v7.3 "Incremental clip addition": true once the narrative order or the
+    final render has completed at least once -- the signal that this project
+    is past its first (full run-all/manual) pass and any further clips added
+    are an INCREMENTAL addition, not part of the initial import."""
+    stages = project.get("stages", {})
+    return any(stages.get(s, {}).get("status") == "done" for s in ("order", "render"))
+
+
+def _enqueue_analyze_for_new_clips(project: dict, added: list[dict]) -> None:
+    """v7.3: once the pipeline has already completed, newly added CAMERA
+    clips each get their own `analyze_clip:<id>` queue item -- import/proxy/
+    thumbs/wav, transcription, and the per-clip cleaner+sequencer for that
+    clip ONLY, followed by a placement suggestion (never an auto-cut/auto-
+    reorder; see magic_video_editor/pipeline/placement.py, which registers the
+    "analyze_clip:*" runner). Skipped for a project's very first batch of
+    clips -- those go through the normal run-all/manual stage flow. Audio-only
+    clips (role != "camera") aren't part of clip_order/EDL, so they're left
+    for the next full run instead."""
+    if not added or not _completed_pipeline(project):
+        return
+    from .. import queue
+
+    for clip in added:
+        if clip["role"] != "camera":
+            continue
+        queue.enqueue(project["id"], f"analyze_clip:{clip['id']}", {"clip_id": clip["id"]})
+
+
 def add_clips(project: dict, paths: list[str], camera_group: str | None = None) -> list[dict]:
     """paths may be files or directories. A directory expands to its media
     files (sorted by name) and — unless `camera_group` is given — uses the
@@ -113,6 +142,7 @@ def add_clips(project: dict, paths: list[str], camera_group: str | None = None) 
             existing.add(str(f))
     _finalize_main_group(project, added)
     store.save(project)
+    _enqueue_analyze_for_new_clips(project, added)
     return added
 
 
@@ -133,6 +163,7 @@ def register_uploaded_clips(project: dict, saved: list[tuple[Path, str]]) -> lis
         existing.add(str(dest))
     _finalize_main_group(project, added)
     store.save(project)
+    _enqueue_analyze_for_new_clips(project, added)
     return added
 
 

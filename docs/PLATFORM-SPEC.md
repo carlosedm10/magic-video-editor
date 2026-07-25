@@ -788,3 +788,164 @@ color panel's live CSS-approximation path never pauses/detaches the draft videos
 compare.js interactions with #player-stage).
 Regression test for the integrator: with a project playing in Draft, change a color
 slider, wait for the auto preview render to complete, and assert playback never stopped.
+
+---
+
+# v7 — Source preview, incremental clips, transitions catalog, subtitle inline edit, reel safe zones (owner, 2026-07-25)
+
+Owner decisions locked: reel safety = DETERMINISTIC geometry (face bbox vs platform zones,
+NO vision-LLM screenshots); new-clip insertion = PROPOSE + 1-click accept (never auto).
+
+## 7.1 Media bin source preview
+Clicking a clip in the media bin loads it into the main player in **Source mode** (plays
+the clip's preview proxy from 0, full clip scrubbing on the timeline RULER ONLY — the EDL
+track stays untouched/dimmed): a small "Source: <name>" chip appears in the player
+controls with an X to return to **Edit mode** (the EDL). Esc / clicking any timeline
+segment also returns. Double-click in the bin = same. This mirrors FCP viewer behavior.
+
+## 7.2 Stage pills -> collapsible pipeline chip
+The 8 stage pills leave the top bar. Replace with ONE compact chip ("Pipeline ✓" /
+"Pipeline 3/8" / error state) that opens a popover listing all stages with status and
+per-stage re-run buttons. While run-all is executing, the existing progress strip remains
+(unchanged). Less noise, same power.
+
+## 7.3 Incremental clip addition (pipeline already run)
+When clips are added to a project whose pipeline already completed:
+- Auto-enqueue an `analyze_clip` queue item scoped to the new clip(s): import/proxy/
+  thumbs/wav + transcribe + per-clip cleaner/sequencer ONLY for that clip. Existing
+  clips are never re-processed.
+- Then a **placement agent** (flat: {placement_after_clip_index: int|-1 (-1=start),
+  duplicate_of_clip_index: int|-1, confidence: 1-5, message: str}) receives the video
+  topic, ordered per-clip summaries of the existing narrative, and the new clip's kept
+  transcript. Output becomes a SUGGESTION card (Ideas tab + toast):
+  - fits: "Encaja después del clip 3 (explica X antes de Y)" -> Accept splices it into
+    clip_order at that position and rebuilds the EDL insertion (existing edits to other
+    segments preserved — only insert, never reshuffle).
+  - duplicate: "Este clip repite contenido del clip 2 — ¿seguro que quieres añadirlo?"
+    -> Accept anyway (places it) / Dismiss (clip stays in the bin, excluded from EDL).
+- Message in the transcript's language.
+
+## 7.4 Overlay track discoverability (already built — surface it)
+The overlay track exists (v5.9). Fix discoverability: permanent thin label "Overlay —
+arrastra un clip aquí" as empty-state on the upper track, highlight on bin-drag, and an
+e2e verification that drag→box→render works after the recent waves.
+
+## 7.5 Transitions catalog (FCP-style, ffmpeg xfade)
+No .cube-like interchange format exists for transitions (gl-transitions is the GLSL
+catalog standard but needs a custom ffmpeg build — rejected). Expose ffmpeg's native
+xfade catalog (~50 named transitions) instead:
+- Backend: GET /api/transitions -> [{name, label_es, category (Fundidos/Barridos/
+  Deslizamientos/Geométricas/Píxel), xfade_name}]; EDL junction transition.type accepts
+  any xfade name (validated against the catalog); render maps type -> xfade=transition=
+  <name> (audio always acrossfade); "fade"/"crossfade" legacy values keep working.
+- UI: FX inspector tab becomes the transitions BROWSER: category sections, animated
+  thumbnail per transition (CSS keyframe approximations on two colored tiles — no video
+  decoding), click-to-apply to the selected junction AND drag-onto-junction-chip in the
+  timeline. Junction chips show the transition name. Draft playback approximates: fades
+  via existing overlay; everything else = generic quick crossfade (exact look = preview
+  render).
+
+## 7.6 Subtitle inline edit on the player
+When subtitles are enabled and the player is PAUSED: the subtitle overlay becomes
+interactive — double-click opens inline editing (contenteditable) saving to a NEW
+project-level cue override map (project["subtitles"]["cue_overrides"] {cue_index: text},
+honored by cue_list + .ass burn for main render AND preview); simultaneously the Subs
+inspector tab opens with that cue's row scrolled into view and focused (cue LIST with
+per-cue editable text is added to the Subs tab for the main video, like the reel editor
+has). Dragging the overlay vertically adjusts the subtitle vertical margin (persisted in
+the subtitles config; snaps to bottom/center presets when close). While playing, the
+overlay stays non-interactive.
+
+## 7.7 Reel social safe zones + face safety (deterministic)
+- New module with PER-PLATFORM zone specs (research current published safe-zone specs
+  for TikTok, Instagram Reels, YouTube Shorts on the web; encode as fractions of
+  1080x1920: right action rail, bottom caption/description area, top bar, progress bar).
+  Each platform also gets a lightweight CSS/SVG MOCKUP overlay (rail icons: heart,
+  comment, share; caption lines; username) for the Reel Editor preview — platform toggle
+  chips (TikTok / Reels / Shorts / none). Search the web for an existing open-source
+  safe-zone template/library first; if a good one exists (svg/png overlays, permissive
+  license), vendor it; else hand-build minimal mockups.
+- **Face safety check (deterministic)**: reuse the existing face detector on sampled
+  frames of the reel window (respecting crop_x/fit): intersect the face bbox (mapped
+  into 9:16 output coords) with each platform's occupied zones. Endpoint
+  GET /api/projects/{pid}/reels/{rid}/safety?platform=... -> {safe: bool, intervals:
+  [{t0,t1,zone}], coverage_pct}. UI: warning badge per platform chip ("La cara queda
+  tapada por la UI de TikTok en 0:04–0:12").
+- **One-click fix — "Zoom out con fondo blur"**: reel gains fit_mode: "fill" (default)
+  | "fit_blur" + fit_scale (0.6..1.0). fit_blur render: background = the same video
+  scaled to fill + boxblur (+slight darken), foreground = the video scaled to fit_scale
+  centered (classic vertical-video treatment). Preview approximates with CSS (blurred
+  underlay). When a safety warning fires, the suggestion offers this fix with a scale
+  that clears the zones (computed from the face bbox geometry).
+
+Conventions: same as always (ruff/lint/smoke, vanilla JS, flat schemas, ffmpeg via
+ffmpeg_utils, strict ownership, never commit, never wait-for-monitors, live user on 8765
++ real data dir untouchable, MVE_DATA scratch + ports 8840-8858 for tests).
+
+## v7.8 — Export: transcript/audio/video + output format settings (owner, 2026-07-25)
+
+### Export dialog restructure
+Three first-class exports: **Vídeo / Audio / Transcripción** (radio or segmented control),
+plus the existing reels options.
+- Quick path: "Exportar" uses the DEFAULTS (from Settings); advanced path: "Exportar
+  como…" expands: for video — resolution picker (2160p/1440p/1080p/720p/Original,
+  CAPPED at the source resolution: options above the source res are disabled with a
+  tooltip "tu material es 1080p" — never upscale; compressing down is always allowed),
+  quality preset (Alta CRF18 / Media CRF23 / Comprimida CRF28), container (mp4 / mov /
+  mkv — what our ffmpeg encodes with h264+aac). For audio — m4a / mp3 / wav of the final
+  cut's audio (with enhance applied if enabled). For transcript — .txt (plain, narrative
+  order, kept sentences only), .srt (re-timed to the FINAL EDL timeline, honoring cue
+  overrides + speakers prefixes if enabled), .md (with clip headings). Files land in the
+  export dir under the project folder, named "<project name>.<ext>" (dedupe as usual).
+- Settings > General gains an "Export defaults" row: default container + quality preset
+  + resolution (Original by default). The Export dialog's quick action reads these.
+
+### Backend
+- render gains an export profile parameter {container, crf, height|original} threaded
+  through final_render (scale only DOWN; audio codec per container: aac for mp4/mov,
+  aac in mkv fine); audio-only export = extract/encode from the rendered cut (or render
+  audio-only path if no cut exists yet -> require a render first with a clear message).
+- New endpoints: POST /api/projects/{pid}/export {kind: video|audio|transcript, profile}
+  -> enqueues; GET transcript export generates synchronously (it is cheap).
+- Validation: requested height > source height -> 400 with the friendly message.
+
+## v7.9 — Voice enhancement v2 + 8-band EQ (owner: current enhance "es una lata")
+The noisereduce spectral gate DEGRADES already-good audio (tinny artifacts). Replace with
+a real neural speech enhancer:
+- RESEARCH (agent has web): benchmark locally the leading Python-native options —
+  **DeepFilterNet** (pip deepfilternet, DNS-grade, CPU-fast, primary candidate),
+  **resemble-enhance** (denoise+enhance, torch), demucs vocals stem (heavy; only if DFN
+  disappoints), speechbrain MetricGAN+. Pick by: quality on speech w/ mild room noise,
+  CPU speed on Apple Silicon, dependency weight. Generate A/B artifacts (original vs
+  each candidate on a real-ish fixture) saved to a scratch folder listed in the report
+  so the owner can LISTEN and veto.
+- New chain: neural enhance (chosen tool) -> loudness normalize -16 LUFS -> peak limit.
+  DROP the crude gate/highpass/presence stack (the model handles it). Keep noisereduce
+  ONLY as a fallback when the model/deps are unavailable. The A/B preview endpoint stays.
+- **8-band EQ**: project["audio_eq"] = 8 gains in dB (-12..+12) at 60/150/400/1k/2.4k/
+  6k/12k/16k Hz, default flat. Render/preview-render apply via chained ffmpeg
+  `equalizer` biquads (or superequalizer mapped). Draft playback applies it LIVE via
+  WebAudio BiquadFilterNodes on the player's video element (peaking filters, same
+  freqs) so sliders are heard instantly. Audio inspector tab: 8 vertical sliders +
+  value labels + reset + a couple of presets (Voz, Música, Plano).
+
+## v7.5 addendum — FCP/iMovie transition parity + SVG identity (owner)
+Research the DEFAULT transition sets of Final Cut Pro and iMovie (lists are documented
+online); map them onto our xfade catalog, naming ours after the familiar ones (Cross
+Dissolve, Fade to Black, Fade to White, Wipe, Slide, Circle, etc. — label_es included)
+and ordering the browser with those familiar ones FIRST. Every transition gets a clear
+visual identity: a small inline SVG glyph (two frames + arrow motif per family) PLUS the
+existing animated hover preview. Drag-to-junction stays the core gesture.
+
+## v7.10 — Timeline clip context menu + speed/retime (owner)
+Research a documented breakdown of Final Cut Pro's clip-level frontend actions (menus/
+shortcuts references online) and map what we lack; implement the high-value set as a
+RIGHT-CLICK context menu on timeline blocks (custom menu, app-first — the webview default
+menu stays disabled): Cambiar velocidad (0.5x/0.75x/1x/1.5x/2x/custom dialog), Duplicar
+segmento, Desactivar/Activar (excluded from render, dimmed block), Dividir aquí, Eliminar
+(ripple), Transición… (opens FX browser for its junction), Ver origen (Source mode at
+that clip time). Speed/retime: segment gains speed (0.25..4.0); render maps to
+setpts=PTS/<v> + atempo chain (atempo composed for >2x/<0.5x); duration math updates EDL
+timeline lengths everywhere (cumulative, playhead, filmstrip width); draft playback uses
+video.playbackRate for that segment. Subtitle cue times for sped segments re-map
+accordingly in cue_list/burn.

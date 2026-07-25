@@ -4,7 +4,6 @@ routers, and keeps UI serving, health, and Range-aware media streaming (so
 in api/projects.py, stage-running endpoints in api/pipeline.py."""
 
 import atexit
-import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -105,7 +104,8 @@ def health():
         "name": "Magic Video Editor",
         "version": __version__,
         "by": "carlosedm10",
-        "ffmpeg": shutil.which("ffmpeg") is not None,
+        "ffmpeg": ffmpeg_utils.binaries_status()["ffmpeg"],
+        "ffprobe": ffmpeg_utils.binaries_status()["ffprobe"],
         "ollama": llm.available(),
         "ollama_mode": llm.mode(),
         "model": config.OLLAMA_MODEL,
@@ -216,9 +216,11 @@ def main():
 
     # v6 packaging Option B: prefer a system Ollama already reachable at
     # config.OLLAMA_URL; else spawn our bundled binary if one was vendored
-    # (packaging/fetch_ollama.sh). Bounded (<=30s); logs and continues in
-    # "unreachable" mode rather than blocking startup forever.
-    ollama_manager.ensure_ollama()
+    # (packaging/fetch_ollama.sh), or self-provision by downloading it if
+    # not. Runs on a background thread (never blocks startup) -- GET
+    # /api/health's ollama_mode reflects "starting"/"downloading" progress
+    # until it settles on system/bundled/downloaded/unreachable.
+    ollama_manager.ensure_ollama_async()
 
     # v6 auto-update: non-blocking GitHub Releases check (never delays boot,
     # fail-silent -- see magic_video_editor/updater.py).

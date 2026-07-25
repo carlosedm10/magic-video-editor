@@ -13,7 +13,7 @@ import socket
 import threading
 import time
 
-from . import config, ffmpeg_utils, queue, settings, store, updater
+from . import config, ffmpeg_utils, ollama_manager, queue, settings, store, updater
 
 GITHUB_URL = "https://github.com/carlosedm10/magic-video-editor"
 
@@ -276,6 +276,17 @@ def main():
     from .server import app as fastapi_app
 
     config.ensure_dirs()
+
+    # v6 packaging Option B (field bug fix): mirrors server.py's main(),
+    # which app.py bypasses by driving uvicorn itself -- ensure_ollama() was
+    # missing here entirely, so the packaged .app never spawned the bundled
+    # `ollama serve` on a machine where Ollama.app was installed but not
+    # running; it just silently sat in whatever mode config.OLLAMA_URL
+    # happened to be in. Runs on its own background thread (never blocks
+    # this window from opening) -- GET /api/health's ollama_mode reflects
+    # "starting"/"downloading" progress until it settles.
+    ollama_manager.ensure_ollama_async()
+
     server = uvicorn.Server(
         uvicorn.Config(fastapi_app, host=config.HOST, port=config.PORT, log_level="warning")
     )

@@ -11,7 +11,7 @@ models:
 	ollama pull $(or $(MODEL),qwen2.5:14b)
 
 doctor:
-	@command -v ffmpeg >/dev/null && echo "ffmpeg      ✓" || echo "ffmpeg      ✗  -> brew install ffmpeg"
+	@command -v ffmpeg >/dev/null && echo "ffmpeg (system, optional) ✓" || echo "ffmpeg (system, optional) ✗  -> brew install ffmpeg (not required: the app bundles its own static ffmpeg/ffprobe via the static-ffmpeg package)"
 	@command -v uv >/dev/null && echo "uv          ✓" || echo "uv          ✗  -> brew install uv"
 	@command -v ollama >/dev/null && echo "ollama      ✓" || echo "ollama      ✗  -> https://ollama.com"
 	@curl -s --max-time 2 http://localhost:11434/api/version >/dev/null \
@@ -102,8 +102,8 @@ health:
 
 smoke:
 	uv run python -c "import magic_video_editor.server, magic_video_editor.app, magic_video_editor.settings, magic_video_editor.updater; \
-		from magic_video_editor.api import projects, pipeline, settings, audio, filters, edl, suggestions, reels as reels_api, subtitles as subtitles_api, thumbs, ollama, overlays, updater as updater_api; \
-		from magic_video_editor.pipeline import ingest, sync, transcribe, takes, ordering, render, reels, faces, filters as pfilters, audio_enhance, review, copywriter, subtitles; \
+		from magic_video_editor.api import projects, pipeline, settings, audio, filters, edl, suggestions, reels as reels_api, subtitles as subtitles_api, thumbs, ollama, overlays, updater as updater_api, transitions as transitions_api, safety as safety_api; \
+		from magic_video_editor.pipeline import ingest, sync, transcribe, takes, ordering, render, reels, faces, filters as pfilters, audio_enhance, review, copywriter, subtitles, safezones; \
 		from magic_video_editor.agents import agents; \
 		print('all modules import OK')"
 

@@ -16,6 +16,7 @@ from pydantic_ai.providers.ollama import OllamaProvider
 from .. import config, settings
 from .prompts import (
     CLIP_ORDER_SYSTEM_PROMPT,
+    CLIP_PLACEMENT_SYSTEM_PROMPT,
     CONTEXT_CHECK_SYSTEM_PROMPT,
     COPYWRITER_SYSTEM_PROMPT,
     DEDUP_JUDGE_SYSTEM_PROMPT,
@@ -29,6 +30,7 @@ from .prompts import (
 )
 from .schemas import (
     ClipOrder,
+    ClipPlacement,
     ContextCheck,
     CopywriterOutput,
     DedupJudge,
@@ -68,6 +70,7 @@ AGENT_SPECS: dict[str, dict] = {
     "context_check": {"prompt": CONTEXT_CHECK_SYSTEM_PROMPT, "output_type": ContextCheck},
     "dedup_judge": {"prompt": DEDUP_JUDGE_SYSTEM_PROMPT, "output_type": DedupJudge},
     "copywriter": {"prompt": COPYWRITER_SYSTEM_PROMPT, "output_type": CopywriterOutput},
+    "clip_placement": {"prompt": CLIP_PLACEMENT_SYSTEM_PROMPT, "output_type": ClipPlacement},
 }
 
 _cache: dict[tuple[str, str], Agent] = {}
