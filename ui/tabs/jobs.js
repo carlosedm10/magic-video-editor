@@ -78,18 +78,24 @@ function _logDisclosure(item, job) {
 function _activityRow(item, { pending = false, finished = false } = {}) {
   const job = item.job_id ? state.jobs[item.job_id] : null;
   const pct = Math.round(((job?.progress ?? item.progress) || 0) * 100);
+  const running = !pending && !finished;
+  const label = queueKindLabel(item.kind);
   return `
     <div class="activity-row ${pending ? "activity-row-pending" : ""}"
          ${pending ? `draggable="true" data-id="${item.id}"` : ""}>
-      <div class="row">
+      <div class="activity-row-head">
         ${pending ? '<span class="q-drag"><i data-lucide="grip-vertical"></i></span>' : ""}
-        <span class="q-name">${esc(queueKindLabel(item.kind))}</span>
+        <span class="q-name" title="${esc(label)}">${esc(label)}</span>
         ${finished ? `<span class="pill ${item.status}">${item.status}</span>` : ""}
         <span class="grow"></span>
         ${!finished ? `<button class="icon-btn danger" data-cancel="${item.id}" title="${pending ? "Remove" : "Cancel"}"><i data-lucide="x"></i></button>` : ""}
       </div>
-      ${!pending ? `<div class="run-all-bar"><div class="run-all-fill" style="width:${pct}%"></div></div>` : ""}
-      ${item.error ? `<div class="dim" style="color:var(--danger)">${esc(item.error)}</div>` : ""}
+      ${running ? `
+      <div class="activity-progress">
+        <div class="run-all-bar activity-bar"><div class="run-all-fill" style="width:${pct}%"></div></div>
+        <span class="activity-pct">${pct}%</span>
+      </div>` : ""}
+      ${item.error ? `<div class="dim activity-error">${esc(item.error)}</div>` : ""}
       ${!pending ? _logDisclosure(item, job) : ""}
     </div>`;
 }

@@ -79,15 +79,32 @@
 .activity-section { display: flex; flex-direction: column; gap: 6px; }
 
 .activity-row {
-  padding: 8px 6px; border-radius: 10px; border-bottom: 1px solid var(--border);
+  display: flex; flex-direction: column; gap: 6px;
+  padding: 8px 10px; border-radius: 10px; border-bottom: 1px solid var(--border);
 }
 .activity-row:last-child { border-bottom: none; }
 .activity-row-pending:hover { background: var(--panel2); }
 .activity-row-pending.dragging { opacity: .5; }
 
-.activity-details-toggle { margin-top: 4px; }
+/* Title/chip/details header — one consistent grid line per row, no matter
+   whether it's running, pending, or a finished (done/error/cancelled) item. */
+.activity-row-head { display: flex; align-items: center; gap: 8px; min-height: 20px; }
+.activity-row-head .q-name { flex: 1; min-width: 0; }
+
+/* Only the RUNNING row gets a bar: thin, garnet, directly under the title,
+   with its own tight top gap (via the parent's flex `gap`) so it never
+   collides with the chip/pill above or the Details disclosure below. */
+.activity-progress { display: flex; align-items: center; gap: 8px; }
+.activity-bar { height: 4px; }
+.activity-pct {
+  font-size: 11px; font-variant-numeric: tabular-nums; color: var(--dim); flex-shrink: 0;
+}
+
+.activity-error { color: var(--danger); }
+
+.activity-details-toggle { align-self: flex-start; }
 .activity-log {
-  max-height: 160px; overflow-y: auto; margin-top: 6px;
+  max-height: 160px; overflow-y: auto;
 }
 
 /* Last-3-finished rows read subtler than running/pending. */
