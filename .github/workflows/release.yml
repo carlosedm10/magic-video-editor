@@ -39,6 +39,12 @@ jobs:
       - name: uv sync
         run: uv sync --group dev
 
+      # Option B: the dmg ships a bundled Ollama runtime. The binary is
+      # gitignored (packaging/vendor/ollama/* except LICENSE), so CI must
+      # fetch it before the build or the .app falls back to system-only.
+      - name: Fetch bundled Ollama binary
+        run: bash packaging/fetch_ollama.sh
+
       - name: make dist (PyInstaller .app + .dmg + sha256)
         run: make dist
 
