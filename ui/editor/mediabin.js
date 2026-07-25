@@ -12,7 +12,7 @@
      "Drop clips or a camera folder" overlay; dropped entries are traversed
      via webkitGetAsEntry so a folder's files carry their folder name as the
      first path segment in the uploaded filename -- the backend
-     (cutroom/api/projects.py clips_upload) already infers camera_group from
+     (magic_video_editor/api/projects.py clips_upload) already infers camera_group from
      that segment, exactly like the webkitdirectory picker does, so both
      paths share one upload helper.
    - The paste-path input is no longer primary UI: it starts hidden behind a

@@ -28,7 +28,7 @@ LLMs only emit typed decisions; ffmpeg does all pixel/sample work.
 
 ## Per-task model strategy (Settings-driven)
 
-`~/CutRoom/settings.json` (managed by `cutroom/settings.py`):
+`~/CutRoom/settings.json` (managed by `magic_video_editor/settings.py`):
 
 ```json
 {
@@ -43,7 +43,7 @@ LLMs only emit typed decisions; ffmpeg does all pixel/sample work.
 }
 ```
 
-`null` = use `default_model`. `cutroom/agents/agents.py` exposes
+`null` = use `default_model`. `magic_video_editor/agents/agents.py` exposes
 `get_agent(task: str) -> Agent` which resolves the model per task at call time
 (cache per (task, model) pair; settings changes apply without restart).
 Rationale: judging single takes works on 7–8B; transcript cleanup, ordering and
@@ -74,14 +74,14 @@ fuzzy dedup misses these. New LLM pass (task `transcript_cleaner`) runs inside t
   input); delete/restore; split at a time; preview (HTML5 video of the source clip
   seeked to segment start — use existing media endpoints).
 - "Reset to AI cut" button regenerates from build_edl.
-- Backend: `cutroom/api/edl.py` — GET/PUT `/api/projects/{pid}/edl` (validated),
+- Backend: `magic_video_editor/api/edl.py` — GET/PUT `/api/projects/{pid}/edl` (validated),
   POST `/api/projects/{pid}/edl/reset`. `render.run` uses `project["edl"]` when present.
 
 ## Color filters
 
 - Per-project `project["color"]` config: `{preset, brightness, contrast, saturation, temperature}`.
   Presets: none, bw, sepia, cinematic (teal-orange), vintage. Sliders -1..1 (0 default).
-- Implementation `cutroom/pipeline/filters.py`: `build_vf(color_cfg) -> str` returning an
+- Implementation `magic_video_editor/pipeline/filters.py`: `build_vf(color_cfg) -> str` returning an
   ffmpeg filter chain (eq/hue/colortemperature/colorchannelmixer/curves). Render and reel
   renders prepend it to their vf chain via the hook in ffmpeg_utils.cut_segment(vf_extra=...).
 - Live preview: `GET /api/projects/{pid}/preview-frame?clip_id&t&<color params>` returns a
@@ -90,7 +90,7 @@ fuzzy dedup misses these. New LLM pass (task `transcript_cleaner`) runs inside t
 ## Voice enhancement ("Enhance voice")
 
 - Per-project toggle `project["audio_enhance"]` (bool) + applied on final render and reels.
-- `cutroom/pipeline/audio_enhance.py`: `enhance(in_wav) -> out_wav` doing:
+- `magic_video_editor/pipeline/audio_enhance.py`: `enhance(in_wav) -> out_wav` doing:
   1) noisereduce spectral gating (non-stationary), 2) high-pass 80 Hz,
   3) gentle presence lift ~3–5 kHz (+2–3 dB biquad, scipy), 4) de-esser optional skip,
   5) loudness normalize to −16 LUFS (pyloudnorm), peak-limit −1 dBTP.
@@ -118,7 +118,7 @@ fuzzy dedup misses these. New LLM pass (task `transcript_cleaner`) runs inside t
 - Vanilla JS, no build step; UI modules as separate files under `ui/` loaded via script tags.
 - pydantic_ai agents: prompts in agents/prompts.py, flat single-purpose schemas in
   agents/schemas.py (NO nested/batch schemas — small models fail them), agents/agents.py.
-- ffmpeg only through cutroom/ffmpeg_utils.py (`ffmpeg_bin()` handles the libass fallback).
+- ffmpeg only through magic_video_editor/ffmpeg_utils.py (`ffmpeg_bin()` handles the libass fallback).
 - Never `git commit` — the orchestrator handles git.
 - File ownership per task is strict (listed in each task brief) to allow parallel work.
 
@@ -235,7 +235,7 @@ snapping, markers), CapCut auto-captions with style templates. Apply these patte
   work on the copy) and report precision/recall by hand-checking the decisions.
 
 ## 2. Job queue (replace reject-with-409 for user actions)
-- New `cutroom/queue.py`: per-project FIFO persisted in project.json ("queue": [...]),
+- New `magic_video_editor/queue.py`: per-project FIFO persisted in project.json ("queue": [...]),
   one global worker thread that executes queue items sequentially per project (parallel
   across projects only within resource limits). Item kinds: stage:<name>, run-all,
   preview_render, final_render, reel_render:<id>, proxies, thumbs.
@@ -308,7 +308,7 @@ snapping, markers), CapCut auto-captions with style templates. Apply these patte
   through the EDL (both Draft and the subtitle styling in the Subtitles inspector tab
   update it instantly).
 - Burn-in: the .ass generator (exists for reels) becomes shared
-  `cutroom/pipeline/subtitles.py`, parameterized by the style config; final render and
+  `magic_video_editor/pipeline/subtitles.py`, parameterized by the style config; final render and
   preview render burn it per segment (cue times re-based per segment); reels reuse it.
 - Inspector Subtitles tab: enable toggle, style preset chips with mini-previews, font
   dropdown, size, colors, position, words-per-cue.
@@ -370,7 +370,7 @@ then text-overridden by index.
    "Fit" button that jumps to that level. Zoom slider range adapts per project.
 
 ## v5 addendum — pydantic_ai native OllamaModel migration (owner request)
-Replace the OpenAIChatModel+OllamaProvider construction in cutroom/agents/agents.py with
+Replace the OpenAIChatModel+OllamaProvider construction in magic_video_editor/agents/agents.py with
 the NATIVE `pydantic_ai.models.ollama.OllamaModel` (exists in our installed 2.17; it
 subclasses OpenAIChatModel so behavior is compatible). Additionally switch structured
 output from PromptedOutput to `NativeOutput(schema)` — self-hosted Ollama >=0.5 enforces

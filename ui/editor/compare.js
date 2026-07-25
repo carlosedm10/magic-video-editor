@@ -18,7 +18,7 @@
      visible beneath it, the left side naturally shows "original" through
      the gap.
    - The graded look is a CSS `filter` APPROXIMATION of
-     cutroom/pipeline/filters.py's build_vf() — CSS has no
+     magic_video_editor/pipeline/filters.py's build_vf() — CSS has no
      colorbalance/colorchannelmixer/curves equivalent, so presets are
      mapped to the nearest CSS primitives and the sliders reuse the same
      eq-style math (brightness offset, 1+contrast, 1+saturation, a
@@ -27,61 +27,100 @@
      is a live-preview HINT only; the exact graded look comes from the
      ffmpeg-rendered preview (§3 preview_render).
    - Every public method is try/catch'd so a bug here can never blank the
-     rest of the app; on an unrecoverable error we tear ourselves down. */
+     rest of the app; on an unrecoverable error we tear ourselves down.
+
+   v5.14 regression audit (owner-mandated code walkthrough, no bug found in
+   this file, one latent correctness gap fixed while auditing):
+     - activate()/deactivate() only add/remove OUR OWN overlay elements and
+       read `state.project`/the DOM — neither ever calls .pause(), .load(),
+       or reassigns .src/.currentTime on player.js's own <video> elements
+       (#video-a/#video-b/#video-preview). Toggling the Color tab on/off
+       therefore cannot pause or detach the draft/preview videos player.js
+       is driving; _sync()'s writes are all confined to our own
+       `this.overlayVideo`.
+     - Gap found + fixed: _sync()'s source lookup was hardcoded to
+       `.player-video.active`, which is the CSS class player.js toggles only
+       between #video-a/#video-b (draft mode) and never touches for
+       #video-preview. With the Color tab active while Player.mode ===
+       "preview", this looked up a hidden, possibly stopped draft video
+       instead of the visible preview video, so the divider would silently
+       mirror the wrong (frozen) source. Fixed by picking whichever
+       `.player-video` is actually VISIBLE (not our own compare-video),
+       which tracks either mode correctly without this file needing to know
+       about Player.mode at all (still fully decoupled from player.js). */
 
 window.EditorUI = window.EditorUI || {};
 
 function _clampNum(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
 
+// v5.7: professional color schema (see magic_video_editor/pipeline/filters.py).
+// Mirrors just enough of PRESET_PARAMS/_resolve_preset_base to give the CSS
+// approximation the SAME resolved numbers the server would render with —
+// preset baselines apply only to sliders the user hasn't moved off their
+// neutral (0) default, exactly like the Python side. Kept intentionally
+// tiny (no LUTs, no colorbalance/colorlevels-exact math — impossible in
+// CSS); LUTs are never approximated here, see the note element instead.
+const _CMP_SLIDER_KEYS = [
+  "exposure", "temperature", "tint", "black_point", "white_point",
+  "brightness", "contrast", "saturation", "vibrance", "sharpness",
+];
+const _CMP_PRESET_PARAMS = {
+  none: {},
+  bw: { saturation: -1.0 },
+  sepia: { saturation: -0.5, temperature: 0.6, tint: 0.1 },
+  cinematic: {
+    temperature: -0.15, tint: 0.05, black_point: 0.03, white_point: 0.03,
+    saturation: -0.1, vibrance: 0.15,
+  },
+  vintage: { black_point: 0.07, white_point: 0.07, saturation: -0.25, temperature: 0.35 },
+};
+
+function _cmpResolve(cfg) {
+  const resolved = {};
+  _CMP_SLIDER_KEYS.forEach((k) => (resolved[k] = 0));
+  Object.assign(resolved, _CMP_PRESET_PARAMS[cfg.preset || "none"] || {});
+  _CMP_SLIDER_KEYS.forEach((k) => {
+    const v = Number(cfg[k]);
+    if (v) resolved[k] = v; // explicit (non-zero) user value always wins over the preset baseline
+  });
+  return resolved;
+}
+
 function _buildColorFilterCSS(cfg) {
   cfg = cfg || {};
-  const preset = cfg.preset || "none";
-  const b = Number(cfg.brightness) || 0;
-  const c = Number(cfg.contrast) || 0;
-  const s = Number(cfg.saturation) || 0;
-  const t = Number(cfg.temperature) || 0;
+  const r = _cmpResolve(cfg);
   const parts = [];
 
-  // Presets: nearest CSS approximation of _preset_vf() in filters.py.
-  switch (preset) {
-    case "bw":
-      parts.push("grayscale(1)", "contrast(1.08)");
-      break;
-    case "sepia":
-      parts.push("sepia(0.85)");
-      break;
-    case "cinematic":
-      // Real filter splits shadows/highlights (colorbalance); CSS can't
-      // split by luminance, so approximate the overall teal/orange push.
-      parts.push("saturate(1.15)", "contrast(1.06)", "hue-rotate(-6deg)");
-      break;
-    case "vintage":
-      // Real filter lifts blacks (curves) + desaturates 25% + ~5800K warm.
-      parts.push("sepia(0.25)", "saturate(0.78)", "contrast(0.92)", "brightness(1.04)");
-      break;
-    default:
-      break;
-  }
+  // exposure: photographic stops double the light per +1 EV; CSS
+  // brightness() is a plain multiplier, so 2**EV lines up naturally.
+  // brightness/black_point (shadow lift) fold into the same multiplier.
+  const brightnessMult = Math.pow(2, r.exposure) * (1 + r.brightness) * (1 + r.black_point * 0.3);
+  parts.push(`brightness(${_clampNum(brightnessMult, 0.15, 4).toFixed(3)})`);
 
-  // Sliders: ffmpeg's `eq` brightness is an additive offset and
-  // contrast/saturation are 1+value multipliers — CSS brightness()/
-  // contrast()/saturate() are multiplicative, so `1 + value` lines up well
-  // enough for a live hint.
-  parts.push(`brightness(${_clampNum(1 + b, 0.2, 2).toFixed(3)})`);
-  parts.push(`contrast(${_clampNum(1 + c, 0.2, 2.5).toFixed(3)})`);
-  parts.push(`saturate(${_clampNum(1 + s, 0, 2.5).toFixed(3)})`);
+  // contrast + the levels squeeze (black_point/white_point) both tighten
+  // the tonal range, so they compound into one contrast() call.
+  const contrastMult = (1 + r.contrast) * (1 + (r.black_point + r.white_point) * 1.4);
+  parts.push(`contrast(${_clampNum(contrastMult, 0.2, 3).toFixed(3)})`);
 
-  if (t) {
-    // Real filter maps t=+1 -> 3500K (warm) / t=-1 -> 9500K (cool) via
-    // colortemperature. CSS has no color-temperature primitive: warm pushes
-    // a touch of sepia + an orange-ish hue-rotate, cool pushes a blue-ish
-    // hue-rotate the other way.
-    if (t > 0) {
-      parts.push(`sepia(${_clampNum(t * 0.3, 0, 0.4).toFixed(3)})`, `hue-rotate(${(-t * 6).toFixed(1)}deg)`);
-    } else {
-      parts.push(`hue-rotate(${(-t * 12).toFixed(1)}deg)`, `saturate(${_clampNum(1 + -t * 0.1, 1, 1.3).toFixed(3)})`);
-    }
+  // saturation + vibrance (vibrance is the "smart"/skin-protecting version —
+  // CSS has no per-hue selectivity, so it just contributes at reduced
+  // weight rather than pretending to protect skin tones).
+  const saturateMult = (1 + r.saturation) * (1 + r.vibrance * 0.5);
+  parts.push(`saturate(${_clampNum(saturateMult, 0, 3).toFixed(3)})`);
+
+  // temperature: +1 (warm, ~3500K) -> a touch of sepia + orange hue-rotate;
+  // -1 (cool, ~8500K) -> a blue-ish hue-rotate the other way.
+  if (r.temperature) {
+    const t = _clampNum(r.temperature, -1, 1);
+    if (t > 0) parts.push(`sepia(${_clampNum(t * 0.3, 0, 0.4).toFixed(3)})`, `hue-rotate(${(-t * 6).toFixed(1)}deg)`);
+    else parts.push(`hue-rotate(${(-t * 12).toFixed(1)}deg)`);
   }
+  // tint: magenta<->green on the CSS hue wheel — a small hue-rotate nudge in
+  // the opposite direction from temperature's warm/cool axis.
+  if (r.tint) parts.push(`hue-rotate(${(r.tint * 10).toFixed(1)}deg)`);
+
+  // sharpness has no CSS filter equivalent at all — intentionally not
+  // approximated (see the Color panel's Detail group hint).
 
   return parts.join(" ");
 }
@@ -102,6 +141,17 @@ const Compare = {
     if (!this.active || !this.overlayVideo) return;
     try {
       this.overlayVideo.style.filter = _buildColorFilterCSS(this.cfg);
+      // v5.7: LUTs can't be approximated in CSS at all (no lut3d/haldclut
+      // equivalent) — say so instead of silently showing an incomplete
+      // grade. The Color panel's own debounced preview-frame image is
+      // where the exact LUT'd look actually shows up.
+      const lutActive = !!(this.cfg?.lut?.name) && Number(this.cfg?.lut?.intensity ?? 1) > 0;
+      if (this._lutNote) {
+        this._lutNote.hidden = !lutActive;
+        this._lutNote.textContent = lutActive
+          ? "LUT active — this is an approximation; see Exact preview in the Color panel."
+          : "";
+      }
     } catch (e) {
       console.error("compare: failed to apply filter", e);
     }
@@ -134,6 +184,19 @@ const Compare = {
       labelRight.className = "compare-label right";
       labelRight.textContent = "Graded";
 
+      // Inline-styled (not a shared CSS class) so this file stays fully
+      // self-contained -- ui/index.html/style.css belong to other agents
+      // this phase, same rule the top-of-file note already states.
+      this._lutNote = document.createElement("div");
+      this._lutNote.hidden = true;
+      Object.assign(this._lutNote.style, {
+        position: "absolute", top: "8px", left: "50%", transform: "translateX(-50%)",
+        zIndex: "7", fontSize: "11px", color: "#fff", background: "rgba(0,0,0,.65)",
+        border: "1px solid var(--accent2, #35c28f)", borderRadius: "999px",
+        padding: "3px 10px", pointerEvents: "none", whiteSpace: "nowrap",
+        maxWidth: "90%", overflow: "hidden", textOverflow: "ellipsis",
+      });
+
       this.divider = document.createElement("div");
       this.divider.className = "compare-divider";
       const handle = document.createElement("div");
@@ -145,6 +208,7 @@ const Compare = {
       this.wrap.appendChild(this.overlayVideo);
       this.wrap.appendChild(labelLeft);
       this.wrap.appendChild(labelRight);
+      this.wrap.appendChild(this._lutNote);
       this.wrap.appendChild(this.divider);
       stage.appendChild(this.wrap);
 
@@ -175,6 +239,7 @@ const Compare = {
     this.wrap = null;
     this.overlayVideo = null;
     this.divider = null;
+    this._lutNote = null;
   },
 
   _applyClip() {
@@ -229,7 +294,12 @@ const Compare = {
   },
 
   _sync() {
-    const src = document.querySelector("#player-stage .player-video.active");
+    // Pick whichever player.js video is actually visible right now (draft's
+    // video-a/video-b OR video-preview) rather than assuming draft mode via
+    // the "active" class — see the v5.14 audit note at the top of this
+    // file. Never touches player.js's elements beyond reading them.
+    const src = Array.from(document.querySelectorAll("#player-stage .player-video"))
+      .find((v) => v !== this.overlayVideo && v.style.visibility !== "hidden");
     const ov = this.overlayVideo;
     if (!src || !ov) return;
     if (!src.getAttribute("src") && !src.src) {

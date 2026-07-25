@@ -25,7 +25,37 @@
    position; preview: the rendered file's own currentTime, since it was
    encoded from the same EDL 1:1... except when a crossfade transition
    shortens the render at a junction, which this cannot see — a documented
-   approximation, see the final report). */
+   approximation, see the final report).
+
+   ---------- v5.14 FIX: "playback dies after editing colors" ----------
+   Root cause #1 (this file, the one owned bug): refreshProject() fires on
+   EVERY project refresh — not just user saves — including the moment a
+   background preview_render job (auto-enqueued by a debounced color/EDL/
+   subtitles/audio edit) finishes, which lands here via onProjectRefreshed()
+   at a completely arbitrary instant, possibly mid-playback. The old code
+   called _autoSelectMode() unconditionally from there, which could flip
+   Draft<->Preview WHILE the user was actively watching either video — and
+   if it flipped into Preview at the exact moment preview.mp4 was still
+   being rewritten in place, the <video> loaded a truncated file and stalled
+   forever (readyState stuck, no error event). Root causes #2 (atomic
+   preview.tmp.mp4 -> os.replace()) and the manifest-only-after-rename
+   ordering are pipeline/render.py's fix (OVERLAY-BACKEND agent), not ours.
+   This file's half of the fix policy:
+     1. NEVER call setMode() while `this.playing` is true, from any AUTO
+        path (_autoSelectMode). A manual click (setMode(mode,{manual:true}))
+        always still works instantly — the user's explicit action always
+        wins, playing or not.
+     2. Auto-select only runs for real on project open (mount() -> the
+        initial onSegmentsChanged() call, where playing is always false)
+        and whenever the player is paused (checked again right when pause()
+        fires, so the mode settles the instant it's safe to touch).
+     3. While playing, if a fresh non-stale preview lands, we don't switch —
+        we light up a "Preview ready" glow on the mode-toggle button
+        instead (_setReadyGlow) so the user can switch by hand.
+     4. The preview <video> src is cache-busted with `?v=<manifest hash>`
+        (_previewSrc) so a previously half-loaded/stale preview.mp4 is never
+        reused just because the path string didn't change.
+   Regression-checked by code walkthrough — see this task's final report. */
 
 window.EditorUI = window.EditorUI || {};
 
@@ -44,6 +74,7 @@ const Player = {
   _previewVideo: null,
   _fadeOverlay: null,
   _subtitleEl: null,
+  _readyGlow: false,     // v5.14: "a fresh preview landed but we're playing — glow, don't switch"
 
   mount() {
     this.videos = [document.getElementById("video-a"), document.getElementById("video-b")];
@@ -82,6 +113,16 @@ const Player = {
         #draft-fade-overlay { position: absolute; inset: 0; z-index: 6; background: #000; opacity: 0;
           pointer-events: none; }
         .pp-mode-btn.active { border-color: var(--accent2); color: var(--accent2); }
+        /* v5.14: "Preview ready" affordance — a fresh preview landed while
+           playing (or before a boundary pause), shown instead of auto-
+           switching mid-playback. Purely a hint; clicking still just does
+           what the button always does (toggle mode). */
+        .pp-mode-btn.ready-glow { border-color: var(--accent2); box-shadow: 0 0 0 1px var(--accent2),
+          0 0 10px rgba(53,194,143,.65); animation: pp-ready-pulse 1.6s ease-in-out infinite; }
+        @keyframes pp-ready-pulse {
+          0%, 100% { box-shadow: 0 0 0 1px var(--accent2), 0 0 6px rgba(53,194,143,.4); }
+          50% { box-shadow: 0 0 0 1px var(--accent2), 0 0 14px rgba(53,194,143,.85); }
+        }
       `;
       document.head.appendChild(style);
     }
@@ -136,7 +177,19 @@ const Player = {
       ? '<i data-lucide="clapperboard"></i> Preview'
       : '<i data-lucide="pencil"></i> Draft';
     btn.classList.toggle("active", this.mode === "preview");
+    // Switching TO preview always resolves whatever the glow was inviting.
+    if (this.mode === "preview") this._readyGlow = false;
+    btn.classList.toggle("ready-glow", this._readyGlow && this.mode === "draft");
     refreshIcons();
+  },
+
+  // v5.14: subtle "a fresh preview landed" affordance instead of an auto
+  // mode-flip while the user might be mid-playback/mid-edit-gesture.
+  _setReadyGlow(on) {
+    on = !!on && this.mode === "draft";
+    if (this._readyGlow === on) return;
+    this._readyGlow = on;
+    document.getElementById("pp-mode-toggle")?.classList.toggle("ready-glow", on);
   },
 
   /* ---------- mode switching (spec v4 §3) ---------- */
@@ -144,7 +197,7 @@ const Player = {
     if (mode === this.mode) { this._updateModeButton(); return; }
     const wasPlaying = this.playing;
     const t = this.currentEdlTime();
-    this.pause();
+    this.pause({ auto: false });
     this.mode = mode;
     this._updateModeButton();
     if (mode === "preview") {
@@ -159,19 +212,47 @@ const Player = {
     if (manual) return; // user's explicit click always wins for this instant
   },
 
+  /* v5.14 fix policy: this is the ONLY function that decides an automatic
+     mode switch, and it must never fire one while `this.playing` is true —
+     that mid-playback flip (compounded by preview.mp4 being rewritten in
+     place) was the actual crash. Safe moments to actually flip: project
+     open (called from mount()'s onSegmentsChanged(), always paused then)
+     and whenever the player is genuinely paused (checked again from
+     pause() itself, so the mode settles the instant it becomes safe).
+     While playing, a fresh non-stale preview only lights the "Preview
+     ready" glow — the user's own toggle click always still works. */
   async _autoSelectMode() {
-    if (!state.project?.preview?.path) { if (this.mode === "preview") this.setMode("draft"); return; }
+    if (!state.project?.preview?.path) {
+      this._setReadyGlow(false);
+      if (!this.playing && this.mode === "preview") this.setMode("draft");
+      return;
+    }
     const token = (this._autoSelectToken = (this._autoSelectToken || 0) + 1);
     let stale = true;
     try { stale = await Editor.previewIsStale(); } catch (_e) { stale = true; }
     if (token !== this._autoSelectToken) return; // a newer check finished first — drop this one
-    this.setMode(stale ? "draft" : "preview");
+
+    if (stale) {
+      this._setReadyGlow(false);
+      if (!this.playing && this.mode === "preview") this.setMode("draft");
+      return;
+    }
+    // A fresh, matching preview exists.
+    if (this.mode === "preview") { this._setReadyGlow(false); return; }
+    if (this.playing) { this._setReadyGlow(true); return; } // never interrupt playback
+    this._setReadyGlow(false);
+    this.setMode("preview");
   },
 
+  // v5.14 fix #3 (cache-busting): append the manifest hash so a stale/half-
+  // loaded preview.mp4 is never reused just because the path string is
+  // unchanged — a genuinely new render always gets a genuinely new URL.
   _previewSrc() {
     const path = state.project?.preview?.path;
     if (!path || !Editor.pid) return null;
-    return `/api/projects/${Editor.pid}/media/file?path=${encodeURIComponent(path)}`;
+    const manifest = state.project?.preview?.manifest;
+    const bust = manifest ? `&v=${encodeURIComponent(manifest)}` : "";
+    return `/api/projects/${Editor.pid}/media/file?path=${encodeURIComponent(path)}${bust}`;
   },
   _loadPreviewVideo(onReady) {
     const src = this._previewSrc();
@@ -313,12 +394,22 @@ const Player = {
     const btn = document.getElementById("pp-playpause");
     if (btn) { btn.innerHTML = '<i data-lucide="pause"></i>'; refreshIcons(); }
   },
-  pause() {
+  // `auto` guards against the internal pause() that setMode() itself does
+  // right before flipping this.mode — re-running _autoSelectMode() there
+  // would race the manual switch it's still in the middle of (e.g. flip
+  // straight back to Preview a beat after the user manually chose Draft).
+  // Real user-driven pauses (play/pause button, K, video ending) all go
+  // through the default auto=true path.
+  pause({ auto = true } = {}) {
     this.playing = false;
     if (this.mode === "preview") this._previewVideo?.pause();
     else this._active()?.pause();
     const btn = document.getElementById("pp-playpause");
     if (btn) { btn.innerHTML = '<i data-lucide="play"></i>'; refreshIcons(); }
+    // v5.14: "auto-select ... when paused" — the instant it's safe (no
+    // active playback to interrupt), let a fresh preview settle in on its
+    // own instead of leaving the user staring at a glowing toggle forever.
+    if (auto) this._autoSelectMode();
   },
   togglePlay() { this.playing ? this.pause() : this.play(); },
 

@@ -2,7 +2,7 @@
    chips (clean/bold/karaoke) with mini text previews, font dropdown, size
    S/M/L, color pickers (text + outline), position bottom/center, words-per-
    cue number. Backend contract: GET/PUT /api/projects/{pid}/subtitles +
-   GET /api/fonts (cutroom/api/subtitles.py, cutroom/pipeline/subtitles.py).
+   GET /api/fonts (magic_video_editor/api/subtitles.py, magic_video_editor/pipeline/subtitles.py).
 
    Exposes window.SubtitlesPanel.render(container, project) — reads/writes
    the NORMALIZED config from the dedicated subtitles endpoint (not the raw,

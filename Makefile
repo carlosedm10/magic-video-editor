@@ -26,10 +26,10 @@ setup:
 .PHONY: app server
 
 app:
-	uv run cutroom
+	uv run mve
 
 server:
-	uv run cutroom-server
+	uv run mve-server
 
 # ----------------------------- Package Management ----------------------------- #
 .PHONY: uv-lock uv-add uv-update uv-remove uv-lock-regenerate
@@ -63,11 +63,11 @@ uv-lock-regenerate:
 .PHONY: lint-backend format-backend lint format
 
 lint-backend:
-	uvx ruff check cutroom/
+	uvx ruff check magic_video_editor/
 
 format-backend:
-	uvx ruff format cutroom/
-	uvx ruff check --fix cutroom/
+	uvx ruff format magic_video_editor/
+	uvx ruff check --fix magic_video_editor/
 
 lint:
 	make lint-backend
@@ -83,10 +83,10 @@ health:
 		|| echo "server not running — start it with: make server"
 
 smoke:
-	uv run python -c "import cutroom.server, cutroom.app, cutroom.settings; \
-		from cutroom.api import projects, pipeline, settings, audio, filters, edl, suggestions, reels as reels_api, subtitles as subtitles_api, thumbs, ollama; \
-		from cutroom.pipeline import ingest, sync, transcribe, takes, ordering, render, reels, faces, filters as pfilters, audio_enhance, review, copywriter, subtitles; \
-		from cutroom.agents import agents; \
+	uv run python -c "import magic_video_editor.server, magic_video_editor.app, magic_video_editor.settings; \
+		from magic_video_editor.api import projects, pipeline, settings, audio, filters, edl, suggestions, reels as reels_api, subtitles as subtitles_api, thumbs, ollama, overlays; \
+		from magic_video_editor.pipeline import ingest, sync, transcribe, takes, ordering, render, reels, faces, filters as pfilters, audio_enhance, review, copywriter, subtitles; \
+		from magic_video_editor.agents import agents; \
 		print('all modules import OK')"
 
 # ----------------------------- ⛔️ DANGER ZONE ⛔️ ----------------------------- #
@@ -96,7 +96,8 @@ smoke:
 clean:
 	rm -rf .venv
 
-# Deletes ALL CutRoom projects, transcripts, and renders under ~/CutRoom.
-# Your original footage is never touched (clips are referenced in place).
+# Deletes ALL projects, transcripts, and renders under the app data dir
+# (~/Library/Application Support/Magic Video Editor). Your original footage
+# is never touched (clips are referenced in place).
 reset-projects:
-	rm -rf ~/CutRoom/projects
+	rm -rf "$(HOME)/Library/Application Support/Magic Video Editor/projects"

@@ -6,8 +6,8 @@
 const _reelsExpandedDesc = new Set(); // reel ids whose description is expanded (kept across re-renders this session)
 
 /* Defensive against a real backend data bug observed live against project
-   c7642fc7755e: cutroom/pipeline/reels.py does `list(copy.get("hashtags") or [])`
-   but cutroom/pipeline/copywriter.py's copy_for_reel returns "hashtags" as a
+   c7642fc7755e: magic_video_editor/pipeline/reels.py does `list(copy.get("hashtags") or [])`
+   but magic_video_editor/pipeline/copywriter.py's copy_for_reel returns "hashtags" as a
    SPACE-JOINED STRING (not a list) -- Python's list("#a #b") explodes it into
    one array entry per CHARACTER, which reel["hashtags"] then persists as-is.
    That's a backend fix (not ui/tabs/reels.js's or ui/editor/reeleditor.js's
@@ -54,7 +54,7 @@ function renderReels() {
     const hasDesc = !!(r.description || "").trim();
     return `
     <div class="card">
-      <div><span class="score">${r.score}</span> · #${r.rank} <b>${esc(r.title || "Untitled")}</b></div>
+      <div><span class="score">${r.score}</span> · #${r.rank} <b>${esc(r.title || "Untitled")}</b>${r.composed ? ' <span class="pill main">Compuesto</span>' : ""}</div>
       <div class="dim">${r.duration}s · hook ${r.hook} · standalone ${r.self_contained} · payoff ${r.payoff}</div>
       ${hasDesc ? `
         <button class="btn small" data-desc-toggle="${r.id}" style="margin:6px 0 4px">

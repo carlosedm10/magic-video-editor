@@ -62,7 +62,7 @@ const STAGES = [
   ["render", "7 Render"], ["reels", "8 Reels"],
 ];
 // Friendly labels for the run-all progress panel (spec: Pipeline orchestration UX).
-// Mirrors cutroom/api/pipeline.py's STAGES/STAGE_LABELS — keep in lockstep.
+// Mirrors magic_video_editor/api/pipeline.py's STAGES/STAGE_LABELS — keep in lockstep.
 const STAGE_LABELS = {
   ingest: "Reading files", sync: "Syncing cameras", transcribe: "Transcribing",
   takes: "Analyzing takes", order: "Ordering the story", review: "Checking for suggestions",
@@ -198,7 +198,7 @@ function renderStageBar() {
     // Queue-driven (spec v4 §2): a stage is "running" when its queue item
     // (kind "stage:<key>") is currently the one the worker picked up, not
     // via the old jobs.start() naming convention (queue jobs are all named
-    // "queue:<kind>:<pid>" now -- see cutroom/queue.py _run_item).
+    // "queue:<kind>:<pid>" now -- see magic_video_editor/queue.py _run_item).
     const running = state.queue.some((i) => i.status === "running" && i.kind === `stage:${key}`);
     const cls = running ? "running" : st ? st.status : "";
     const title = st?.detail || "";

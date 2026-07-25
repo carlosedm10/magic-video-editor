@@ -26,7 +26,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from pydantic_ai import Agent  # noqa: E402
 from pydantic_ai.output import NativeOutput, PromptedOutput  # noqa: E402
 
-from cutroom.agents import agents as agents_mod  # noqa: E402
+from magic_video_editor.agents import agents as agents_mod  # noqa: E402
 
 FIXTURE_PATH = Path(__file__).resolve().parent / "eval_fixture.json"
 
@@ -34,7 +34,7 @@ FIXTURE_PATH = Path(__file__).resolve().parent / "eval_fixture.json"
 def build_agent(task: str, model: str) -> Agent:
     """Build an Agent for `task` pinned to `model`, bypassing settings.py's
     per-task resolution -- same prompt/schema/output-mode construction as
-    cutroom.agents.agents.get_agent, just with an explicit model so the eval
+    magic_video_editor.agents.agents.get_agent, just with an explicit model so the eval
     can compare models directly."""
     spec = agents_mod.AGENT_SPECS[task]
     if task in agents_mod._PROMPTED_OUTPUT_TASKS:

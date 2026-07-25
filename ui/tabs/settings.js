@@ -1,19 +1,30 @@
-/* Settings — full-screen page (spec v4 section 5).
+/* Settings — full-screen page (spec v4 section 5, redesigned per v5.10/
+   v5.11/v5.12).
    Mounted by core.js into #tab-settings, which the drawer/shell is expected
    to size full-viewport (this module renders assuming the container it's
    given covers everything -- no drawer-width styling here).
 
-   Left section nav: General | Brand | Models | Performance | Transcription | About.
-   - General: export_dir (native pick_folder w/ manual-paste fallback) +
-     "Open folder" (POST /api/open-folder). Saves via PUT /api/settings.
+   Left section nav: General | Brand | Models | Performance | About.
+   - General (v5.10): export location as a friendly-path row ("~/Movies/…"),
+     a "Change…" button that auto-saves immediately (native picker, no Save
+     button anywhere in this card), a "Reveal in Finder" icon button, and a
+     live structure-preview breadcrumb built from the actually-open project
+     (state.project, exposed by core.js). Clicking the path switches it to
+     an editable input (Enter saves, Esc cancels) for power users.
    - Brand: settings.brand_profile free-text textarea (spec v5 addendum "SEO
-     copywriter + brand profile"), fed to the copywriter agent. Autosave on
-     blur + explicit Save button, character count.
-   - Models: default + per-task dropdowns (GET /api/ollama/models) PLUS the
-     Ollama model manager (GET /api/ollama/library, POST /api/ollama/pull
-     polled via GET /api/jobs/{id}, DELETE /api/ollama/models/{name}).
-   - Performance: max_parallel_ffmpeg / ffmpeg_threads / min_free_ram_gb.
-   - Transcription: whisper_model.
+     copywriter + brand profile"), fed to the copywriter agent. Autosaves on
+     blur with the shared "Saved ✓" toast (no Save button, per v5.10's
+     "apply the same pattern to the rest of Settings").
+   - Models (v5.11 + v5.12): a compact "Your models" two-column grid
+     (default + per-task selects, descriptions as tooltips) fitting one
+     screen, an "Installed" horizontal chip list, and ONE "Browse models"
+     button that opens the model browser as an encapsulated modal
+     (recommendation block + search + results + install progress). Below
+     that, the visually distinct "Transcription — Whisper" box (folded in
+     per v5.12) with a curated repo dropdown + explainer. Everything
+     auto-saves on change.
+   - Performance: max_parallel_ffmpeg / ffmpeg_threads / min_free_ram_gb,
+     auto-saving on change.
    - About: corrected product name/branding + health. */
 
 const TASK_INFO = [
@@ -36,7 +47,6 @@ const SECTIONS = [
   ["brand", "Brand"],
   ["models", "Models"],
   ["performance", "Performance"],
-  ["transcription", "Transcription"],
   ["about", "About"],
 ];
 
@@ -45,6 +55,16 @@ const COMPAT_INFO = {
   tight: { label: "Tight fit", color: "var(--warn)" },
   too_big: { label: "Too big for this Mac", color: "var(--danger)" },
 };
+
+// v5.12: curated mlx-community Whisper repos shown as a dropdown instead of
+// a raw text input, plus the "Custom repo…" escape hatch.
+const WHISPER_OPTIONS = [
+  ["mlx-community/whisper-large-v3-turbo", "large-v3-turbo — Recommended (best speed/accuracy balance)"],
+  ["mlx-community/whisper-large-v3", "large-v3 (highest accuracy, slower)"],
+  ["mlx-community/whisper-medium", "medium"],
+  ["mlx-community/whisper-small", "small (fastest, less precise)"],
+];
+const WHISPER_CUSTOM = "__custom__";
 
 const _sfs = {
   section: "general",
@@ -62,6 +82,8 @@ const _sfs = {
   lazyTags: {}, // model name -> {loading, tags, live, error}
   pullJobs: {}, // model -> job dict (while installing)
   polling: new Set(),
+  modelModalOpen: false,
+  generalEditing: false,
 };
 
 function _injectStyleOnce() {
@@ -84,7 +106,7 @@ function _injectStyleOnce() {
     .sfs-nav-btn:hover { background:var(--panel2); color:var(--text); }
     .sfs-nav-btn.active { background:var(--panel2); color:var(--text); font-weight:600;
       box-shadow: inset 3px 0 0 var(--accent); }
-    .sfs-content { flex:1 1 auto; overflow-y:auto; padding:40px 56px 80px; }
+    .sfs-content { flex:1 1 auto; overflow-y:auto; padding:40px 56px 80px; position:relative; }
     .sfs-content-inner { max-width:720px; margin:0 auto; display:flex; flex-direction:column; gap:32px; }
     .sfs-h1 { font-size:26px; font-weight:700; letter-spacing:-0.02em; margin:0 0 4px; }
     .sfs-sub { color:var(--dim); font-size:14px; margin:0 0 8px; }
@@ -102,14 +124,104 @@ function _injectStyleOnce() {
     .sfs-btn {
       background:var(--panel2); border:1px solid var(--border); color:var(--text);
       border-radius:10px; padding:9px 16px; font:inherit; font-size:13.5px; cursor:pointer;
-      white-space:nowrap;
+      white-space:nowrap; display:inline-flex; align-items:center; gap:6px;
     }
     .sfs-btn:hover { border-color:var(--accent); }
     .sfs-btn.primary { background:var(--accent); border-color:var(--accent); color:#fff; }
     .sfs-btn.primary:hover { background:var(--accent-hover); border-color:var(--accent-hover); }
     .sfs-btn:disabled { opacity:0.5; cursor:default; }
+    .sfs-icon-btn {
+      background:var(--panel2); border:1px solid var(--border); color:var(--dim);
+      border-radius:10px; width:36px; height:36px; flex:0 0 auto; cursor:pointer;
+      display:flex; align-items:center; justify-content:center;
+    }
+    .sfs-icon-btn:hover { border-color:var(--accent); color:var(--text); }
     .sfs-feedback { font-size:13px; color:var(--dim); }
     .sfs-guide { font-size:13px; color:var(--dim); line-height:1.6; margin:0 0 4px; }
+
+    /* ---------- General: export location row (v5.10) ---------- */
+    .sfs-export-row { display:flex; align-items:center; gap:14px; }
+    .sfs-export-icon {
+      flex:0 0 auto; width:40px; height:40px; border-radius:12px; background:var(--panel2);
+      display:flex; align-items:center; justify-content:center; color:var(--dim);
+    }
+    .sfs-export-main { flex:1 1 auto; min-width:0; }
+    .sfs-export-label { font-weight:600; font-size:13px; margin-bottom:4px; }
+    .sfs-export-path {
+      background:transparent; border:none; color:var(--text); font:inherit; font-size:14px;
+      padding:2px 0; cursor:text; text-align:left; max-width:100%; overflow:hidden;
+      text-overflow:ellipsis; white-space:nowrap; border-bottom:1px dashed transparent;
+    }
+    .sfs-export-path:hover { border-bottom-color:var(--border); color:var(--dim); }
+    .sfs-export-input { font-size:14px; }
+    .sfs-breadcrumb-card { padding:18px 24px; }
+    .sfs-breadcrumb {
+      display:flex; align-items:center; flex-wrap:wrap; gap:4px; margin-top:8px;
+      font-size:13px; color:var(--dim);
+    }
+    .sfs-crumb { display:inline-flex; align-items:center; gap:5px; color:var(--text); }
+    .sfs-crumb:last-child { color:var(--accent2); }
+    .sfs-crumb svg { width:14px; height:14px; flex:0 0 auto; }
+    .sfs-crumb-sep { width:13px; height:13px; color:var(--dim); flex:0 0 auto; }
+
+    /* ---------- toast (auto-persist pattern, everywhere) ---------- */
+    .sfs-toast {
+      position:fixed; right:32px; bottom:28px; z-index:80;
+      background:var(--panel); border:1px solid var(--border); color:var(--accent2);
+      border-radius:10px; padding:10px 16px; font-size:13px; font-weight:600;
+      box-shadow:0 8px 28px rgba(0,0,0,.35); opacity:0; transform:translateY(6px);
+      transition:opacity .18s ease, transform .18s ease; pointer-events:none;
+    }
+    .sfs-toast.show { opacity:1; transform:translateY(0); }
+    .sfs-toast.sfs-toast-error { color:var(--danger); }
+
+    /* ---------- Models: compact grid + chips (v5.11) ---------- */
+    .sfs-card-head { display:flex; align-items:center; justify-content:space-between; gap:16px; }
+    .sfs-2col { display:grid; grid-template-columns:1fr 1fr; gap:16px 24px; }
+    .sfs-field-compact { display:flex; flex-direction:column; gap:6px; min-width:0; }
+    .sfs-label-row { display:flex; align-items:center; gap:6px; font-weight:600; font-size:13px; }
+    .sfs-info-icon { width:13px; height:13px; color:var(--dim); flex:0 0 auto; cursor:help; }
+    .sfs-divider { border-top:1px solid var(--border); margin:22px 0 16px; }
+    .sfs-chip-list { display:flex; flex-wrap:wrap; gap:8px; margin-top:12px; }
+    .sfs-installed-chip {
+      display:inline-flex; align-items:center; gap:8px; border:1px solid var(--border);
+      border-radius:999px; padding:6px 8px 6px 14px; font-size:12.5px; background:var(--panel2);
+    }
+    .sfs-installed-chip-size { color:var(--dim); }
+    .sfs-installed-chip-x {
+      background:transparent; border:none; color:var(--dim); cursor:pointer; padding:2px;
+      display:flex; align-items:center; justify-content:center; border-radius:50%;
+    }
+    .sfs-installed-chip-x:hover { color:var(--danger); background:var(--panel); }
+    .sfs-installed-chip-x svg { width:13px; height:13px; }
+
+    /* ---------- Transcription/Whisper box, folded into Models (v5.12) ---------- */
+    .sfs-whisper-card { border-top:2px solid var(--accent2); }
+    .sfs-whisper-head { display:flex; align-items:center; gap:12px; }
+    .sfs-whisper-icon {
+      flex:0 0 auto; width:34px; height:34px; border-radius:10px;
+      background:var(--panel2); color:var(--accent2);
+      display:flex; align-items:center; justify-content:center;
+    }
+    .sfs-whisper-title { font-weight:700; font-size:14.5px; }
+    .sfs-whisper-explainer { line-height:1.6; }
+
+    /* ---------- model browser modal (v5.11) ---------- */
+    .sfs-modal-overlay {
+      position:fixed; inset:0; z-index:70; background:rgba(2,3,7,.55);
+      display:flex; align-items:center; justify-content:center; padding:24px;
+    }
+    .sfs-modal {
+      width:min(720px, 100%); max-height:min(84vh, 820px); display:flex; flex-direction:column;
+      background:var(--panel); border:1px solid var(--border); border-radius:18px;
+      box-shadow:0 24px 60px rgba(0,0,0,.5); overflow:hidden;
+    }
+    .sfs-modal-head {
+      display:flex; align-items:center; justify-content:space-between;
+      padding:20px 24px; border-bottom:1px solid var(--border); flex:0 0 auto;
+    }
+    .sfs-modal-body { padding:20px 24px 28px; overflow-y:auto; flex:1 1 auto; }
+
     .sfs-lib-card {
       border:1px solid var(--border); border-radius:12px; padding:14px 16px; margin-top:12px;
       display:flex; flex-direction:column; gap:8px;
@@ -122,11 +234,6 @@ function _injectStyleOnce() {
       border-radius:999px; padding:5px 10px; font-size:12px; background:var(--panel2);
     }
     .sfs-chip-dot { width:7px; height:7px; border-radius:50%; }
-    .sfs-installed-row {
-      display:flex; align-items:center; justify-content:space-between; gap:10px;
-      padding:9px 0; border-top:1px solid var(--border);
-    }
-    .sfs-installed-row:first-child { border-top:none; }
     .sfs-reco-row { display:flex; gap:14px; margin-top:12px; }
     .sfs-reco-card {
       flex:1 1 0; border:1px solid var(--border); border-radius:12px; padding:16px;
@@ -139,6 +246,7 @@ function _injectStyleOnce() {
     .sfs-section-heading { font-size:13px; font-weight:600; margin:4px 0 2px; color:var(--dim); }
     .sfs-progress { height:6px; border-radius:4px; background:var(--panel2); overflow:hidden; margin-top:4px; }
     .sfs-progress-fill { height:100%; background:var(--accent2); transition:width .2s; }
+
     .sfs-about-row { display:flex; justify-content:space-between; gap:16px; padding:8px 0; border-top:1px solid var(--border); font-size:13.5px; }
     .sfs-about-row:first-child { border-top:none; }
     .sfs-about-key { color:var(--dim); }
@@ -153,6 +261,21 @@ function _injectStyleOnce() {
     .sfs-charcount { color:var(--dim); font-size:12px; margin-top:6px; text-align:right; }
   `;
   document.head.appendChild(style);
+}
+
+/* ---------- shared "Saved ✓" toast (auto-persist pattern, everywhere) ---------- */
+
+function _sfsToast(msg, isError) {
+  const host = document.querySelector(".sfs-content") || document.body;
+  const el = document.createElement("div");
+  el.className = "sfs-toast" + (isError ? " sfs-toast-error" : "");
+  el.textContent = msg;
+  host.appendChild(el);
+  requestAnimationFrame(() => el.classList.add("show"));
+  setTimeout(() => {
+    el.classList.remove("show");
+    setTimeout(() => el.remove(), 220);
+  }, 1700);
 }
 
 async function renderSettings() {
@@ -196,6 +319,7 @@ function _sfsRenderShell() {
   pane.querySelectorAll("[data-section]").forEach((btn) => {
     btn.onclick = () => {
       _sfs.section = btn.dataset.section;
+      _sfs.generalEditing = false;
       _sfsRenderShell();
     };
   });
@@ -205,73 +329,158 @@ function _sfsRenderShell() {
   else if (_sfs.section === "brand") _sfsRenderBrand(host);
   else if (_sfs.section === "models") _sfsRenderModels(host);
   else if (_sfs.section === "performance") _sfsRenderPerformance(host);
-  else if (_sfs.section === "transcription") _sfsRenderTranscription(host);
   else if (_sfs.section === "about") _sfsRenderAbout(host);
+
+  // The model browser is a standalone overlay (survives section switches
+  // while an install is in flight) -- keep it mounted/visible if it was
+  // already open (e.g. renderTab() got called again by refreshProject()).
+  if (_sfs.modelModalOpen) _sfsShowModelModal();
 }
 
-/* ---------- General ---------- */
+/* ---------- General (v5.10: friendly path, auto-save, breadcrumb) ---------- */
+
+function _sfsFriendlyPath(p) {
+  if (!p) return "";
+  const m = p.match(/^\/Users\/[^/]+(\/.*)?$/);
+  if (m) return "~" + (m[1] || "");
+  return p;
+}
+
+function _sfsBasename(p) {
+  if (!p) return "";
+  const clean = p.replace(/\/+$/, "");
+  const parts = clean.split("/");
+  return parts[parts.length - 1] || clean;
+}
+
+function _sfsSanitizeStem(name) {
+  const cleaned = (name || "").replace(/[/:\\]/g, "").replace(/\s+/g, " ").trim();
+  return cleaned || "project";
+}
+
+function _sfsBreadcrumbCrumbs(exportDir) {
+  const rootName = _sfsBasename(exportDir) || "Exports";
+  const proj = state.project;
+  let projName, leaf;
+  if (proj) {
+    projName = proj.name || "Untitled project";
+    const reels = proj.reels || [];
+    if (reels.length) {
+      const latest = reels[reels.length - 1];
+      leaf = `${_sfsSanitizeStem(latest.title || `Reel ${latest.rank ?? ""}`)}.mp4`;
+    } else {
+      leaf = `${_sfsSanitizeStem(projName)}.mp4`;
+    }
+  } else {
+    projName = "<project name>";
+    leaf = "<project name>.mp4";
+  }
+  return [
+    { icon: "folder", label: rootName },
+    { icon: "folder", label: projName },
+    { icon: "file-video", label: leaf },
+  ];
+}
+
+function _sfsBreadcrumbHtml(exportDir) {
+  return _sfsBreadcrumbCrumbs(exportDir).map((c, i) => `
+    ${i ? '<i data-lucide="chevron-right" class="sfs-crumb-sep"></i>' : ""}
+    <span class="sfs-crumb"><i data-lucide="${c.icon}"></i>${esc(c.label)}</span>`).join("");
+}
 
 function _sfsRenderGeneral(host) {
   const s = _sfs.settings;
+  const editing = _sfs.generalEditing;
   host.innerHTML = `
     <div>
       <div class="sfs-h1">General</div>
       <div class="sfs-sub">Where finished exports land.</div>
     </div>
     <div class="sfs-card">
-      <div class="sfs-field">
-        <label class="sfs-label">Export folder</label>
-        <div class="sfs-row">
-          <input type="text" class="sfs-input" id="sfs-export-dir" value="${esc(s.export_dir || "")}" />
-          <button class="sfs-btn" id="sfs-choose-folder">Choose…</button>
-          <button class="sfs-btn" id="sfs-open-folder">Open folder</button>
+      <div class="sfs-export-row">
+        <div class="sfs-export-icon"><i data-lucide="folder"></i></div>
+        <div class="sfs-export-main">
+          <div class="sfs-export-label">Export location</div>
+          ${editing
+            ? `<input type="text" class="sfs-input sfs-export-input" id="sfs-export-input"
+                 value="${esc(s.export_dir || "")}" />`
+            : `<button class="sfs-export-path" id="sfs-export-path-btn"
+                 title="Click to edit the path directly">${esc(_sfsFriendlyPath(s.export_dir))}</button>`}
         </div>
-        <div class="sfs-hint">Final renders and reels are written here, under a per-project folder.
-          If a native folder picker isn't available (browser mode), paste the path directly.</div>
+        <button class="sfs-btn" id="sfs-change-folder"><i data-lucide="folder-open"></i> Change…</button>
+        <button class="sfs-icon-btn" id="sfs-reveal-folder" title="Reveal in Finder">
+          <i data-lucide="external-link"></i>
+        </button>
       </div>
-      <div class="sfs-row" style="margin-top:20px">
-        <button class="sfs-btn primary" id="sfs-save-general">Save</button>
-        <span class="sfs-feedback" id="sfs-general-feedback"></span>
-      </div>
+      <div class="sfs-hint">Final renders and reels are written here, inside a folder per project.</div>
+    </div>
+    <div class="sfs-card sfs-breadcrumb-card">
+      <div class="sfs-label" style="margin-bottom:0">Your exports</div>
+      <div class="sfs-breadcrumb">${_sfsBreadcrumbHtml(s.export_dir)}</div>
     </div>`;
 
-  $("#sfs-choose-folder").onclick = async () => {
+  const startEditing = () => {
+    _sfs.generalEditing = true;
+    _sfsRenderGeneral(host);
+    refreshIcons();
+    const input = $("#sfs-export-input");
+    input?.focus();
+    input?.select();
+  };
+  const stopEditing = () => {
+    _sfs.generalEditing = false;
+    _sfsRenderGeneral(host);
+    refreshIcons();
+  };
+  const saveExportDir = async (path) => {
+    if (!path || !path.trim()) { stopEditing(); return; }
+    try {
+      _sfs.settings = await api("/settings", { method: "PUT", body: { export_dir: path } });
+      stopEditing();
+      _sfsToast("Saved ✓");
+    } catch (e) {
+      _sfsToast(`Couldn't save: ${e.message}`, true);
+    }
+  };
+
+  $("#sfs-export-path-btn")?.addEventListener("click", startEditing);
+
+  const input = $("#sfs-export-input");
+  if (input) {
+    let cancelled = false;
+    input.onkeydown = (e) => {
+      // Stop propagation: this is an inline field-level Enter/Esc (save/
+      // cancel just this edit), not the app-wide Escape handler in core.js
+      // that closes the whole Settings overlay -- letting it bubble would
+      // cancel-and-also-close instead of just cancel-in-place.
+      if (e.key === "Enter") { e.stopPropagation(); cancelled = false; saveExportDir(input.value); }
+      else if (e.key === "Escape") { e.stopPropagation(); cancelled = true; stopEditing(); }
+    };
+    input.onblur = () => { if (!cancelled) stopEditing(); };
+  }
+
+  $("#sfs-change-folder").onclick = async () => {
     const api_ = window.pywebview?.api;
     if (api_?.pick_folder) {
       try {
         const picked = await api_.pick_folder();
         const path = Array.isArray(picked) ? picked[0] : picked;
-        if (path) $("#sfs-export-dir").value = path;
+        if (path) await saveExportDir(path);
       } catch (e) {
-        alert(`Folder picker failed: ${e.message}`);
+        _sfsToast(`Folder picker failed: ${e.message}`, true);
       }
     } else {
-      alert("Native folder picker isn't available here — paste the folder path directly.");
+      // Dev/browser fallback (never the primary design, per the app-first
+      // principle) -- just drop into the inline editable path.
+      startEditing();
     }
   };
 
-  $("#sfs-open-folder").onclick = async () => {
+  $("#sfs-reveal-folder").onclick = async () => {
     try {
-      await api("/open-folder", { method: "POST", body: { path: $("#sfs-export-dir").value } });
+      await api("/open-folder", { method: "POST", body: { path: s.export_dir } });
     } catch (e) {
-      alert(`Couldn't open folder: ${e.message}`);
-    }
-  };
-
-  $("#sfs-save-general").onclick = async () => {
-    const feedback = $("#sfs-general-feedback");
-    feedback.textContent = "Saving…";
-    feedback.style.color = "";
-    try {
-      _sfs.settings = await api("/settings", {
-        method: "PUT",
-        body: { export_dir: $("#sfs-export-dir").value },
-      });
-      feedback.textContent = "Saved.";
-      feedback.style.color = "var(--accent2)";
-    } catch (e) {
-      feedback.textContent = `Failed to save: ${e.message}`;
-      feedback.style.color = "var(--danger)";
+      _sfsToast(`Couldn't open folder: ${e.message}`, true);
     }
   };
 }
@@ -304,11 +513,7 @@ function _sfsRenderBrand(host) {
         <div class="sfs-hint">Free-form plain text: your channel/handle, target audience, tone of
           voice, recurring links, hashtags you always use, and your usual call-to-action. It's
           passed as-is to the copywriter agent when it writes reel and video titles/descriptions.
-          Saves automatically when you click away, or use Save below.</div>
-      </div>
-      <div class="sfs-row" style="margin-top:6px">
-        <button class="sfs-btn primary" id="sfs-save-brand">Save</button>
-        <span class="sfs-feedback" id="sfs-brand-feedback"></span>
+          Saves automatically when you click away.</div>
       </div>
     </div>`;
 
@@ -317,38 +522,23 @@ function _sfsRenderBrand(host) {
   textarea.oninput = () => {
     charcount.textContent = `${textarea.value.length} characters`;
   };
-  textarea.onblur = () => _sfsSaveBrand({ silent: true });
-  $("#sfs-save-brand").onclick = () => _sfsSaveBrand({ silent: false });
+  textarea.onblur = () => _sfsSaveBrand();
 }
 
-async function _sfsSaveBrand({ silent }) {
+async function _sfsSaveBrand() {
   const textarea = $("#sfs-brand-profile");
   if (!textarea) return;
-  const feedback = $("#sfs-brand-feedback");
   const value = textarea.value;
-  if (silent && _sfs.settings && (_sfs.settings.brand_profile || "") === value) return;
-  if (feedback) {
-    feedback.textContent = "Saving…";
-    feedback.style.color = "";
-  }
+  if (_sfs.settings && (_sfs.settings.brand_profile || "") === value) return;
   try {
-    _sfs.settings = await api("/settings", {
-      method: "PUT",
-      body: { brand_profile: value },
-    });
-    if (feedback) {
-      feedback.textContent = "Saved.";
-      feedback.style.color = "var(--accent2)";
-    }
+    _sfs.settings = await api("/settings", { method: "PUT", body: { brand_profile: value } });
+    _sfsToast("Saved ✓");
   } catch (e) {
-    if (feedback) {
-      feedback.textContent = `Failed to save: ${e.message}`;
-      feedback.style.color = "var(--danger)";
-    }
+    _sfsToast(`Couldn't save: ${e.message}`, true);
   }
 }
 
-/* ---------- Models ---------- */
+/* ---------- Models (v5.11 restructure + v5.12 Whisper box) ---------- */
 
 function _sfsModelOptions(selected) {
   const opts = _sfs.models.map((m) =>
@@ -365,8 +555,27 @@ function _sfsTaskOptions(selected) {
   return `<option value="" ${nullSel}>(use default)</option>` + _sfsModelOptions(selected || "");
 }
 
+function _sfsInstalledChipsHtml() {
+  if (_sfs.modelsError) return `<div class="sfs-hint">Unavailable — Ollama isn't reachable.</div>`;
+  if (!_sfs.models.length) return `<div class="sfs-hint">No models installed yet.</div>`;
+  return _sfs.models.map((m) => `
+    <span class="sfs-installed-chip">
+      <span>${esc(m.name)}</span>
+      <span class="sfs-installed-chip-size">${m.size_gb}GB</span>
+      <button class="sfs-installed-chip-x" data-delete-model="${esc(m.name)}" title="Delete">
+        <i data-lucide="x"></i>
+      </button>
+    </span>`).join("");
+}
+
+function _sfsWhisperCurrentValue(s) {
+  return WHISPER_OPTIONS.some(([id]) => id === s.whisper_model) ? s.whisper_model : WHISPER_CUSTOM;
+}
+
 function _sfsRenderModels(host) {
   const s = _sfs.settings;
+  const whisperSel = _sfsWhisperCurrentValue(s);
+  const whisperCustomVisible = whisperSel === WHISPER_CUSTOM;
   host.innerHTML = `
     <div>
       <div class="sfs-h1">Models</div>
@@ -374,77 +583,194 @@ function _sfsRenderModels(host) {
     </div>
 
     <div class="sfs-card">
-      <div class="sfs-label" style="margin-bottom:12px">Task models</div>
       ${_sfs.modelsError ? `<div class="sfs-hint" style="color:var(--warn)">
         Couldn't reach Ollama: ${esc(_sfs.modelsError)}</div>` : ""}
+      <div class="sfs-label" style="margin-bottom:12px">Your models</div>
+      <div class="sfs-2col">
+        <div class="sfs-field-compact" style="grid-column:1 / -1">
+          <label class="sfs-label-row"><span>Default model</span></label>
+          <select class="sfs-select" id="s-default-model">${_sfsModelOptions(s.default_model)}</select>
+        </div>
+        ${TASK_INFO.map(([key, label, desc]) => `
+          <div class="sfs-field-compact">
+            <label class="sfs-label-row">
+              <span>${esc(label)}</span>
+              <i data-lucide="info" class="sfs-info-icon" title="${esc(desc)}"></i>
+            </label>
+            <select class="sfs-select" id="s-task-${key}" data-task="${key}">
+              ${_sfsTaskOptions(s.task_models[key])}
+            </select>
+          </div>`).join("")}
+      </div>
+
+      <div class="sfs-divider"></div>
+      <div class="sfs-card-head">
+        <div class="sfs-label" style="margin:0">Installed</div>
+        <button class="sfs-btn primary" id="sfs-browse-models">
+          <i data-lucide="search"></i> Browse models
+        </button>
+      </div>
+      <div class="sfs-chip-list" id="sfs-installed-chips">${_sfsInstalledChipsHtml()}</div>
+    </div>
+
+    <div class="sfs-card sfs-whisper-card">
+      <div class="sfs-whisper-head">
+        <div class="sfs-whisper-icon"><i data-lucide="mic"></i></div>
+        <div class="sfs-whisper-title">Transcription — Whisper</div>
+      </div>
       <div class="sfs-field">
-        <label class="sfs-label">Default model</label>
-        <select class="sfs-select" id="s-default-model">${_sfsModelOptions(s.default_model)}</select>
+        <label class="sfs-label">Whisper model</label>
+        <select class="sfs-select" id="s-whisper-select">
+          ${WHISPER_OPTIONS.map(([id, label]) =>
+            `<option value="${esc(id)}" ${whisperSel === id ? "selected" : ""}>${esc(label)}</option>`).join("")}
+          <option value="${WHISPER_CUSTOM}" ${whisperCustomVisible ? "selected" : ""}>Custom repo…</option>
+        </select>
+        <input type="text" class="sfs-input" id="s-whisper-custom" style="margin-top:8px; ${whisperCustomVisible ? "" : "display:none"}"
+          value="${esc(whisperCustomVisible ? (s.whisper_model || "") : "")}"
+          placeholder="mlx-community/whisper-..." />
       </div>
-      ${TASK_INFO.map(([key, label, desc]) => `
-        <div class="sfs-field">
-          <label class="sfs-label">${esc(label)}</label>
-          <select class="sfs-select" id="s-task-${key}" data-task="${key}">
-            ${_sfsTaskOptions(s.task_models[key])}
-          </select>
-          <div class="sfs-hint">${esc(desc)}</div>
-        </div>`).join("")}
-      <div class="sfs-row" style="margin-top:6px">
-        <button class="sfs-btn primary" id="s-save-models">Save</button>
-        <span class="sfs-feedback" id="s-models-feedback"></span>
+      <div class="sfs-hint sfs-whisper-explainer">
+        Speech-to-text uses Whisper — the open-source standard for transcription — not an
+        Ollama LLM. It produces the word-level timestamps every edit decision depends on, and
+        runs on the Apple GPU via MLX. The Ollama models above only reason over the resulting text.
       </div>
-    </div>
-
-    <div class="sfs-card">
-      <div class="sfs-label">Get more models</div>
-      <div class="sfs-guide">Models run 100% locally via Ollama — nothing leaves this Mac.
-        Search below, check the fit for your machine's RAM, and install.</div>
-      <div id="sfs-reco-block" style="margin-top:14px">${_sfsRecommendationHtml()}</div>
-      <div class="sfs-row" style="margin-top:16px">
-        <input type="text" class="sfs-input" id="sfs-lib-search" placeholder="Search models… (e.g. qwen, llama, gemma)"
-          value="${esc(_sfs.libQuery)}" />
-        <button class="sfs-btn" id="sfs-lib-search-btn">Search</button>
-      </div>
-      <div id="sfs-lib-results" style="margin-top:6px"></div>
-    </div>
-
-    <div class="sfs-card">
-      <div class="sfs-label">Installed models</div>
-      <div id="sfs-installed-list">${_sfsInstalledListHtml()}</div>
     </div>`;
 
-  $("#s-save-models").onclick = async () => {
-    const feedback = $("#s-models-feedback");
-    feedback.textContent = "Saving…";
-    feedback.style.color = "";
-    const task_models = {};
-    TASK_INFO.forEach(([key]) => {
-      const v = $(`#s-task-${key}`).value;
-      task_models[key] = v === "" ? null : v;
-    });
-    try {
-      _sfs.settings = await api("/settings", {
-        method: "PUT",
-        body: { default_model: $("#s-default-model").value, task_models },
-      });
-      feedback.textContent = "Saved.";
-      feedback.style.color = "var(--accent2)";
-    } catch (e) {
-      feedback.textContent = `Failed to save: ${e.message}`;
-      feedback.style.color = "var(--danger)";
-    }
-  };
+  $("#s-default-model").onchange = _sfsSaveModels;
+  TASK_INFO.forEach(([key]) => { $(`#s-task-${key}`).onchange = _sfsSaveModels; });
 
+  $("#sfs-browse-models").onclick = _sfsOpenModelModal;
+  _sfsAttachDeleteHandlers();
+
+  const whisperSelect = $("#s-whisper-select");
+  const whisperCustom = $("#s-whisper-custom");
+  whisperSelect.onchange = async () => {
+    const v = whisperSelect.value;
+    if (v === WHISPER_CUSTOM) {
+      whisperCustom.style.display = "";
+      whisperCustom.focus();
+      return;
+    }
+    whisperCustom.style.display = "none";
+    await _sfsSaveWhisper(v);
+  };
+  whisperCustom.onkeydown = (e) => { if (e.key === "Enter") whisperCustom.blur(); };
+  whisperCustom.onblur = () => _sfsSaveWhisper(whisperCustom.value);
+}
+
+async function _sfsSaveModels() {
+  const task_models = {};
+  TASK_INFO.forEach(([key]) => {
+    const el = $(`#s-task-${key}`);
+    if (el) task_models[key] = el.value === "" ? null : el.value;
+  });
+  try {
+    _sfs.settings = await api("/settings", {
+      method: "PUT",
+      body: { default_model: $("#s-default-model").value, task_models },
+    });
+    _sfsToast("Saved ✓");
+  } catch (e) {
+    _sfsToast(`Couldn't save: ${e.message}`, true);
+  }
+}
+
+async function _sfsSaveWhisper(value) {
+  if (!value || !value.trim()) return;
+  if (_sfs.settings && _sfs.settings.whisper_model === value.trim()) return;
+  try {
+    _sfs.settings = await api("/settings", { method: "PUT", body: { whisper_model: value.trim() } });
+    _sfsToast("Saved ✓");
+  } catch (e) {
+    _sfsToast(`Couldn't save: ${e.message}`, true);
+  }
+}
+
+function _sfsAttachDeleteHandlers() {
+  document.querySelectorAll("[data-delete-model]").forEach((btn) => {
+    btn.onclick = async () => {
+      const name = btn.dataset.deleteModel;
+      if (!confirm(`Delete "${name}" from Ollama?`)) return;
+      btn.disabled = true;
+      try {
+        await api(`/ollama/models/${encodeURIComponent(name)}`, { method: "DELETE" });
+        _sfs.models = await api("/ollama/models");
+        _sfsRefreshInstalledUI();
+      } catch (e) {
+        _sfsToast(`Delete failed: ${e.message}`, true);
+        btn.disabled = false;
+      }
+    };
+  });
+}
+
+function _sfsRefreshInstalledUI() {
+  if (_sfs.section === "models") {
+    const list = $("#sfs-installed-chips");
+    if (list) { list.innerHTML = _sfsInstalledChipsHtml(); refreshIcons(); }
+    _sfsAttachDeleteHandlers();
+  }
+}
+
+/* ---------- Model browser modal (v5.11) ----------
+   Encapsulated dialog: hardware recommendation + search + results + install
+   progress. Lives as a standalone overlay outside #tab-settings so closing
+   it (or switching Settings section) never interrupts an in-flight pull --
+   polling in _sfsWatchPullJob keeps running regardless of _sfs.modelModalOpen. */
+
+function _sfsEnsureModelModal() {
+  if (document.getElementById("sfs-model-modal")) return;
+  const el = document.createElement("div");
+  el.id = "sfs-model-modal";
+  el.className = "sfs-modal-overlay";
+  el.hidden = true;
+  el.innerHTML = `
+    <div class="sfs-modal">
+      <div class="sfs-modal-head">
+        <div class="sfs-h1" style="margin:0; font-size:20px">Browse models</div>
+        <button class="sfs-icon-btn" id="sfs-model-modal-close" title="Close">
+          <i data-lucide="x"></i>
+        </button>
+      </div>
+      <div class="sfs-modal-body">
+        <div class="sfs-guide">Models run 100% locally via Ollama — nothing leaves this Mac.
+          Search below, check the fit for your machine's RAM, and install.</div>
+        <div id="sfs-reco-block" style="margin-top:14px"></div>
+        <div class="sfs-row" style="margin-top:18px">
+          <input type="text" class="sfs-input" id="sfs-lib-search" placeholder="Search models… (e.g. qwen, llama, gemma)" />
+          <button class="sfs-btn" id="sfs-lib-search-btn">Search</button>
+        </div>
+        <div id="sfs-lib-results" style="margin-top:6px"></div>
+      </div>
+    </div>`;
+  document.body.appendChild(el);
+
+  $("#sfs-model-modal-close").onclick = _sfsCloseModelModal;
+  el.addEventListener("click", (e) => { if (e.target.id === "sfs-model-modal") _sfsCloseModelModal(); });
   $("#sfs-lib-search-btn").onclick = () => _sfsSearchLibrary($("#sfs-lib-search").value);
   $("#sfs-lib-search").onkeydown = (e) => { if (e.key === "Enter") _sfsSearchLibrary(e.target.value); };
+}
 
+function _sfsShowModelModal() {
+  _sfsEnsureModelModal();
+  $("#sfs-model-modal").hidden = false;
+  $("#sfs-lib-search").value = _sfs.libQuery;
   if (_sfs.libResults !== null) _sfsRenderLibraryResults();
   else _sfsSearchLibrary("");
-
   if (_sfs.recommendation !== null || _sfs.recommendationError) _sfsAttachRecommendationHandlers();
   else _sfsLoadRecommendation();
+  refreshIcons();
+}
 
-  _sfsAttachDeleteHandlers();
+function _sfsOpenModelModal() {
+  _sfs.modelModalOpen = true;
+  _sfsShowModelModal();
+}
+
+function _sfsCloseModelModal() {
+  _sfs.modelModalOpen = false;
+  const el = document.getElementById("sfs-model-modal");
+  if (el) el.hidden = true;
 }
 
 /* ---------- Recommendation block ---------- */
@@ -497,6 +823,7 @@ async function _sfsLoadRecommendation() {
   const box = $("#sfs-reco-block");
   if (box) box.innerHTML = _sfsRecommendationHtml();
   _sfsAttachRecommendationHandlers();
+  refreshIcons();
 }
 
 function _sfsAttachRecommendationHandlers() {
@@ -507,18 +834,9 @@ function _sfsAttachRecommendationHandlers() {
       const b = $("#sfs-reco-block");
       if (b) b.innerHTML = _sfsRecommendationHtml();
       _sfsAttachRecommendationHandlers();
+      refreshIcons();
     });
   });
-}
-
-function _sfsInstalledListHtml() {
-  if (_sfs.modelsError) return `<div class="sfs-hint">Unavailable — Ollama isn't reachable.</div>`;
-  if (!_sfs.models.length) return `<div class="sfs-hint">No models installed yet.</div>`;
-  return _sfs.models.map((m) => `
-    <div class="sfs-installed-row">
-      <span>${esc(m.name)} <span class="sfs-about-key">(${m.size_gb}GB${m.family ? ", " + esc(m.family) : ""})</span></span>
-      <button class="sfs-btn" data-delete-model="${esc(m.name)}">Delete</button>
-    </div>`).join("");
 }
 
 async function _sfsSearchLibrary(q) {
@@ -597,6 +915,7 @@ function _sfsRenderLibraryResults() {
   box.querySelectorAll("[data-load-tags]").forEach((btn) => {
     btn.onclick = () => _sfsLoadTags(btn.dataset.loadTags);
   });
+  refreshIcons();
 }
 
 async function _sfsLoadTags(name) {
@@ -619,11 +938,15 @@ async function _sfsPullModel(modelRef, onProgress) {
     if (onProgress) onProgress();
     _sfsWatchPullJob(job_id, modelRef, onProgress);
   } catch (e) {
-    alert(`Couldn't start install: ${e.message}`);
+    _sfsToast(`Couldn't start install: ${e.message}`, true);
   }
 }
 
 function _sfsWatchPullJob(jobId, modelRef, onProgress) {
+  // Deliberately NOT gated on the modal or even the Settings section being
+  // open/visible -- an install must keep going (and keep updating the
+  // "Installed" chip list once it lands) no matter what the user is looking
+  // at, per v5.11 §2 ("closing the modal never loses an in-flight pull").
   if (_sfs.polling.has(jobId)) return;
   _sfs.polling.add(jobId);
   const poll = async () => {
@@ -635,7 +958,7 @@ function _sfsWatchPullJob(jobId, modelRef, onProgress) {
       return;
     }
     _sfs.pullJobs[modelRef] = job;
-    if (_sfs.section === "models") {
+    if (_sfs.modelModalOpen) {
       _sfsRenderLibraryResults();
       if (onProgress) onProgress();
     }
@@ -649,37 +972,16 @@ function _sfsWatchPullJob(jobId, modelRef, onProgress) {
       } catch (e) {
         _sfs.modelsError = e.message;
       }
-      if (_sfs.section === "models") {
-        const list = $("#sfs-installed-list");
-        if (list) list.innerHTML = _sfsInstalledListHtml();
-        _sfsAttachDeleteHandlers();
+      _sfsRefreshInstalledUI();
+      if (_sfs.modelModalOpen) {
         _sfsRenderLibraryResults();
         if (onProgress) onProgress();
       }
-      if (job.status === "error") alert(`Install failed: ${job.error || "unknown error"}`);
+      if (job.status === "error") _sfsToast(`Install failed: ${job.error || "unknown error"}`, true);
+      else _sfsToast("Installed ✓");
     }
   };
   poll();
-}
-
-function _sfsAttachDeleteHandlers() {
-  document.querySelectorAll("[data-delete-model]").forEach((btn) => {
-    btn.onclick = async () => {
-      const name = btn.dataset.deleteModel;
-      if (!confirm(`Delete "${name}" from Ollama?`)) return;
-      btn.disabled = true;
-      try {
-        await api(`/ollama/models/${encodeURIComponent(name)}`, { method: "DELETE" });
-        _sfs.models = await api("/ollama/models");
-        const list = $("#sfs-installed-list");
-        if (list) list.innerHTML = _sfsInstalledListHtml();
-        _sfsAttachDeleteHandlers();
-      } catch (e) {
-        alert(`Delete failed: ${e.message}`);
-        btn.disabled = false;
-      }
-    };
-  });
 }
 
 /* ---------- Performance ---------- */
@@ -712,71 +1014,26 @@ function _sfsRenderPerformance(host) {
           value="${perf.min_free_ram_gb ?? 4}" />
         <div class="sfs-hint">Heavy steps wait/queue instead of starting when available RAM drops below this.</div>
       </div>
-      <div class="sfs-row" style="margin-top:6px">
-        <button class="sfs-btn primary" id="sfs-save-perf">Save</button>
-        <span class="sfs-feedback" id="sfs-perf-feedback"></span>
-      </div>
     </div>`;
 
-  $("#sfs-save-perf").onclick = async () => {
-    const feedback = $("#sfs-perf-feedback");
-    feedback.textContent = "Saving…";
-    feedback.style.color = "";
-    const threadsVal = $("#sfs-perf-threads").value.trim();
-    const performance = {
-      max_parallel_ffmpeg: parseInt($("#sfs-perf-parallel").value, 10) || 1,
-      ffmpeg_threads: threadsVal === "" ? null : parseInt(threadsVal, 10),
-      min_free_ram_gb: parseFloat($("#sfs-perf-ram").value) || 0,
-    };
-    try {
-      _sfs.settings = await api("/settings", { method: "PUT", body: { performance } });
-      feedback.textContent = "Saved.";
-      feedback.style.color = "var(--accent2)";
-    } catch (e) {
-      feedback.textContent = `Failed to save: ${e.message}`;
-      feedback.style.color = "var(--danger)";
-    }
-  };
+  ["sfs-perf-parallel", "sfs-perf-threads", "sfs-perf-ram"].forEach((id) => {
+    $(`#${id}`).onchange = _sfsSavePerformance;
+  });
 }
 
-/* ---------- Transcription ---------- */
-
-function _sfsRenderTranscription(host) {
-  const s = _sfs.settings;
-  host.innerHTML = `
-    <div>
-      <div class="sfs-h1">Transcription</div>
-      <div class="sfs-sub">Whisper model used to transcribe clips (mlx-community repo).</div>
-    </div>
-    <div class="sfs-card">
-      <div class="sfs-field">
-        <label class="sfs-label">Whisper model</label>
-        <input type="text" class="sfs-input" id="s-whisper-model" value="${esc(s.whisper_model)}"
-          placeholder="mlx-community/whisper-large-v3-turbo" />
-        <div class="sfs-hint">Any mlx-community Whisper repo id. Larger models transcribe more accurately but slower.</div>
-      </div>
-      <div class="sfs-row" style="margin-top:6px">
-        <button class="sfs-btn primary" id="sfs-save-whisper">Save</button>
-        <span class="sfs-feedback" id="sfs-whisper-feedback"></span>
-      </div>
-    </div>`;
-
-  $("#sfs-save-whisper").onclick = async () => {
-    const feedback = $("#sfs-whisper-feedback");
-    feedback.textContent = "Saving…";
-    feedback.style.color = "";
-    try {
-      _sfs.settings = await api("/settings", {
-        method: "PUT",
-        body: { whisper_model: $("#s-whisper-model").value },
-      });
-      feedback.textContent = "Saved.";
-      feedback.style.color = "var(--accent2)";
-    } catch (e) {
-      feedback.textContent = `Failed to save: ${e.message}`;
-      feedback.style.color = "var(--danger)";
-    }
+async function _sfsSavePerformance() {
+  const threadsVal = $("#sfs-perf-threads").value.trim();
+  const performance = {
+    max_parallel_ffmpeg: parseInt($("#sfs-perf-parallel").value, 10) || 1,
+    ffmpeg_threads: threadsVal === "" ? null : parseInt(threadsVal, 10),
+    min_free_ram_gb: parseFloat($("#sfs-perf-ram").value) || 0,
   };
+  try {
+    _sfs.settings = await api("/settings", { method: "PUT", body: { performance } });
+    _sfsToast("Saved ✓");
+  } catch (e) {
+    _sfsToast(`Couldn't save: ${e.message}`, true);
+  }
 }
 
 /* ---------- About ---------- */

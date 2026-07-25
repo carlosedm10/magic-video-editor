@@ -1,4 +1,4 @@
-# magic-video-editor (CutRoom)
+# Magic Video Editor
 
 Local-first AI video editor for macOS. You drop in raw footage; it transcribes,
 finds the best takes, orders the story, renders a main cut, and suggests ~20
@@ -7,7 +7,7 @@ Reels/TikTok-ready vertical clips — **everything runs on your machine**:
 - **Whisper** (mlx-whisper, Apple Silicon GPU) — transcription with word timestamps
 - **Ollama + pydantic_ai** (any local model, default `qwen2.5:14b`, configurable
   per task in Settings) — all editorial *decisions*, as typed agents in
-  `cutroom/agents/` (prompts.py / schemas.py / agents.py)
+  `magic_video_editor/agents/` (prompts.py / schemas.py / agents.py)
 - **ffmpeg** — all cutting/cropping/rendering. No editing app involved.
 - **scipy** — multi-cam / external-audio sync via audio cross-correlation
 - **OpenCV** — face detection for speaker-centered 9:16 crops
@@ -46,8 +46,8 @@ config without touching prompts or schemas.
 
 ```bash
 make setup    # uv sync + pull the default ollama model + doctor checks
-make app      # native app window (pywebview)
-make server   # or: plain backend, open http://127.0.0.1:8765
+make app      # native app window (pywebview) -- runs `mve`
+make server   # or: plain backend, open http://127.0.0.1:8765 -- runs `mve-server`
 ```
 
 Other useful targets: `make doctor` (env checks), `make lint` / `make format`,
@@ -56,16 +56,21 @@ Other useful targets: `make doctor` (env checks), `make lint` / `make format`,
 
 First transcription downloads the whisper model (~1.6 GB) from Hugging Face.
 
-Projects and renders live in `~/CutRoom/projects/`.
+Projects and renders live in `~/Library/Application Support/Magic Video Editor/projects/`
+(a pre-existing `~/CutRoom` is auto-migrated there on first launch).
 
 ## Configuration (env vars)
 
 | Var | Default | |
 |---|---|---|
-| `CUTROOM_LLM` | `qwen2.5:14b` | any Ollama model (fallback only — Settings tab / `~/CutRoom/settings.json` wins) |
-| `CUTROOM_WHISPER` | `mlx-community/whisper-large-v3-turbo` | any mlx whisper repo |
-| `CUTROOM_DATA` | `~/CutRoom` | projects dir |
+| `MVE_LLM` | `qwen2.5:14b` | any Ollama model (fallback only — Settings tab / `<data dir>/settings.json` wins) |
+| `MVE_WHISPER` | `mlx-community/whisper-large-v3-turbo` | any mlx whisper repo |
+| `MVE_DATA` | `~/Library/Application Support/Magic Video Editor` | projects dir |
 | `OLLAMA_URL` | `http://localhost:11434` | |
+
+Legacy `CUTROOM_LLM` / `CUTROOM_WHISPER` / `CUTROOM_DATA` (and `CUTROOM_HOST` /
+`CUTROOM_PORT` / `CUTROOM_FFMPEG`) are still honored as a fallback, with a
+one-time deprecation warning logged when used.
 
 ## Honest v1 limitations
 

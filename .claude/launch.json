@@ -2,10 +2,10 @@
   "version": "0.0.1",
   "configurations": [
     {
-      "name": "cutroom",
+      "name": "mve",
       "cwd": "/Users/carlos.dominguez/projects/magic-video-editor",
       "runtimeExecutable": "uv",
-      "runtimeArgs": ["run", "cutroom-server"],
+      "runtimeArgs": ["run", "mve-server"],
       "port": 8765
     }
   ]

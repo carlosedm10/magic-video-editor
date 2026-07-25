@@ -160,6 +160,21 @@ const Timeline = {
       .tl-history-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
       .tl-history-time { color: var(--dim); font-variant-numeric: tabular-nums; flex-shrink: 0; }
       .tl-history-empty { color: var(--dim); padding: 6px; }
+
+      /* ---- manual overlay track (spec v5.9b) ---- */
+      .tl-overlay-track { position: absolute; left: 0; right: 0; top: 22px; height: 26px; z-index: 1;
+        border-bottom: 1px solid var(--border); }
+      .tl-overlay-track.tl-drop-target { outline: 2px dashed var(--accent2); outline-offset: -2px; }
+      .ov-block { position: absolute; top: 3px; height: 20px; border-radius: 6px; overflow: hidden;
+        background: rgba(53,194,143,.20); border: 1px solid var(--accent2); cursor: grab;
+        display: flex; align-items: center; }
+      .ov-block:hover { background: rgba(53,194,143,.3); }
+      .ov-block.selected { background: rgba(53,194,143,.42); box-shadow: 0 0 0 1px var(--accent2); }
+      .ov-block .ov-label { padding: 0 6px; font-size: 10px; color: var(--text); white-space: nowrap;
+        overflow: hidden; text-overflow: ellipsis; pointer-events: none; }
+      .ov-edge { position: absolute; top: 0; bottom: 0; width: 6px; cursor: ew-resize; z-index: 2; }
+      .ov-edge-l { left: 0; } .ov-edge-r { right: 0; }
+      .ov-edge:hover { background: rgba(53,194,143,.6); }
     `;
     document.head.appendChild(style);
   },
@@ -235,6 +250,49 @@ const Timeline = {
         content.appendChild(strip);
       }
     }
+    this._ensureOverlayTrack();
+  },
+
+  /* ---------- manual overlay track chrome (spec v5.9b) ----------
+     A second, thinner lane ABOVE the main video track: created once here,
+     pushed down from under the ruler (22px), and #timeline-track (owned by
+     the CSS in ui/style.css as `top: 22px`) is shifted down via inline
+     style to make room — inline style beats the external stylesheet rule
+     for the same element/property, same trick the rest of this file already
+     relies on for chrome ui/index.html/ui/style.css don't know about. */
+  _ensureOverlayTrack() {
+    const content = document.getElementById("timeline-content");
+    const mainTrack = document.getElementById("timeline-track");
+    if (!content || !mainTrack || document.getElementById("timeline-overlay-track")) return;
+    const track = document.createElement("div");
+    track.id = "timeline-overlay-track";
+    track.className = "tl-overlay-track"; // top/height/left/right come from the injected stylesheet above
+    content.appendChild(track);
+    mainTrack.style.top = "48px"; // was 22px (CSS) — pushed down to make room for the 22-48px overlay lane
+
+    track.addEventListener("pointerdown", (e) => {
+      if (e.target.closest(".ov-block")) return; // block/edge handlers below own their own drag
+      Editor.deselectOverlay();
+    });
+    track.addEventListener("dragover", (e) => {
+      if (!e.dataTransfer?.types?.includes("application/x-mve-clip")) return;
+      e.preventDefault();
+      e.stopPropagation(); // don't also let #timeline-content's main-track drop handler fire
+      e.dataTransfer.dropEffect = "copy";
+      track.classList.add("tl-drop-target");
+    });
+    track.addEventListener("dragleave", (e) => { e.stopPropagation(); track.classList.remove("tl-drop-target"); });
+    track.addEventListener("drop", (e) => {
+      track.classList.remove("tl-drop-target");
+      const clipId = e.dataTransfer?.getData("application/x-mve-clip");
+      if (!clipId) return;
+      e.preventDefault();
+      e.stopPropagation();
+      const rect = track.getBoundingClientRect();
+      const scroll = document.getElementById("timeline-scroll");
+      const x = e.clientX - rect.left + (scroll?.scrollLeft || 0);
+      Editor.insertOverlay(clipId, Math.max(0, x / this.pxPerSec));
+    });
   },
 
   _toggleSnapping(force) {
@@ -387,7 +445,15 @@ const Timeline = {
     const player = window.EditorUI.player;
     if (e.key === " ") { e.preventDefault(); player?.togglePlay(); }
     else if (e.key === "x" || e.key === "X") { e.preventDefault(); this.splitAtPlayhead(); }
-    else if (e.key === "Delete" || e.key === "Backspace") { e.preventDefault(); Editor.deleteSelected(); }
+    else if (e.key === "Delete" || e.key === "Backspace") {
+      e.preventDefault();
+      // A selected overlay (spec v5.9b) takes priority — it's the more
+      // recently-interacted-with selection, and overlays/segments have
+      // fully independent selection state (Editor.overlaySelected vs.
+      // Editor.selected) so this never accidentally eats a segment delete.
+      if (Editor.overlaySelected) Editor.deleteOverlay(Editor.overlaySelected);
+      else Editor.deleteSelected();
+    }
     else if (meta && (e.key === "z" || e.key === "Z")) {
       e.preventDefault();
       if (e.shiftKey) Editor.redo(); else Editor.undo();
@@ -423,6 +489,7 @@ const Timeline = {
     this._renderTrack(segs, px);
     this.renderSelection();
     this.renderMarkers();
+    this.renderOverlays();
     this.updatePlayhead(window.EditorUI.player?.currentEdlTime?.() ?? 0);
     this.refreshRenderBar();
     refreshIcons();
@@ -464,6 +531,95 @@ const Timeline = {
         else window.EditorUI.player?.seekToEdlTime?.(m.edl_t);
       };
     });
+  },
+
+  /* ---------- manual overlay track (spec v5.9b) ----------
+     Thinner blocks in the lane above the main track. All mutations go
+     through Editor.overlay* (ui/editor/state.js) exactly like segments go
+     through Editor.commit()/trim() — this module never touches
+     Editor.overlays directly. Move = drag the block body; trim = drag
+     either edge handle (left trims the in-point, right trims duration) —
+     same live-preview-then-commit-on-release shape as the main track's
+     edge drag below, just without the left-edge-anchor complication (an
+     overlay's on-screen position already comes straight from t_start, no
+     cumulative-duration layout to fight). */
+  renderOverlays() {
+    const track = document.getElementById("timeline-overlay-track");
+    if (!track) return;
+    const px = this.pxPerSec;
+    const overlays = Editor.overlays || [];
+    track.innerHTML = overlays.map((o) => {
+      const leftPx = o.t_start * px;
+      const widthPx = Math.max(o.duration * px, 3);
+      const clip = Editor.clip(o.clip_id);
+      const name = clip?.filename || o.clip_id;
+      const selected = o.id === Editor.overlaySelected;
+      return `<div class="ov-block${selected ? " selected" : ""}" data-ov="${o.id}"
+        style="left:${leftPx.toFixed(1)}px;width:${widthPx.toFixed(1)}px" title="${esc(name)} (overlay)">
+        <div class="ov-edge ov-edge-l" data-ov="${o.id}" data-edge="start"></div>
+        <span class="ov-label">${esc(name)} · ${fmtT(o.duration)}</span>
+        <div class="ov-edge ov-edge-r" data-ov="${o.id}" data-edge="end"></div>
+      </div>`;
+    }).join("");
+    track.querySelectorAll(".ov-block").forEach((el) => {
+      el.addEventListener("pointerdown", (e) => this._onOverlayPointerDown(e, el));
+    });
+  },
+
+  renderOverlaySelection() {
+    document.querySelectorAll(".ov-block").forEach((el) => {
+      el.classList.toggle("selected", el.dataset.ov === Editor.overlaySelected);
+    });
+  },
+
+  _onOverlayPointerDown(e, el) {
+    if (e.target.classList.contains("ov-edge")) return this._onOverlayEdgePointerDown(e);
+    e.stopPropagation(); // don't also trigger the main track's background-click-to-seek
+    const id = el.dataset.ov;
+    Editor.selectOverlay(id);
+    const ov = (Editor.overlays || []).find((o) => o.id === id);
+    if (!ov) return;
+    const startX = e.clientX;
+    const startT = ov.t_start;
+    const px = this.pxPerSec;
+    let moved = false;
+    const onMove = (ev) => {
+      const dt = (ev.clientX - startX) / px;
+      if (Math.abs(dt) * px > 2) moved = true;
+      Editor.overlayMoveLive(id, Math.round((startT + dt) * 1000) / 1000);
+    };
+    const onUp = () => {
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onUp);
+      if (moved) Editor.commitOverlayEdit("Move overlay");
+      else this.renderOverlays(); // no-op drag: still worth a clean re-render (selection only)
+    };
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp);
+  },
+
+  _onOverlayEdgePointerDown(e) {
+    e.stopPropagation();
+    const edge = e.target;
+    const id = edge.dataset.ov;
+    const field = edge.dataset.edge; // "start" | "end"
+    const ov = (Editor.overlays || []).find((o) => o.id === id);
+    if (!ov) return;
+    Editor.selectOverlay(id);
+    const startX = e.clientX;
+    const px = this.pxPerSec;
+    const originAbs = field === "start" ? ov.t_start : ov.t_start + ov.duration;
+    const onMove = (ev) => {
+      const dt = (ev.clientX - startX) / px;
+      Editor.overlayTrimLive(id, field, Math.round((originAbs + dt) * 1000) / 1000);
+    };
+    const onUp = () => {
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onUp);
+      Editor.commitOverlayEdit(field === "start" ? "Trim overlay start" : "Trim overlay end");
+    };
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp);
   },
 
   /* ---------- render bar (spec v4 §3) ---------- */

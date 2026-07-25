@@ -18,7 +18,7 @@
     ["uploaded", "Uploaded"],
   ];
 
-  // Automatic processing_level values (cutroom/store.py processing_level)
+  // Automatic processing_level values (magic_video_editor/store.py processing_level)
   // -> display badge text + a css modifier class.
   const LEVEL_LABEL = {
     por_empezar: "Por empezar",

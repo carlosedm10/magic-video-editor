@@ -6,7 +6,7 @@
    so core.js never needs to know the editor's internals.
 
    Server contract: GET/PUT /api/projects/{pid}/edl, POST .../edl/reset,
-   POST .../edl/split (cutroom/api/edl.py). Each segment may carry a
+   POST .../edl/split (magic_video_editor/api/edl.py). Each segment may carry a
    `transition` {type: none|fade|crossfade, duration} — the transition INTO
    that segment (docs/PLATFORM-SPEC.md "Transitions (junction-level)"). */
 
@@ -36,13 +36,13 @@ function _setSaveState(text, isError) {
 }
 
 /* ---------- manifest hash (spec v4 §3 render bar / preview-match) ----------
-   Mirrors cutroom/pipeline/render.py's _preview_manifest: sha256 hex[:16] of
+   Mirrors magic_video_editor/pipeline/render.py's _preview_manifest: sha256 hex[:16] of
    json.dumps({edl, color, subtitles, audio_enhance}, sort_keys=True,
    default=str). Two things a generic JSON.stringify would get wrong here:
    (1) Python's default `json.dumps` separators are ", " and ": " (a space
    after each), NOT JSON.stringify's compact ",%":"; get this wrong and every
    hash mismatches even when the data is identical — verified byte-for-byte
-   against cutroom.pipeline.render._preview_manifest while building this.
+   against magic_video_editor.pipeline.render._preview_manifest while building this.
    (2) every numeric field in this payload that's declared Python `float`
    (edl start/end/transition.duration, all four color sliders) serializes
    with a trailing ".0" when integer-valued, vs plain ints for the one true
@@ -140,7 +140,235 @@ const Editor = {
     this._pushHistory("Opened project");
     this.dirty = false;
     _setSaveState("");
+    await this._loadOverlays();
     this._notify();
+  },
+
+  /* ---------- manual overlay track (spec v5.9b) ----------
+     project["overlays"] — a second timeline track for video-over-video/PiP,
+     STRICTLY MANUAL: only magic_video_editor/api/overlays.py's GET/PUT ever touch it
+     server-side (the AI pipeline never creates/edits overlay items), and on
+     the client only the methods below mutate `this.overlays` — timeline.js's
+     overlay track and overlaybox.js read/act through these, never touching
+     the array directly, mirroring how segments only ever change through
+     commit()/trim()/etc. above.
+
+     History is DELIBERATELY separate from the main EDL undo stack (spec:
+     "never through EDL history — separate small undo stack ok") — a smaller
+     20-entry stack (_ovHistory/_ovHistoryIndex) that only overlay edits push
+     to; Cmd+Z/redo for the main timeline never touches it and vice versa
+     (there's no shared keyboard binding for the overlay stack yet — future
+     UI can call undoOverlays()/redoOverlays() directly, e.g. from a chip in
+     overlaybox.js's floating controls).
+
+     Save is a debounced PUT of the WHOLE list (the endpoint replaces
+     project["overlays"] wholesale, no partial-update route) — same
+     _scheduleSave-style pattern as the EDL, just on its own timer so an
+     overlay edit never resets the EDL's 2s save countdown or vice versa. */
+  overlays: [],
+  overlaySelected: null,
+  _ovHistory: [],
+  _ovHistoryIndex: -1,
+  _ovSaveTimer: null,
+
+  async _loadOverlays() {
+    this.overlays = [];
+    this.overlaySelected = null;
+    this._ovHistory = [];
+    this._ovHistoryIndex = -1;
+    try {
+      const { overlays } = await api(`/projects/${this.pid}/overlays`);
+      this.overlays = (overlays || []).map((o) => ({ ...o }));
+    } catch (e) {
+      console.error("Failed to load overlays", e); // e.g. router not mounted yet server-side
+      this.overlays = [];
+    }
+    this._pushOverlayHistory("Loaded overlays");
+  },
+
+  overlayClipDuration(clipId) { return this.clipDuration(clipId); },
+
+  _clampOverlay(ov) {
+    const clipDur = this.clipDuration(ov.clip_id);
+    const cutDur = this.totalDuration();
+    ov.duration = Math.max(0.2, ov.duration);
+    if (Number.isFinite(clipDur)) {
+      ov.clip_in = Math.max(0, Math.min(ov.clip_in, Math.max(0, clipDur - 0.2)));
+      ov.duration = Math.min(ov.duration, Math.max(0.2, clipDur - ov.clip_in));
+    }
+    ov.t_start = Math.max(0, ov.t_start);
+    if (cutDur > 0) {
+      ov.t_start = Math.min(ov.t_start, Math.max(0, cutDur - ov.duration));
+      ov.duration = Math.min(ov.duration, Math.max(0.2, cutDur - ov.t_start));
+    }
+    ov.x = Math.max(0, Math.min(1, ov.x));
+    ov.y = Math.max(0, Math.min(1, ov.y));
+    ov.scale = Math.max(0.02, Math.min(1, ov.scale));
+    ov.opacity = Math.max(0, Math.min(1, ov.opacity));
+    return ov;
+  },
+
+  /* Adds a full-clip overlay dropped from the media bin at timeline second
+     `tStart` (spec: "created by dragging a clip from the media bin onto the
+     overlay track"). Client-generated id (non-empty) survives the PUT
+     round-trip unchanged (overlays.py only mints a server id when the
+     client sent none), so selection stays stable through the debounced save. */
+  insertOverlay(clipId, tStart) {
+    const clip = this.clip(clipId);
+    const dur = clip?.info?.duration;
+    if (!dur || dur <= 0) return null;
+    const cutDur = this.totalDuration();
+    let duration = Math.min(3, dur);
+    let t = Math.max(0, tStart);
+    if (cutDur > 0) {
+      t = Math.min(t, Math.max(0, cutDur - duration));
+      duration = Math.min(duration, Math.max(0.2, cutDur - t));
+    }
+    const id = `ov${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
+    const ov = {
+      id, clip_id: clipId, t_start: Math.round(t * 100) / 100,
+      duration: Math.round(duration * 100) / 100, clip_in: 0,
+      x: 0.35, y: 0.35, scale: 0.3, opacity: 1,
+    };
+    const list = [...this.overlays.map((o) => ({ ...o })), ov];
+    this.overlaySelected = id;
+    this.commitOverlays(list, { label: `Add overlay ${clip?.filename || clipId}` });
+    return id;
+  },
+
+  deleteOverlay(id) {
+    const list = this.overlays.filter((o) => o.id !== id).map((o) => ({ ...o }));
+    if (this.overlaySelected === id) this.overlaySelected = null;
+    this.commitOverlays(list, { label: "Delete overlay" });
+  },
+
+  selectOverlay(id) { this.overlaySelected = id; this._notifyOverlaySelection(); },
+  deselectOverlay() { this.overlaySelected = null; this._notifyOverlaySelection(); },
+
+  /* ---------- live-drag updates (no history push / no save — mirrors
+     timeline.js's _previewSegments pattern for edge/block drags): the
+     dragging module (timeline.js overlay track, overlaybox.js) calls these
+     on every pointermove for immediate visual feedback, then calls
+     commitOverlayEdit() once on pointerup to snapshot+push history+save. ---------- */
+  overlayMoveLive(id, tStart) {
+    const ov = this.overlays.find((o) => o.id === id);
+    if (!ov) return;
+    ov.t_start = Math.max(0, tStart);
+    const cutDur = this.totalDuration();
+    if (cutDur > 0) ov.t_start = Math.min(ov.t_start, Math.max(0, cutDur - ov.duration));
+    this._notifyOverlays();
+  },
+  /* edge: "start" trims the IN point (t_start & clip_in move together,
+     duration shrinks/grows inversely, the overlay's END stays put); "end"
+     only changes duration. `absTime` is the proposed new absolute timeline
+     second for that edge (new t_start for "start", new t_start+duration for
+     "end") — same convention timeline.js already uses for EDL edge drags. */
+  overlayTrimLive(id, edge, absTime) {
+    const ov = this.overlays.find((o) => o.id === id);
+    if (!ov) return;
+    if (edge === "start") {
+      let dt = absTime - ov.t_start;
+      dt = Math.min(dt, ov.duration - 0.2);
+      dt = Math.max(dt, -ov.t_start, -ov.clip_in);
+      ov.t_start += dt; ov.clip_in += dt; ov.duration -= dt;
+    } else {
+      let newDuration = Math.max(0.2, absTime - ov.t_start);
+      const clipDur = this.clipDuration(ov.clip_id);
+      if (Number.isFinite(clipDur)) newDuration = Math.min(newDuration, Math.max(0.2, clipDur - ov.clip_in));
+      const cutDur = this.totalDuration();
+      if (cutDur > 0) newDuration = Math.min(newDuration, Math.max(0.2, cutDur - ov.t_start));
+      ov.duration = newDuration;
+    }
+    this._notifyOverlays();
+  },
+  /* Player-stage bounding box (overlaybox.js): move = x/y, corners = scale
+     (+the anchor-corner x/y shift that comes with resizing from a corner). */
+  overlayTransformLive(id, patch) {
+    const ov = this.overlays.find((o) => o.id === id);
+    if (!ov) return;
+    Object.assign(ov, patch);
+    ov.x = Math.max(0, Math.min(1, ov.x));
+    ov.y = Math.max(0, Math.min(1, ov.y));
+    ov.scale = Math.max(0.02, Math.min(1, ov.scale));
+    this._notifyOverlays();
+  },
+  overlayOpacity(id, value) {
+    const list = this.overlays.map((o) => ({ ...o }));
+    const ov = list.find((o) => o.id === id);
+    if (!ov) return;
+    ov.opacity = Math.max(0, Math.min(1, value));
+    this.commitOverlays(list, { label: "Overlay opacity" });
+  },
+
+  /* Finalizes whatever a live-drag left in `this.overlays`: re-clamps every
+     field (belt-and-braces — the live methods above already clamp, but this
+     is also the entry point for anything that mutates the array directly),
+     pushes one history entry, and schedules the debounced save. */
+  commitOverlayEdit(label) {
+    this.overlays = this.overlays.map((o) => this._clampOverlay({ ...o }));
+    this._pushOverlayHistory(label);
+    this._scheduleOverlaySave();
+    this._notifyOverlays();
+  },
+
+  commitOverlays(list, { label } = {}) {
+    this.overlays = list.map((o) => this._clampOverlay({ ...o }));
+    if (this.overlaySelected && !this.overlays.some((o) => o.id === this.overlaySelected)) this.overlaySelected = null;
+    this._pushOverlayHistory(label);
+    this._scheduleOverlaySave();
+    this._notifyOverlays();
+  },
+
+  _pushOverlayHistory(label) {
+    const idx = this._ovHistoryIndex ?? -1;
+    this._ovHistory = (this._ovHistory || []).slice(0, idx + 1);
+    this._ovHistory.push({ label: label || "Overlay edit", overlays: this.overlays.map((o) => ({ ...o })) });
+    if (this._ovHistory.length > 20) this._ovHistory.shift();
+    this._ovHistoryIndex = this._ovHistory.length - 1;
+  },
+  undoOverlays() {
+    if ((this._ovHistoryIndex ?? -1) <= 0) return;
+    this._ovHistoryIndex--;
+    this.overlays = (this._ovHistory[this._ovHistoryIndex].overlays || []).map((o) => ({ ...o }));
+    this._scheduleOverlaySave();
+    this._notifyOverlays();
+  },
+  redoOverlays() {
+    if (!this._ovHistory || this._ovHistoryIndex >= this._ovHistory.length - 1) return;
+    this._ovHistoryIndex++;
+    this.overlays = (this._ovHistory[this._ovHistoryIndex].overlays || []).map((o) => ({ ...o }));
+    this._scheduleOverlaySave();
+    this._notifyOverlays();
+  },
+
+  _scheduleOverlaySave() {
+    clearTimeout(this._ovSaveTimer);
+    this._ovSaveTimer = setTimeout(() => this.saveOverlays(), 600);
+  },
+  async saveOverlays() {
+    if (!this.pid) return;
+    clearTimeout(this._ovSaveTimer);
+    try {
+      const body = { overlays: this.overlays.map((o) => ({ ...o })) };
+      const res = await api(`/projects/${this.pid}/overlays`, { method: "PUT", body });
+      this.overlays = (res.overlays || []).map((o) => ({ ...o }));
+      this._notifyOverlays();
+    } catch (e) {
+      console.error("Overlay save failed", e); // fail-soft: local edits stay visible, just unsaved
+    }
+  },
+
+  _notifyOverlays() {
+    [
+      () => window.EditorUI.timeline?.renderOverlays?.(),
+      () => window.EditorUI.overlaybox?.render?.(),
+    ].forEach((fn) => { try { fn(); } catch (e) { console.error("EditorUI overlay render error", e); } });
+  },
+  _notifyOverlaySelection() {
+    [
+      () => window.EditorUI.timeline?.renderOverlaySelection?.(),
+      () => window.EditorUI.overlaybox?.render?.(),
+    ].forEach((fn) => { try { fn(); } catch (e) { console.error("EditorUI overlay selection error", e); } });
   },
 
   /* ---------- markers (spec v4 §4 — "M adds a marker") ----------
@@ -441,6 +669,12 @@ window.EditorUI.onProjectSelected = async function (project) {
   try { window.EditorUI.player?.mount(); } catch (e) { console.error(e); }
   try { window.EditorUI.timeline?.mount(); } catch (e) { console.error(e); }
   try { window.EditorUI.inspector?.mount(); } catch (e) { console.error(e); }
+  // Resizable panels (spec v5.9a) — idempotent (mount() no-ops after the
+  // first call), but harmless to call every time a project is (re)selected.
+  try { window.EditorUI.splitters?.mount(); } catch (e) { console.error(e); }
+  // Manual overlay track's player-stage bounding box (spec v5.9b).
+  try { window.EditorUI.overlaybox?.mount(); } catch (e) { console.error(e); }
+  try { _mountSpeakerSelect(project); } catch (e) { console.error(e); }
 };
 
 window.EditorUI.onProjectRefreshed = function (project) {
@@ -455,4 +689,54 @@ window.EditorUI.onProjectRefreshed = function (project) {
   // a completed preview_render job) — recheck render-bar + player-mode staleness.
   try { window.EditorUI.timeline?.refreshRenderBar?.(); } catch (e) { console.error(e); }
   try { window.EditorUI.player?.onProjectRefreshed?.(); } catch (e) { console.error(e); }
+  try { _mountSpeakerSelect(project); } catch (e) { console.error(e); }
 };
+
+/* ---------- "Locutores" speaker-count field (spec v5.8c UI) ----------
+   A small select in the media bin header (ui/editor/mediabin.js's
+   #media-bin .bin-head, owned by another agent this phase — same
+   fair-game DOM-injection pattern ui/editor/timeline.js already uses on
+   the timeline toolbar) PATCHing project.speaker_count via the endpoint
+   magic_video_editor/api/projects.py already exposes (1/2/3/4/"auto",
+   default 1). Wired once, then just kept in sync with the live project
+   value on every render (mediabin.js rebuilds #media-bin-list's innerHTML
+   on every render(), but NOT .bin-head itself, so the select survives). */
+function _mountSpeakerSelect(project) {
+  const head = document.querySelector("#media-bin .bin-head");
+  if (!head) return;
+  let sel = document.getElementById("speaker-count-select");
+  if (!sel) {
+    const wrap = document.createElement("label");
+    wrap.className = "row";
+    wrap.style.cssText = "gap:4px; font-size:12px;";
+    wrap.title = "How many distinct speakers to detect for subtitle diarization "
+      + "— a known count is far more reliable than auto-detecting it.";
+    const span = document.createElement("span");
+    span.className = "dim";
+    span.textContent = "Locutores";
+    sel = document.createElement("select");
+    sel.id = "speaker-count-select";
+    sel.innerHTML = ["1", "2", "3", "4", "auto"].map((v) =>
+      `<option value="${v}">${v === "auto" ? "Auto" : v}</option>`).join("");
+    sel.onchange = async () => {
+      const raw = sel.value;
+      const value = raw === "auto" ? "auto" : Number(raw);
+      try {
+        await api(`/projects/${state.pid}`, { method: "PATCH", body: { speaker_count: value } });
+        if (state.project) state.project.speaker_count = value;
+      } catch (e) {
+        alert(`Couldn't update speaker count: ${e.message}`);
+        sel.value = String(project.speaker_count ?? 1);
+      }
+    };
+    wrap.appendChild(span);
+    wrap.appendChild(sel);
+    // Sits just before the health/settings footer's usual spot — right after
+    // the group's add-file buttons, before the "grow" spacer would push
+    // things off; simplest correct placement is right at the end of the
+    // header row (bin-head is a flex .row, so it wraps under narrow bins).
+    head.appendChild(wrap);
+  }
+  const cur = project?.speaker_count ?? 1;
+  if (document.activeElement !== sel) sel.value = String(cur);
+}

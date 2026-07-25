@@ -1,18 +1,31 @@
-/* Reel Editor (spec v5): full takeover of the editor area when a reel is
-   opened for editing — fix framing (crop_x), extend/trim the cut beyond the
-   AI window (in_override/out_override), hand-edit subtitles (cue_overrides +
-   subtitle_style), restyle, re-render THAT reel.
+/* Reel Editor (spec v5 + v5.8a/v5.8b UI): full takeover of the editor area
+   when a reel is opened for editing — fix framing (crop_x), extend/trim the
+   cut beyond the AI window (in_override/out_override, now per-segment),
+   hand-edit subtitles (cue_overrides + subtitle_style), restyle, re-render
+   THAT reel, and (v5.8b) build/edit multi-segment "podcast case" reels.
 
    Entry point: ui/tabs/reels.js's "Edit" button calls window.ReelEditor.open(rid).
    "← Back to project" / Esc calls window.ReelEditor.close().
 
-   Server contract (cutroom/api/reels.py): PATCH /api/projects/{pid}/reels/{rid}
+   Server contract (magic_video_editor/api/reels.py): PATCH /api/projects/{pid}/reels/{rid}
    (in_override/out_override/crop_x/cue_overrides/subtitle_style/title/
-   description — all optional, partial), POST .../regenerate-copy, GET
-   .../cues (index-keyed, text already reflects cue_overrides, re-based so
-   0 == the effective window's start). Render itself reuses the existing
-   POST .../render (cutroom/api/pipeline.py), which enqueues through the
-   queue (state.queue, kept fresh by core.js's global poll).
+   description/segments/transitions — all optional, partial; `segments` and
+   `transitions` REPLACE the whole list wholesale — see that file's
+   SegmentInput/TransitionInput docstrings), POST .../regenerate-copy, GET
+   .../cues (GLOBAL index across every segment concatenated in order, text
+   already reflects cue_overrides, each cue carries a `segment` field).
+   Render itself reuses the existing POST .../render (magic_video_editor/api/pipeline.py),
+   which enqueues through the queue (state.queue, kept fresh by core.js's
+   global poll).
+
+   Multi-segment data model (spec v5.8b, magic_video_editor/pipeline/reels.py):
+   reel.segments = [{clip_id, start, end, in_override, out_override}], one
+   entry per segment (a pre-v5.8b single-window reel is migrated to a
+   1-segment list server-side on read); reel.transitions = junction
+   transitions between consecutive segments (len == segments.length - 1,
+   default {type:"crossfade", duration:0.4}). reel.composed is true for
+   reels the viral composer built from a combined pair (surfaced as a
+   "Compuesto" badge both here and on the Reels tab grid).
 
    Everything in this file is wrapped in one IIFE and exposes exactly one
    global (window.ReelEditor) so it can never collide with a top-level
@@ -33,21 +46,21 @@
 (function () {
   let _fontsCache = null; // GET /fonts is project-independent; fetch once per session
 
-  function _effectiveWindowFor(reel, clipDuration, dragPreview) {
+  function _effectiveWindowFor(reelLike, clipDuration, dragPreview) {
     if (dragPreview) return dragPreview;
     let duration = clipDuration;
-    if (!duration || duration <= 0) duration = Math.max(reel.end || 0, reel.out_override || 0) || 1;
-    let start = reel.in_override;
-    start = start == null ? reel.start : Number(start);
-    let end = reel.out_override;
-    end = end == null ? reel.end : Number(end);
+    if (!duration || duration <= 0) duration = Math.max(reelLike.end || 0, reelLike.out_override || 0) || 1;
+    let start = reelLike.in_override;
+    start = start == null ? reelLike.start : Number(start);
+    let end = reelLike.out_override;
+    end = end == null ? reelLike.end : Number(end);
     start = Math.max(0, Math.min(start, duration));
     end = Math.max(start + 0.05, Math.min(end, duration));
     return { start, end };
   }
 
   /* Defensive against a real backend data bug observed live against project
-     c7642fc7755e: cutroom/pipeline/reels.py does `list(copy.get("hashtags") or [])`
+     c7642fc7755e: magic_video_editor/pipeline/reels.py does `list(copy.get("hashtags") or [])`
      but copywriter.py's copy_for_reel returns "hashtags" as a space-joined
      STRING, not a list -- Python's list("#a #b") explodes it per-character.
      Not this file's bug to fix; just don't render 50+ one-letter pills. */
@@ -83,6 +96,7 @@
   const SUB_STYLES = [["clean", "Clean"], ["bold", "Bold"], ["karaoke", "Karaoke"]];
   const SUB_SIZES = [["S", "S"], ["M", "M"], ["L", "L"]];
   const SUB_POSITIONS = [["bottom", "Bottom"], ["center", "Center"]];
+  const TRANSITION_ORDER = ["none", "fade", "crossfade"];
 
   const ReelEditor = {
     pid: null,
@@ -92,10 +106,10 @@
     activeTab: "reel",
     playing: false,
     cues: [],
-    thumbs: { meta: null, stripUrl: null, failed: false },
-    _dragPreview: null,     // {start,end} while dragging a strip edge, else null
+    _activeSeg: 0,          // index of the segment currently loaded in #re-video
+    _segDragPreview: null,  // {idx, start, end} while dragging a segment edge, else null
+    _segThumbs: {},         // clip_id -> {meta, stripUrl, failed} (one entry per distinct clip used by any segment)
     _cropDragPreview: null, // 0..1 while dragging the framing window, else null
-    _pxPerSec: 1,
     _timers: {},
     _tickTimer: null,
     _wired: false,
@@ -124,7 +138,8 @@
       this.pid = state.pid;
       this.rid = rid;
       this.clip = (state.project.clips || []).find((c) => c.id === reel.clip_id) || null;
-      this._dragPreview = null;
+      this._activeSeg = 0;
+      this._segDragPreview = null;
       this._cropDragPreview = null;
       this._exportSig = null;
       this.playing = false;
@@ -147,6 +162,7 @@
       const sub = document.getElementById("re-heading-sub");
       if (sub) sub.textContent = this.clip?.filename || "(source clip not found)";
       this._setSaveState("");
+      this._closeAddPicker();
 
       this._layoutFrame();
       this._mountVideo();
@@ -209,26 +225,45 @@
         .re-tab:hover { color: var(--text); }
         .re-tab.active { color: var(--text); border-bottom-color: var(--accent-hover); font-weight: 600; }
         .re-tabpanels { flex: 1; overflow-y: auto; padding: 12px; }
-        .re-readonly-row { display: flex; gap: 14px; margin: 6px 0; font-size: 12px; color: var(--dim); }
+        .re-readonly-row { display: flex; align-items: center; gap: 14px; margin: 6px 0; font-size: 12px; color: var(--dim); }
         .re-readonly-row b { color: var(--text); }
 
         #re-timeline-pane { grid-area: timeline; display: flex; flex-direction: column; overflow: hidden;
           padding: 8px 12px 10px; }
-        #re-strip-wrap { flex: 1; min-height: 0; position: relative; overflow: hidden; border-radius: 8px;
+        #re-segments-wrap { flex: 1; min-height: 0; position: relative; overflow: visible; border-radius: 8px;
           background: var(--panel2); border: 1px solid var(--border); }
-        #re-strip-track { position: relative; height: 100%; }
-        .re-strip-film { position: absolute; inset: 0; opacity: .7; background-repeat: no-repeat; }
-        #re-ai-marker { position: absolute; top: 0; bottom: 0; border: 1px dashed rgba(154,163,178,.65);
-          background: rgba(154,163,178,.08); pointer-events: none; }
-        #re-window { position: absolute; top: 4px; bottom: 4px; border: 2px solid var(--accent-hover);
-          border-radius: 6px; background: rgba(194,32,48,.14); }
-        .re-edge { position: absolute; top: 0; bottom: 0; width: 12px; cursor: ew-resize; }
-        .re-edge-l { left: -5px; } .re-edge-r { right: -5px; }
-        .re-tl-inputs { flex-shrink: 0; padding-top: 8px; }
-        .re-tl-inputs input[type=number] { width: 80px; }
+        #re-segments-row { position: relative; height: 100%; display: flex; align-items: stretch; gap: 3px; padding: 0 2px; }
+        .re-seg { position: relative; min-width: 36px; height: 100%; margin: 4px 0; border-radius: 6px; overflow: hidden;
+          background: #05070d; border: 2px solid var(--accent-hover); cursor: pointer; box-sizing: border-box; }
+        .re-seg-film { position: absolute; inset: 0; opacity: .75; background-repeat: no-repeat; pointer-events: none; }
+        .re-seg-edge { position: absolute; top: 0; bottom: 0; width: 12px; cursor: ew-resize; z-index: 2; }
+        .re-seg-edge-l { left: -5px; } .re-seg-edge-r { right: -5px; }
+        .re-seg-del { position: absolute; top: 2px; right: 2px; z-index: 3; width: 16px; height: 16px; line-height: 14px;
+          text-align: center; border-radius: 999px; background: rgba(0,0,0,.6); color: #fff; font-size: 11px;
+          cursor: pointer; border: none; padding: 0; }
+        .re-seg-del:hover { background: var(--accent-hover); }
+        .re-seg-time { position: absolute; left: 4px; bottom: 2px; font-size: 10px; color: #fff;
+          background: rgba(0,0,0,.5); border-radius: 4px; padding: 1px 4px; z-index: 2; pointer-events: none;
+          white-space: nowrap; }
+        .re-junction-chip { flex-shrink: 0; align-self: center; font-size: 10px; padding: 3px 7px; border-radius: 999px;
+          background: var(--panel2); border: 1px solid var(--border); color: var(--dim); cursor: pointer;
+          white-space: nowrap; z-index: 2; }
+        .re-junction-chip.fade, .re-junction-chip.crossfade { color: var(--accent2); border-color: var(--accent2); }
+        #re-playhead { position: absolute; top: 0; bottom: 0; width: 2px; background: var(--accent-hover); z-index: 5;
+          pointer-events: none; box-shadow: 0 0 8px var(--accent-hover); }
+        .re-drag-tooltip { position: absolute; top: -18px; font-size: 10px; background: var(--accent-hover); color: #fff;
+          padding: 1px 5px; border-radius: 4px; white-space: nowrap; z-index: 6; pointer-events: none;
+          transform: translateX(-50%); }
+        .re-tl-footer { flex-shrink: 0; padding-top: 8px; display: flex; align-items: center; gap: 10px; }
+
+        #re-add-picker { flex-shrink: 0; margin-top: 8px; padding: 8px; border: 1px solid var(--border);
+          border-radius: 8px; background: var(--panel2); }
+        #re-add-strip-wrap { position: relative; height: 44px; border-radius: 6px; overflow: hidden;
+          background: #05070d; border: 1px solid var(--border); cursor: crosshair; }
+        #re-add-strip-film { position: absolute; inset: 0; opacity: .8; background-repeat: no-repeat; pointer-events: none; }
 
         #re-cue-list .field-row { align-items: center; }
-        #re-cue-list .field-row label { width: 56px; }
+        #re-cue-list .field-row label { width: 76px; flex-shrink: 0; }
         #re-cue-list .field-row input[type=text] { flex: 1; width: auto; }
       `;
       document.head.appendChild(style);
@@ -283,22 +318,24 @@
           </aside>
 
           <section id="re-timeline-pane" class="re-area">
-            <div class="dim" style="margin-bottom:6px">Drag the bright edges to trim — the dashed band is the
-              original AI cut; you can extend past it.</div>
-            <div id="re-strip-wrap">
-              <div id="re-strip-track">
-                <div id="re-strip-film" class="re-strip-film"></div>
-                <div id="re-ai-marker"></div>
-                <div id="re-window">
-                  <div class="re-edge re-edge-l" data-edge="start"></div>
-                  <div class="re-edge re-edge-r" data-edge="end"></div>
-                </div>
-              </div>
+            <div class="dim" style="margin-bottom:6px">Drag a segment's bright edges to trim (extends past its
+              AI window); click/drag a segment to seek; click a junction chip to cycle its transition.</div>
+            <div id="re-segments-wrap">
+              <div id="re-segments-row"></div>
+              <div id="re-playhead" hidden></div>
             </div>
-            <div class="re-tl-inputs row">
-              <label class="dim">In</label><input type="number" step="0.1" id="re-in-input">
-              <label class="dim">Out</label><input type="number" step="0.1" id="re-out-input">
-              <span class="dim" id="re-dur-label"></span>
+            <div class="re-tl-footer">
+              <button id="re-add-segment-btn" class="btn small"><i data-lucide="plus"></i> Add segment</button>
+              <span class="dim mono" id="re-total-dur"></span>
+            </div>
+            <div id="re-add-picker" hidden>
+              <div class="dim" style="margin-bottom:6px">Click a moment on the source clip to add a new segment there.</div>
+              <div id="re-add-strip-wrap">
+                <div id="re-add-strip-film"></div>
+              </div>
+              <div class="row" style="margin-top:6px">
+                <button id="re-add-cancel" class="btn small">Cancel</button>
+              </div>
             </div>
           </section>
         </div>`;
@@ -316,19 +353,20 @@
       if (play) play.onclick = () => this.togglePlay();
       document.getElementById("re-tabs")?.querySelectorAll("[data-re-tab]").forEach((b) =>
         b.onclick = () => this.switchTab(b.dataset.reTab));
-      const inInput = document.getElementById("re-in-input");
-      if (inInput) inInput.onchange = () => {
-        const { end } = this._effectiveWindow();
-        this._commitWindow(Number(inInput.value), end);
-      };
-      const outInput = document.getElementById("re-out-input");
-      if (outInput) outInput.onchange = () => {
-        const { start } = this._effectiveWindow();
-        this._commitWindow(start, Number(outInput.value));
-      };
-      this._wireStripDrag();
       this._wireFrameDrag();
-      window.addEventListener("resize", () => { if (this.isOpen) this._layoutFrame(); });
+      const addBtn = document.getElementById("re-add-segment-btn");
+      if (addBtn) addBtn.onclick = () => this._openAddPicker();
+      const cancelBtn = document.getElementById("re-add-cancel");
+      if (cancelBtn) cancelBtn.onclick = () => this._closeAddPicker();
+      const addStrip = document.getElementById("re-add-strip-wrap");
+      if (addStrip) addStrip.addEventListener("click", (e) => {
+        const rect = addStrip.getBoundingClientRect();
+        if (!rect.width) return;
+        const dur = this.clip?.info?.duration || 1;
+        const frac = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
+        this._addSegmentAt(frac * dur);
+      });
+      window.addEventListener("resize", () => { if (this.isOpen) { this._layoutFrame(); this._renderSegmentsRow(); } });
       // Capture phase, and BEFORE anything else: while the Reel Editor is a
       // full takeover, the main editor's timeline/player keydown handlers
       // (bound globally on `document`, bubble phase) must never fire — e.g.
@@ -347,6 +385,7 @@
       if (e.key === "Escape") {
         e.stopPropagation();
         e.preventDefault();
+        if (!document.getElementById("re-add-picker")?.hidden) { this._closeAddPicker(); return; }
         this.close();
         return;
       }
@@ -367,9 +406,37 @@
       return (state.project?.reels || []).find((r) => r.id === this.rid) || {};
     },
 
-    _effectiveWindow() {
-      const reel = this._reel();
-      return _effectiveWindowFor(reel, this.clip?.info?.duration, this._dragPreview);
+    _segments() {
+      return this._reel().segments || [];
+    },
+
+    _transitions() {
+      return this._reel().transitions || [];
+    },
+
+    _clipFor(clipId) {
+      return (state.project?.clips || []).find((c) => c.id === clipId) || null;
+    },
+
+    _segEffectiveWindow(idx) {
+      const seg = this._segments()[idx];
+      if (!seg) return { start: 0, end: 1 };
+      const clip = this._clipFor(seg.clip_id);
+      const duration = clip?.info?.duration;
+      const dragPreview = (this._segDragPreview && this._segDragPreview.idx === idx)
+        ? { start: this._segDragPreview.start, end: this._segDragPreview.end }
+        : null;
+      return _effectiveWindowFor(seg, duration, dragPreview);
+    },
+
+    _totalDuration() {
+      const segs = this._segments();
+      let total = 0;
+      for (let i = 0; i < segs.length; i++) {
+        const { start, end } = this._segEffectiveWindow(i);
+        total += Math.max(0, end - start);
+      }
+      return total;
     },
 
     _mergeReel(updated) {
@@ -403,6 +470,36 @@
     _debouncedPatch(key, fields, delay, afterSave) {
       clearTimeout(this._timers[key]);
       this._timers[key] = setTimeout(() => this._patch(fields, { afterSave }), delay);
+    },
+
+    /* ---------- segments/transitions PATCH plumbing (spec v5.8b) ---------- */
+
+    _commitSegments(segments, transitions, afterSave) {
+      const fields = { segments };
+      if (transitions) fields.transitions = transitions;
+      this._patch(fields, { afterSave });
+    },
+
+    // Structural edits (add/delete/edge-drag-release) commit immediately on
+    // gesture-end, same "optimistic local state during the gesture, one PATCH
+    // on release" pattern as the single-segment code this replaces — the
+    // spec's "debounced" only needs to cover rapid repeat clicks (e.g. the
+    // junction chip cycling quickly), handled via _timers below.
+    _debouncedCommitSegments(segments, transitions, delay, afterSave) {
+      clearTimeout(this._timers.segments);
+      this._timers.segments = setTimeout(() => this._commitSegments(segments, transitions, afterSave), delay);
+    },
+
+    _afterSegmentsChange() {
+      this._loadThumbs(); // covers any newly-referenced clip_id; ends in _renderSegmentsRow()
+      this._reloadCues().then(() => { if (this.activeTab === "subs") this._renderSubsTab(); });
+      if (this.activeTab === "reel") this._renderReelTab();
+      if (this._activeSeg >= this._segments().length) this._activeSeg = Math.max(0, this._segments().length - 1);
+      const v = document.getElementById("re-video");
+      if (v) {
+        const { start, end } = this._segEffectiveWindow(this._activeSeg);
+        if (v.currentTime < start || v.currentTime > end) { try { v.currentTime = start; } catch (_e) { /* ignore */ } }
+      }
     },
 
     /* ---------- framing (crop_x) ---------- */
@@ -494,41 +591,82 @@
       window.addEventListener("pointerup", onUp);
     },
 
-    /* ---------- playback (single clip, virtual window, loop) ---------- */
+    /* ---------- playback (virtual multi-segment EDL, loop) ---------- */
 
     _mountVideo() {
       const v = document.getElementById("re-video");
-      if (!v || !this.clip) return;
-      const src = `/api/projects/${this.pid}/media/preview/${this.clip.id}`;
+      if (!v) return;
+      v.ontimeupdate = () => this._onTimeUpdate();
+      v.onerror = () => console.error("Reel Editor video error", v.error);
+      this._activeSeg = 0;
+      if (this._segments().length) {
+        const { start } = this._segEffectiveWindow(0);
+        this._loadSegmentVideo(0, start, false);
+      }
+    },
+
+    // Swaps <video> src only when the target segment's clip differs from
+    // what's currently loaded (so consecutive same-clip segments don't
+    // reload/flash); otherwise just jumps currentTime. `resumePlaying`
+    // re-issues play() once metadata/seek settles, so playback continues
+    // seamlessly across a segment (and clip) boundary.
+    _loadSegmentVideo(idx, localTime, resumePlaying) {
+      const seg = this._segments()[idx];
+      const v = document.getElementById("re-video");
+      if (!seg || !v) return;
+      const src = `/api/projects/${this.pid}/media/preview/${seg.clip_id}`;
+      const doSeek = () => {
+        try { v.currentTime = localTime; } catch (_e) { /* not ready */ }
+        if (resumePlaying) v.play().catch(() => {});
+      };
       if (v.dataset.src !== src) {
         v.dataset.src = src;
         v.src = src;
-        v.onerror = () => console.error("Reel Editor video error", v.error);
-        v.onloadedmetadata = () => {
-          const { start } = this._effectiveWindow();
-          try { v.currentTime = start; } catch (_e) { /* not ready */ }
-        };
+        v.onloadedmetadata = doSeek;
+      } else {
+        doSeek();
       }
-      v.ontimeupdate = () => this._onTimeUpdate();
+    },
+
+    _seekTo(idx, localTime) {
+      const seg = this._segments()[idx];
+      if (!seg) return;
+      const wasPlaying = this.playing;
+      this._activeSeg = idx;
+      this._loadSegmentVideo(idx, localTime, wasPlaying);
+      this._renderPlayhead();
+      this._updateTimeDisplay();
     },
 
     _onTimeUpdate() {
       const v = document.getElementById("re-video");
       if (!v) return;
-      const { start, end } = this._effectiveWindow();
+      const segs = this._segments();
+      if (!segs.length) return;
+      const idx = this._activeSeg;
+      const { start, end } = this._segEffectiveWindow(idx);
       if (v.currentTime >= end - 0.05) {
-        try { v.currentTime = start; } catch (_e) { /* ignore */ }
-        if (!this.playing) v.pause();
+        const next = (idx + 1) % segs.length;
+        if (next !== idx) {
+          const wasPlaying = this.playing;
+          this._activeSeg = next;
+          const nextWin = this._segEffectiveWindow(next);
+          this._loadSegmentVideo(next, nextWin.start, wasPlaying);
+        } else {
+          try { v.currentTime = start; } catch (_e) { /* ignore */ }
+          if (!this.playing) v.pause();
+        }
       } else if (v.currentTime < start - 0.25) {
         try { v.currentTime = start; } catch (_e) { /* ignore */ }
       }
       this._updateTimeDisplay();
+      this._renderPlayhead();
     },
 
     play() {
       const v = document.getElementById("re-video");
-      if (!v) return;
-      const { start, end } = this._effectiveWindow();
+      if (!v || !this._segments().length) return;
+      const { start, end } = this._segEffectiveWindow(this._activeSeg);
       if (v.currentTime < start || v.currentTime >= end) { try { v.currentTime = start; } catch (_e) { /* ignore */ } }
       this.playing = true;
       v.play().catch(() => {});
@@ -548,89 +686,180 @@
       const el = document.getElementById("re-time");
       if (!el) return;
       const v = document.getElementById("re-video");
-      const { start, end } = this._effectiveWindow();
-      const local = Math.max(0, (v?.currentTime || 0) - start);
-      el.textContent = `${fmtT(local)} / ${fmtT(end - start)}`;
+      const idx = this._activeSeg;
+      const { start } = this._segEffectiveWindow(idx);
+      let elapsed = 0;
+      for (let i = 0; i < idx; i++) {
+        const w = this._segEffectiveWindow(i);
+        elapsed += Math.max(0, w.end - w.start);
+      }
+      elapsed += Math.max(0, (v?.currentTime || start) - start);
+      el.textContent = `${fmtT(elapsed)} / ${fmtT(this._totalDuration())}`;
     },
 
-    /* ---------- mini-timeline (single-segment, full clip strip) ---------- */
+    /* ---------- mini-timeline: segments row, playhead, junctions ---------- */
+
+    async _ensureSegThumbs(clipId) {
+      if (this._segThumbs[clipId]) return this._segThumbs[clipId];
+      const entry = { meta: null, stripUrl: null, failed: false };
+      this._segThumbs[clipId] = entry;
+      try {
+        entry.meta = await api(`/projects/${this.pid}/thumbs/${clipId}/meta`);
+        entry.stripUrl = `/api/projects/${this.pid}/thumbs/${clipId}/strip`;
+      } catch (_e) {
+        entry.failed = true; // 404 — no filmstrip generated yet; plain block is fine
+      }
+      return entry;
+    },
 
     async _loadThumbs() {
-      this.thumbs = { meta: null, stripUrl: null, failed: false };
-      if (this.clip) {
-        try {
-          this.thumbs.meta = await api(`/projects/${this.pid}/thumbs/${this.clip.id}/meta`);
-          this.thumbs.stripUrl = `/api/projects/${this.pid}/thumbs/${this.clip.id}/strip`;
-        } catch (_e) {
-          this.thumbs.failed = true; // 404 — no filmstrip generated yet; plain track is fine
-        }
-      }
-      this._renderStrip();
+      const ids = new Set();
+      if (this.clip) ids.add(this.clip.id);
+      this._segments().forEach((s) => ids.add(s.clip_id));
+      await Promise.all([...ids].map((id) => this._ensureSegThumbs(id)));
+      this._renderSegmentsRow();
+      if (!document.getElementById("re-add-picker")?.hidden) this._renderAddPickerStrip();
     },
 
-    _renderStrip() {
-      const wrap = document.getElementById("re-strip-wrap");
-      const track = document.getElementById("re-strip-track");
-      if (!wrap || !track) return;
-      const dur = this.clip?.info?.duration || 1;
-      const trackW = wrap.clientWidth || 600;
-      this._pxPerSec = trackW / dur;
-      track.style.width = `${trackW}px`;
+    _renderSegmentsRow() {
+      const row = document.getElementById("re-segments-row");
+      if (!row) return;
+      const segs = this._segments();
+      const transitions = this._transitions();
+      if (!segs.length) { row.innerHTML = ""; this._renderPlayhead(); return; }
 
-      const film = document.getElementById("re-strip-film");
-      if (film) {
-        if (this.thumbs.meta && this.thumbs.stripUrl) {
-          const bgW = Math.max(1, this.thumbs.meta.count * this.thumbs.meta.interval_s * this._pxPerSec);
-          film.style.backgroundImage = `url('${this.thumbs.stripUrl}')`;
-          film.style.backgroundRepeat = "no-repeat";
+      const parts = [];
+      segs.forEach((seg, i) => {
+        const { start, end } = this._segEffectiveWindow(i);
+        const dur = Math.max(0.1, end - start);
+        parts.push(`
+          <div class="re-seg${i === this._activeSeg ? " active-seg" : ""}" data-seg="${i}" style="flex:${dur} 0 0px">
+            <div class="re-seg-film" data-film="${i}"></div>
+            <div class="re-seg-time" data-time="${i}">${fmtT(dur)}</div>
+            ${segs.length > 1 ? `<button type="button" class="re-seg-del" data-del="${i}" title="Delete segment">✕</button>` : ""}
+            <div class="re-seg-edge re-seg-edge-l" data-seg-edge="${i}" data-edge="start"></div>
+            <div class="re-seg-edge re-seg-edge-r" data-seg-edge="${i}" data-edge="end"></div>
+          </div>`);
+        if (i < segs.length - 1) {
+          const t = transitions[i] || { type: "crossfade", duration: 0.4 };
+          parts.push(`<button type="button" class="re-junction-chip ${t.type}" data-junction="${i}"
+            title="Click to change transition">${t.type}</button>`);
+        }
+      });
+      row.innerHTML = parts.join("");
+
+      // second pass: measure each block's rendered width, then paint its
+      // filmstrip crop (bg-size/position depend on the actual px width,
+      // which only exists post-layout with flex-grow-by-duration blocks).
+      segs.forEach((seg, i) => {
+        const el = row.querySelector(`.re-seg[data-seg="${i}"]`);
+        const film = row.querySelector(`.re-seg-film[data-film="${i}"]`);
+        if (!el || !film) return;
+        const thumbs = this._segThumbs[seg.clip_id];
+        const { start, end } = this._segEffectiveWindow(i);
+        const dur = Math.max(0.1, end - start);
+        const blockW = el.clientWidth || 1;
+        if (thumbs?.meta && thumbs?.stripUrl) {
+          const pxPerSec = blockW / dur;
+          const bgW = Math.max(1, thumbs.meta.count * thumbs.meta.interval_s * pxPerSec);
+          film.style.backgroundImage = `url('${thumbs.stripUrl}')`;
           film.style.backgroundSize = `${bgW.toFixed(1)}px 100%`;
-          film.style.backgroundPosition = "0 0";
-          film.hidden = false;
+          film.style.backgroundPosition = `${(-start * pxPerSec).toFixed(1)}px 0`;
         } else {
-          film.hidden = true;
+          film.style.backgroundImage = "";
         }
-      }
+      });
 
-      const reel = this._reel();
-      const aiMarker = document.getElementById("re-ai-marker");
-      if (aiMarker) {
-        aiMarker.style.left = `${(reel.start || 0) * this._pxPerSec}px`;
-        aiMarker.style.width = `${Math.max(2, ((reel.end || 0) - (reel.start || 0)) * this._pxPerSec)}px`;
-      }
-      this._renderWindowRegion();
+      this._wireSegmentsRow();
+      this._renderPlayhead();
+      const totalEl = document.getElementById("re-total-dur");
+      if (totalEl) totalEl.textContent = `Total ${fmtT(this._totalDuration())}`;
+      refreshIcons();
     },
 
-    _renderWindowRegion() {
-      const win = document.getElementById("re-window");
-      if (!win) return;
-      const { start, end } = this._effectiveWindow();
-      const px = this._pxPerSec || 1;
-      win.style.left = `${start * px}px`;
-      win.style.width = `${Math.max(3, (end - start) * px)}px`;
-      const inInput = document.getElementById("re-in-input");
-      const outInput = document.getElementById("re-out-input");
-      if (inInput && document.activeElement !== inInput) inInput.value = start.toFixed(2);
-      if (outInput && document.activeElement !== outInput) outInput.value = end.toFixed(2);
-      const durLabel = document.getElementById("re-dur-label");
-      if (durLabel) durLabel.textContent = `Duration ${fmtT(end - start)}`;
-    },
-
-    _wireStripDrag() {
-      const win = document.getElementById("re-window");
-      if (!win) return;
-      win.querySelectorAll(".re-edge").forEach((edge) => {
-        edge.addEventListener("pointerdown", (e) => this._onEdgeDown(e, edge.dataset.edge));
+    _wireSegmentsRow() {
+      const row = document.getElementById("re-segments-row");
+      if (!row) return;
+      row.querySelectorAll(".re-seg-edge").forEach((edge) => {
+        edge.addEventListener("pointerdown", (e) => {
+          e.stopPropagation();
+          this._onSegEdgeDown(e, Number(edge.dataset.segEdge), edge.dataset.edge);
+        });
+      });
+      row.querySelectorAll(".re-seg-del").forEach((btn) => {
+        btn.onclick = (e) => { e.stopPropagation(); this._deleteSegment(Number(btn.dataset.del)); };
+      });
+      row.querySelectorAll(".re-junction-chip").forEach((chip) => {
+        chip.onclick = (e) => { e.stopPropagation(); this._cycleTransition(Number(chip.dataset.junction)); };
+      });
+      row.querySelectorAll(".re-seg").forEach((el) => {
+        el.addEventListener("pointerdown", (e) => {
+          if (e.target.closest(".re-seg-edge") || e.target.closest(".re-seg-del")) return;
+          this._onSegBackgroundDown(e, el, Number(el.dataset.seg));
+        });
       });
     },
 
-    _onEdgeDown(e, field) {
-      e.stopPropagation();
+    // Click/drag on a segment's own filmstrip = seek within it (spec
+    // v5.8a: "click/drag on the strip seeks").
+    _onSegBackgroundDown(e, el, idx) {
+      const rect = el.getBoundingClientRect();
+      if (!rect.width) return;
+      const seek = (clientX) => {
+        const frac = Math.max(0, Math.min(1, (clientX - rect.left) / rect.width));
+        const { start, end } = this._segEffectiveWindow(idx);
+        this._seekTo(idx, start + frac * (end - start));
+      };
+      seek(e.clientX);
+      const onMove = (ev) => seek(ev.clientX);
+      const onUp = () => {
+        window.removeEventListener("pointermove", onMove);
+        window.removeEventListener("pointerup", onUp);
+      };
+      window.addEventListener("pointermove", onMove);
+      window.addEventListener("pointerup", onUp);
+    },
+
+    _ensureDragTooltip() {
+      let tip = document.getElementById("re-drag-tooltip");
+      if (!tip) {
+        tip = document.createElement("div");
+        tip.id = "re-drag-tooltip";
+        tip.className = "re-drag-tooltip";
+        tip.hidden = true;
+        document.getElementById("re-segments-wrap")?.appendChild(tip);
+      }
+      return tip;
+    },
+
+    _showDragTooltip(tip, timeValue, field, el) {
+      const wrap = document.getElementById("re-segments-wrap");
+      if (!tip || !wrap) return;
+      const wrapRect = wrap.getBoundingClientRect();
+      const elRect = el.getBoundingClientRect();
+      const x = field === "start" ? (elRect.left - wrapRect.left) : (elRect.right - wrapRect.left);
+      tip.hidden = false;
+      tip.textContent = fmtT(timeValue);
+      tip.style.left = `${x}px`;
+    },
+
+    // Drag a segment's in/out handle (spec v5.8a: "in/out handles show
+    // timecodes while dragging"; extends past the segment's own AI window,
+    // same clamp/snap behavior the pre-v5.8b single-window strip used).
+    _onSegEdgeDown(e, idx, field) {
+      const seg = this._segments()[idx];
+      const el = document.querySelector(`.re-seg[data-seg="${idx}"]`);
+      if (!seg || !el) return;
+      const rect = el.getBoundingClientRect();
+      if (!rect.width) return;
+      const orig = this._segEffectiveWindow(idx);
+      const clip = this._clipFor(seg.clip_id);
+      const dur = clip?.info?.duration ?? Infinity;
       const startX = e.clientX;
-      const px = this._pxPerSec || 1;
-      const dur = this.clip?.info?.duration ?? Infinity;
-      const orig = this._effectiveWindow();
+      const pxPerSec = rect.width / Math.max(0.05, orig.end - orig.start);
+      const tip = this._ensureDragTooltip();
       const onMove = (ev) => {
-        const deltaSec = (ev.clientX - startX) / px;
+        const deltaSec = (ev.clientX - startX) / pxPerSec;
         let s = orig.start, en = orig.end;
         if (field === "start") {
           s = Math.round((orig.start + deltaSec) / 0.05) * 0.05;
@@ -639,47 +868,125 @@
           en = Math.round((orig.end + deltaSec) / 0.05) * 0.05;
           en = Math.max(s + 0.2, Math.min(en, dur));
         }
-        this._dragPreview = { start: s, end: en };
-        this._renderWindowRegion();
+        this._segDragPreview = { idx, start: s, end: en };
+        this._renderSegmentsRow();
+        this._showDragTooltip(tip, field === "start" ? s : en, field, document.querySelector(`.re-seg[data-seg="${idx}"]`) || el);
       };
       const onUp = () => {
         window.removeEventListener("pointermove", onMove);
         window.removeEventListener("pointerup", onUp);
-        const p = this._dragPreview;
-        this._dragPreview = null;
-        if (p) this._commitWindow(p.start, p.end);
-        else this._renderWindowRegion();
+        tip.hidden = true;
+        const p = this._segDragPreview;
+        if (p) this._commitSegmentWindow(p.idx, p.start, p.end);
       };
       window.addEventListener("pointermove", onMove);
       window.addEventListener("pointerup", onUp);
     },
 
-    _commitWindow(s, e) {
-      const dur = this.clip?.info?.duration ?? Infinity;
-      s = Math.max(0, Math.min(s, dur));
-      e = Math.max(s + 0.1, Math.min(e, dur));
+    _commitSegmentWindow(idx, s, en) {
+      const segs = this._segments().map((seg, i) => i === idx
+        ? { ...seg, in_override: Math.round(s * 1000) / 1000, out_override: Math.round(en * 1000) / 1000 }
+        : seg);
       // Kept as the optimistic value (not nulled) until the PATCH settles --
-      // _effectiveWindow() prefers _dragPreview when set, so the strip/inputs/
-      // video-loop bounds all keep reflecting the just-committed trim through
-      // the round-trip instead of snapping back to the stale server value
-      // (or staying snapped-back forever if the save fails).
-      this._dragPreview = { start: s, end: e };
-      this._renderWindowRegion();
-      this._patch(
-        { in_override: Math.round(s * 1000) / 1000, out_override: Math.round(e * 1000) / 1000 },
-        { afterSave: () => { this._dragPreview = null; this._afterWindowChange(); } },
-      );
+      // _segEffectiveWindow() prefers _segDragPreview when its idx matches,
+      // so the block/playhead/video-loop bounds keep reflecting the
+      // just-committed trim through the round-trip instead of snapping back.
+      this._commitSegments(segs, null, () => {
+        this._segDragPreview = null;
+        this._afterSegmentsChange();
+      });
     },
 
-    _afterWindowChange() {
-      this._renderWindowRegion();
-      if (this.activeTab === "reel") this._renderReelTab();
-      this._reloadCues().then(() => { if (this.activeTab === "subs") this._renderSubsTab(); });
+    _deleteSegment(idx) {
+      const segs = this._segments();
+      if (segs.length <= 1) return;
+      const newSegs = segs.filter((_, i) => i !== idx);
+      // Drop the junction attached to the removed segment: the one before it
+      // if it had a predecessor, else the one after (segment 0 has none before).
+      const trans = this._transitions();
+      const dropAt = idx > 0 ? idx - 1 : 0;
+      const newTrans = trans.filter((_, i) => i !== dropAt);
+      this._commitSegments(newSegs, newTrans, () => this._afterSegmentsChange());
+    },
+
+    _cycleTransition(junctionIdx) {
+      const trans = this._transitions().map((t) => ({ ...t }));
+      const cur = trans[junctionIdx] || { type: "crossfade", duration: 0.4 };
+      const next = TRANSITION_ORDER[(TRANSITION_ORDER.indexOf(cur.type) + 1) % TRANSITION_ORDER.length];
+      // TransitionInput.duration is `gt=0.0` regardless of type (the server
+      // zeroes it out internally for "none") -- always send a positive value.
+      trans[junctionIdx] = { type: next, duration: cur.duration && cur.duration > 0 ? cur.duration : 0.4 };
+      this._debouncedCommitSegments(this._segments(), trans, 250, () => this._renderSegmentsRow());
+    },
+
+    _renderPlayhead() {
+      const row = document.getElementById("re-segments-row");
+      const wrap = document.getElementById("re-segments-wrap");
+      const ph = document.getElementById("re-playhead");
+      if (!row || !wrap || !ph) return;
+      const idx = this._activeSeg;
+      const el = row.querySelector(`.re-seg[data-seg="${idx}"]`);
+      if (!el) { ph.hidden = true; return; }
       const v = document.getElementById("re-video");
-      if (v) {
-        const { start, end } = this._effectiveWindow();
-        if (v.currentTime < start || v.currentTime > end) { try { v.currentTime = start; } catch (_e) { /* ignore */ } }
+      const { start, end } = this._segEffectiveWindow(idx);
+      const dur = Math.max(0.05, end - start);
+      const frac = Math.max(0, Math.min(1, ((v?.currentTime || start) - start) / dur));
+      const wrapRect = wrap.getBoundingClientRect();
+      const elRect = el.getBoundingClientRect();
+      ph.hidden = false;
+      ph.style.left = `${(elRect.left - wrapRect.left) + frac * elRect.width}px`;
+    },
+
+    /* ---- Add segment: pick a moment from the reel's own source clip strip
+       (spec v5.8b: "'add segment' (pick any moment from the source clip
+       strip)") ---- */
+
+    _openAddPicker() {
+      if (!this.clip) { alert("Source clip not found — can't add a segment."); return; }
+      const picker = document.getElementById("re-add-picker");
+      if (!picker) return;
+      picker.hidden = false;
+      this._renderAddPickerStrip();
+    },
+
+    _closeAddPicker() {
+      const picker = document.getElementById("re-add-picker");
+      if (picker) picker.hidden = true;
+    },
+
+    _renderAddPickerStrip() {
+      const wrap = document.getElementById("re-add-strip-wrap");
+      const film = document.getElementById("re-add-strip-film");
+      if (!wrap || !film || !this.clip) return;
+      const dur = this.clip.info?.duration || 1;
+      const trackW = wrap.clientWidth || 600;
+      const pxPerSec = trackW / dur;
+      const thumbs = this._segThumbs[this.clip.id];
+      if (thumbs?.meta && thumbs?.stripUrl) {
+        const bgW = Math.max(1, thumbs.meta.count * thumbs.meta.interval_s * pxPerSec);
+        film.style.backgroundImage = `url('${thumbs.stripUrl}')`;
+        film.style.backgroundSize = `${bgW.toFixed(1)}px 100%`;
+        film.style.backgroundPosition = "0 0";
+      } else {
+        film.style.backgroundImage = "";
       }
+    },
+
+    _addSegmentAt(t) {
+      const dur = this.clip?.info?.duration || (t + 3);
+      const start = Math.max(0, Math.min(t, Math.max(0, dur - 0.2)));
+      const end = Math.min(dur, start + 3);
+      const newSeg = {
+        clip_id: this.clip.id,
+        start: Math.round(start * 1000) / 1000,
+        end: Math.round(end * 1000) / 1000,
+        in_override: null,
+        out_override: null,
+      };
+      const segs = [...this._segments(), newSeg];
+      const trans = [...this._transitions(), { type: "crossfade", duration: 0.4 }];
+      this._closeAddPicker();
+      this._commitSegments(segs, trans, () => this._afterSegmentsChange());
     },
 
     /* ---------- tabs ---------- */
@@ -696,13 +1003,14 @@
     },
 
     /* ---- Reel tab: title/description editable, hashtags + copy, regenerate,
-       in/out/duration/score readonly (spec v5: "title editable, score readonly") ---- */
+       segment count/duration/score readonly, "Compuesto" badge for composer-
+       combined reels (spec v5.8b) ---- */
 
     _renderReelTab() {
       const el = document.getElementById("re-panel-reel");
       if (!el) return;
       const reel = this._reel();
-      const { start, end } = this._effectiveWindow();
+      const segs = this._segments();
       el.innerHTML = `
         <div class="card">
           <b>Reel</b>
@@ -721,11 +1029,12 @@
             <button class="btn small" id="re-regen-btn"><i data-lucide="refresh-cw"></i> Regenerate copy</button>
           </div>
           <div class="re-readonly-row" style="margin-top:12px">
-            <span>In <b>${start.toFixed(2)}s</b></span>
-            <span>Out <b>${end.toFixed(2)}s</b></span>
-            <span>Duration <b>${fmtT(end - start)}</b></span>
+            <span>Segments <b>${segs.length}</b></span>
+            <span>Duration <b>${fmtT(this._totalDuration())}</b></span>
             <span>Score <b class="score">${reel.score ?? "—"}</b></span>
+            ${reel.composed ? '<span class="pill main">Compuesto</span>' : ""}
           </div>
+          ${reel.composed && reel.composer_why ? `<div class="dim" style="margin-top:6px">${esc(reel.composer_why)}</div>` : ""}
         </div>`;
 
       const titleInput = el.querySelector("#re-title-input");
@@ -828,7 +1137,7 @@
         </div>
         <div class="card">
           <b>Cues</b>
-          <div class="hint">Typo fixes for this reel's burned-in captions (times are relative to the trimmed window).</div>
+          <div class="hint">Typo fixes for this reel's burned-in captions (times are relative to each segment's trimmed window).</div>
           <div id="re-cue-list">${this._cueListHtml()}</div>
         </div>`;
 
@@ -850,9 +1159,10 @@
 
     _cueListHtml() {
       if (!this.cues.length) return '<div class="dim">No cues in this window yet.</div>';
+      const multi = this._segments().length > 1;
       return this.cues.map((c) => `
         <div class="field-row" data-cue="${c.index}">
-          <label class="mono">${fmtT(c.start)}</label>
+          <label class="mono">${multi ? `S${(c.segment ?? 0) + 1} · ` : ""}${fmtT(c.start)}</label>
           <input type="text" class="re-cue-input" data-idx="${c.index}" value="${esc(c.text)}">
         </div>`).join("");
     },
