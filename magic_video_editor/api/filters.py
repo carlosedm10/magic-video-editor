@@ -106,6 +106,11 @@ def preview_frame(
         clip = store.get_clip(project, clip_id)
     except KeyError:
         raise HTTPException(404, f"clip {clip_id} not found") from None
+    if not Path(clip["path"]).exists():
+        # Media referenced by the project is missing on disk (moved data
+        # dir, deleted file, ...) -- a clean 404 rather than letting ffmpeg
+        # fail on the bad input path and raise an uncaught FFmpegError (500).
+        raise HTTPException(404, "clip media file not found")
 
     if preset not in filters.PRESETS:
         raise HTTPException(400, f"unknown preset {preset!r}")

@@ -10,7 +10,13 @@ import sys
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse, HTMLResponse, Response, StreamingResponse
+from fastapi.responses import (
+    FileResponse,
+    HTMLResponse,
+    JSONResponse,
+    Response,
+    StreamingResponse,
+)
 from pydantic import BaseModel
 
 from . import __version__, config, ffmpeg_utils, llm, ollama_manager, store, updater
@@ -46,6 +52,31 @@ app.include_router(thumbs.router)
 app.include_router(reels.router)
 app.include_router(overlays.router)
 app.include_router(updater_api.router)
+
+
+# ---------- error handling ----------
+#
+# Belt-and-suspenders: most api/*.py endpoints already catch
+# store.ProjectNotFound (as `except FileNotFoundError`, its parent class)
+# themselves and raise a clean HTTPException(404). These handlers are the
+# safety net for the ones that don't (e.g. api/pipeline.py's queue
+# endpoints, api/projects.py's clip/sentence/order mutations) so a deleted
+# -- or, pre-migration-fix, a merely-mis-pathed -- project id never surfaces
+# as a raw 500 traceback. Registered for both the specific ProjectNotFound
+# (clear "project not found" message) and plain FileNotFoundError (e.g. a
+# media file referenced by a project that's gone missing on disk) so
+# whichever one an endpoint's code path actually raises still comes back as
+# JSON, not a stack trace.
+
+
+@app.exception_handler(store.ProjectNotFound)
+async def project_not_found_handler(_request: Request, exc: store.ProjectNotFound) -> JSONResponse:
+    return JSONResponse(status_code=404, content={"detail": "project not found"})
+
+
+@app.exception_handler(FileNotFoundError)
+async def file_not_found_handler(_request: Request, exc: FileNotFoundError) -> JSONResponse:
+    return JSONResponse(status_code=404, content={"detail": "not found"})
 
 
 # ---------- UI ----------
@@ -145,7 +176,11 @@ def _stream(path: Path, request: Request):
 @app.get("/api/projects/{pid}/media/clip/{cid}")
 def media_clip(pid: str, cid: str, request: Request):
     project = store.load(pid)
-    return _stream(Path(store.get_clip(project, cid)["path"]), request)
+    try:
+        clip = store.get_clip(project, cid)
+    except KeyError:
+        raise HTTPException(404) from None
+    return _stream(Path(clip["path"]), request)
 
 
 @app.get("/api/projects/{pid}/media/preview/{cid}")
@@ -154,7 +189,10 @@ def media_preview(pid: str, cid: str, request: Request):
     (HEVC/10-bit/4K sources Chrome can't decode — see docs/PLATFORM-SPEC.md),
     else the original file (already browser-playable)."""
     project = store.load(pid)
-    clip = store.get_clip(project, cid)
+    try:
+        clip = store.get_clip(project, cid)
+    except KeyError:
+        raise HTTPException(404) from None
     path = clip.get("proxy") or clip["path"]
     return _stream(Path(path), request)
 

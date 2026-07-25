@@ -3,6 +3,7 @@
 (wavs, renders, reels)."""
 
 import json
+import logging
 import threading
 import time
 import uuid
@@ -10,7 +11,24 @@ from pathlib import Path
 
 from . import config
 
+logger = logging.getLogger(__name__)
+
 _lock = threading.Lock()
+
+# Guards against re-healing the same project id over and over on every
+# load() within a single process -- once a project has been checked (healed
+# or not, or already on the current data dir), never re-check it again.
+_healed_once: set[str] = set()
+
+
+class ProjectNotFound(FileNotFoundError):
+    """Raised by load() when `project_id` has no project.json on disk.
+    Subclasses FileNotFoundError on purpose: existing call sites written as
+    `except FileNotFoundError` (edl.py, subtitles.py, overlays.py,
+    suggestions.py, thumbs.py, reels.py, filters.py, ...) keep working
+    unchanged, while server.py additionally registers an exception handler
+    for this specific type so any call site that DIDN'T bother catching it
+    still gets a clean 404 instead of a raw 500 traceback."""
 
 
 def _pdir(project_id: str) -> Path:
@@ -19,6 +37,61 @@ def _pdir(project_id: str) -> Path:
 
 def _pfile(project_id: str) -> Path:
     return _pdir(project_id) / "project.json"
+
+
+def _any_path_exists(obj) -> bool:
+    """True if any string value under `obj` (recursively, through dicts and
+    lists) is a filesystem path that currently exists. Used by the self-heal
+    below to make sure we only rewrite legacy paths when the *rewritten*
+    path is actually reachable -- never blindly rewrite into nothing."""
+    if isinstance(obj, str):
+        return len(obj) > 1 and Path(obj).exists()
+    if isinstance(obj, dict):
+        return any(_any_path_exists(v) for v in obj.values())
+    if isinstance(obj, list):
+        return any(_any_path_exists(v) for v in obj)
+    return False
+
+
+def _self_heal_legacy_paths(project: dict, project_id: str) -> dict:
+    """v5.13 migration follow-up: heals any project whose project.json still
+    contains absolute paths under the hardcoded legacy `~/CutRoom` default
+    (config._OLD_DEFAULT_DATA_DIR) even though the equivalent file now
+    exists under the *current* data dir (config.DATA_DIR) -- i.e. someone
+    who already went through a bad migration (moved the directory without
+    migrate_data_dir()'s path rewrite, or hand-moved it before that existed).
+    Rewrites + saves once, and only when the rewritten path actually
+    resolves on disk (never "heals" into paths that don't exist either).
+    Guarded by _healed_once so this only ever touches disk once per project
+    id per process, not on every single load()."""
+    if project_id in _healed_once:
+        return project
+    _healed_once.add(project_id)
+
+    old_prefix = str(config._OLD_DEFAULT_DATA_DIR)
+    new_prefix = str(config.DATA_DIR)
+    if old_prefix == new_prefix:
+        return project
+
+    text = json.dumps(project)
+    if old_prefix not in text:
+        return project
+
+    healed = json.loads(text.replace(old_prefix, new_prefix))
+    if not _any_path_exists(healed):
+        # Rewriting wouldn't actually point anywhere real either -- leave
+        # the project untouched (and un-erroring) rather than "healing"
+        # it into a still-broken state.
+        return project
+
+    logger.warning(
+        "Self-healing stale legacy paths (%s -> %s) in project %s",
+        old_prefix,
+        new_prefix,
+        project_id,
+    )
+    save(healed, preserve_queue=False)
+    return healed
 
 
 def new_project(name: str) -> dict:
@@ -83,7 +156,11 @@ def save(project: dict, *, preserve_queue: bool = True) -> None:
 
 
 def load(project_id: str) -> dict:
-    return json.loads(_pfile(project_id).read_text())
+    try:
+        project = json.loads(_pfile(project_id).read_text())
+    except FileNotFoundError:
+        raise ProjectNotFound(project_id) from None
+    return _self_heal_legacy_paths(project, project_id)
 
 
 def processing_level(project: dict) -> str:

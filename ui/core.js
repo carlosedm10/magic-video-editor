@@ -33,6 +33,63 @@ const api = async (path, opts = {}) => {
   }
   return res.json();
 };
+
+/* ---------- stale-project recovery ----------
+   A project can vanish out from under an open tab (deleted in another tab,
+   or -- the bug this guards against -- a stale persisted selection from a
+   previous session whose project.json is simply gone). Every project-scoped
+   endpoint 404s at that point; without this, a browser left on that project
+   just polls /queue every 2s forever against a dead id. selectProject()
+   remembers the current pid in localStorage so a reload can restore it;
+   the very same key is what gets cleared here once we've confirmed the
+   project is actually gone. */
+
+const LAST_PROJECT_KEY = "mve_last_project_id";
+
+function getPersistedProjectId() {
+  try { return localStorage.getItem(LAST_PROJECT_KEY); } catch (_e) { return null; }
+}
+
+function setPersistedProjectId(pid) {
+  try {
+    if (pid) localStorage.setItem(LAST_PROJECT_KEY, pid);
+    else localStorage.removeItem(LAST_PROJECT_KEY);
+  } catch (_e) { /* private browsing / storage disabled -- non-fatal */ }
+}
+
+function showToast(msg) {
+  const el = document.createElement("div");
+  el.className = "mve-toast";
+  el.textContent = msg;
+  Object.assign(el.style, {
+    position: "fixed", bottom: "24px", left: "50%", transform: "translateX(-50%)",
+    background: "var(--panel, #222)", color: "var(--text, #fff)",
+    padding: "10px 18px", borderRadius: "8px", fontSize: "13px",
+    boxShadow: "0 4px 16px rgba(0,0,0,.3)", zIndex: 9999,
+    opacity: "0", transition: "opacity .2s ease",
+  });
+  document.body.appendChild(el);
+  requestAnimationFrame(() => { el.style.opacity = "1"; });
+  setTimeout(() => {
+    el.style.opacity = "0";
+    setTimeout(() => el.remove(), 300);
+  }, 3000);
+}
+
+// Guards against handling the same project's disappearance twice (e.g. a
+// refreshProject() 404 and a pollQueue() 404 landing back to back).
+let _handlingProjectGone = false;
+
+function handleProjectGone(pid) {
+  if (_handlingProjectGone || state.pid !== pid) return;
+  _handlingProjectGone = true;
+  console.warn(`Project ${pid} no longer exists -- returning to Home.`);
+  if (getPersistedProjectId() === pid) setPersistedProjectId(null);
+  state.watching.clear();
+  goHome();
+  showToast("Project no longer exists");
+  _handlingProjectGone = false;
+}
 const esc = (s) => (s || "").replace(/[&<>"]/g, (c) =>
   ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
 
@@ -99,6 +156,8 @@ async function selectProject(pid) {
   state.pid = pid;
   state.runAllJob = null;
   state.queue = [];
+  state._queuePoll404s = 0;
+  setPersistedProjectId(pid);
   await refreshProject();
   hideHome();
   $("#project-view").hidden = false;
@@ -143,6 +202,7 @@ function goHome() {
   state.project = null;
   state.tab = null;
   state.queue = [];
+  state._queuePoll404s = 0;
   state.runAllJob = null;
   state.runAllItem = null;
   closeDrawer();
@@ -158,7 +218,15 @@ function goHome() {
 async function refreshProject() {
   if (!state.pid) return;
   const prevId = state.project?.id;
-  state.project = await api(`/projects/${state.pid}`);
+  const pid = state.pid;
+  let project;
+  try {
+    project = await api(`/projects/${pid}`);
+  } catch (e) {
+    if (e.status === 404) { handleProjectGone(pid); return; }
+    throw e;
+  }
+  state.project = project;
   $("#p-name") && ($("#p-name").textContent = state.project.name);
   document.title = `${state.project.name} — Magic Video Editor`;
   renderStageBar();
@@ -289,12 +357,21 @@ function ensureQueuePolling() {
 
 async function pollQueue() {
   if (!state.pid) return;
+  const pid = state.pid;
   try {
-    const { queue } = await api(`/projects/${state.pid}/queue`);
+    const { queue } = await api(`/projects/${pid}/queue`);
     state.queue = queue;
-  } catch (_e) {
-    // Transient network hiccup -- keep the last known queue rather than
-    // flashing the badge/panel empty.
+    state._queuePoll404s = 0;
+  } catch (e) {
+    // A single 404 could be a transient blip (e.g. mid-delete race) -- only
+    // treat the project as gone once 3 polls in a row against the SAME pid
+    // 404, so we don't yank the user out of a project on one flaky response.
+    // Any other error (network hiccup, 5xx) just keeps the last known queue
+    // rather than flashing the badge/panel empty.
+    if (e.status === 404) {
+      state._queuePoll404s = (state._queuePoll404s || 0) + 1;
+      if (state._queuePoll404s >= 3) handleProjectGone(pid);
+    }
     return;
   }
   state.runAllItem = state.queue.find(
@@ -529,8 +606,17 @@ async function boot() {
 
   updateTopbarForProject();
   const list = await loadProjects();
-  if (list.length === 1) await selectProject(list[0].id);
-  else showHome();
+  const savedPid = getPersistedProjectId();
+  if (savedPid && list.some((p) => p.id === savedPid)) {
+    await selectProject(savedPid);
+  } else {
+    // Stale persisted selection whose project.json is already gone (the
+    // exact bug this guards against) -- drop it silently rather than
+    // leaving it around to be picked up (and 404 against) next boot.
+    if (savedPid) setPersistedProjectId(null);
+    if (list.length === 1) await selectProject(list[0].id);
+    else showHome();
+  }
   refreshIcons();
 
   initUpdateBanner();

@@ -1,5 +1,6 @@
 """Global configuration. Everything local, everything overridable via env."""
 
+import json
 import logging
 import os
 from pathlib import Path
@@ -39,17 +40,71 @@ def env_with_legacy_fallback(
     return default
 
 
+def rewrite_project_json_paths(projects_dir: Path, old_prefix: str, new_prefix: str) -> int:
+    """Walk `projects_dir`/*/project.json and rewrite every absolute path
+    string carrying `old_prefix` to `new_prefix`. Text-level string replace
+    (load as text, str.replace, validate, write back) rather than a
+    structural walk -- project.json has paths scattered all over the schema
+    (clip["path"], source_path, wav, proxy, thumbs.*, preview.path,
+    renders[].path, reels[].path, ...) and new ones get added over time;
+    a plain prefix replace on the raw text catches all of them without
+    hand-enumerating the schema. Validates the rewritten text parses as
+    JSON *before* writing anything -- a file that fails to validate is
+    skipped (and logged) rather than risking a corrupt project.json.
+    Each file is written atomically (tmp + os.replace). Returns the number
+    of files actually rewritten."""
+    if not projects_dir.exists():
+        return 0
+    rewritten = 0
+    for project_json in sorted(projects_dir.glob("*/project.json")):
+        try:
+            text = project_json.read_text()
+        except OSError as e:
+            logger.error("Could not read %s for path migration: %s", project_json, e)
+            continue
+        if old_prefix not in text:
+            continue
+        new_text = text.replace(old_prefix, new_prefix)
+        try:
+            json.loads(new_text)
+        except json.JSONDecodeError as e:
+            logger.error(
+                "Skipped path rewrite for %s: result failed to parse as JSON (%s)",
+                project_json,
+                e,
+            )
+            continue
+        tmp = project_json.with_suffix(".tmp")
+        tmp.write_text(new_text)
+        tmp.replace(project_json)
+        rewritten += 1
+    return rewritten
+
+
 def migrate_data_dir(old: Path, new: Path) -> bool:
     """Move `old` to `new` if `old` exists and `new` does not (same-volume
-    rename, so it's fast and atomic). Pure function taking explicit paths --
-    unit-test THIS with tmp dirs; never call it against real default paths in
-    tests. Returns True if a migration happened."""
+    rename, so it's fast and atomic), then rewrite any absolute paths
+    stored INSIDE each projects/*/project.json that still point at `old`
+    (see rewrite_project_json_paths) -- otherwise every clip/wav/proxy/
+    render/reel path baked into project.json keeps pointing at the
+    now-gone `old` location and every read 500s with "No such file or
+    directory". Pure function taking explicit paths -- unit-test THIS with
+    tmp dirs; never call it against real default paths in tests. Returns
+    True if a migration happened."""
     old = Path(old)
     new = Path(new)
     if old.exists() and not new.exists():
         new.parent.mkdir(parents=True, exist_ok=True)
         os.rename(old, new)
         logger.warning("Migrated data directory: %s -> %s", old, new)
+        n = rewrite_project_json_paths(new / "projects", str(old), str(new))
+        if n:
+            logger.warning(
+                "Rewrote absolute paths in %d project.json file(s) after migration (%s -> %s)",
+                n,
+                old,
+                new,
+            )
         return True
     return False
 
