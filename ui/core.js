@@ -532,5 +532,86 @@ async function boot() {
   if (list.length === 1) await selectProject(list[0].id);
   else showHome();
   refreshIcons();
+
+  initUpdateBanner();
 }
 boot();
+
+/* ---------- Auto-update banner (spec v6 "Auto-update via GitHub Releases")
+   -- ADDITIVE ONLY, does not touch anything above. GET /api/update is
+   populated by a non-blocking background check the backend fires at
+   startup (magic_video_editor/updater.py), so it may not be `checked` yet
+   the instant boot() runs -- poll a few times, a few seconds apart, then
+   give up quietly. Dismissing hides the banner for the rest of this
+   session (sessionStorage) without asking the backend to forget the
+   update; reloading the app shows it again until it's actually installed. */
+
+let _updateStatus = null;
+
+async function initUpdateBanner() {
+  for (let attempt = 0; attempt < 6; attempt++) {
+    try {
+      _updateStatus = await api("/update");
+    } catch (_e) {
+      return; // best-effort chrome -- a network hiccup here must never surface
+    }
+    if (_updateStatus.checked) break;
+    await new Promise((r) => setTimeout(r, 3000));
+  }
+  renderUpdateBanner();
+
+  $("#update-banner-cta").onclick = installUpdate;
+  $("#update-banner-dismiss").onclick = () => {
+    sessionStorage.setItem("mve_update_dismissed", _updateStatus?.latest_version || "1");
+    $("#update-banner").hidden = true;
+  };
+}
+
+function renderUpdateBanner() {
+  const banner = $("#update-banner");
+  if (!banner || !_updateStatus?.available) return;
+  if (sessionStorage.getItem("mve_update_dismissed") === (_updateStatus.latest_version || "1")) return;
+  $("#update-banner-text").textContent =
+    `Nueva versión ${_updateStatus.latest_version} — Actualizar ahora`;
+  banner.hidden = false;
+  refreshIcons();
+}
+
+async function installUpdate() {
+  if (!confirm(
+    `Se descargará e instalará Magic Video Editor ${_updateStatus.latest_version}. ` +
+    "La app se cerrará y se reabrirá automáticamente. ¿Continuar?"
+  )) return;
+
+  const cta = $("#update-banner-cta");
+  const progress = $("#update-banner-progress");
+  cta.disabled = true;
+  progress.hidden = false;
+  progress.textContent = "0%";
+
+  let job;
+  try {
+    job = await api("/update/install", { method: "POST" });
+  } catch (e) {
+    cta.disabled = false;
+    progress.hidden = true;
+    alert(e.message); // e.g. dev-mode "git pull instead" -- see updater.py
+    return;
+  }
+
+  const poll = async () => {
+    let j;
+    try { j = await api(`/jobs/${job.job_id}`); }
+    catch (_e) { return; } // the app is likely exiting to relaunch -- expected
+    progress.textContent = `${Math.round((j.progress || 0) * 100)}%`;
+    if (j.status === "running") setTimeout(poll, 800);
+    else if (j.status === "error") {
+      cta.disabled = false;
+      progress.hidden = true;
+      alert(`Update failed: ${j.error}`);
+    }
+    // status "done": the process is about to os._exit() itself and the
+    // update helper relaunches a fresh instance -- nothing left to do here.
+  };
+  poll();
+}

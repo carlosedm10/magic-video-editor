@@ -1,0 +1,63 @@
+name: Release
+
+# Spec v6 "Release pipeline": on a version tag push, build the .app + .dmg
+# (+ sha256 sidecar) on a real macOS runner and attach them to the GitHub
+# Release that magic_video_editor/updater.py's non-blocking startup check
+# polls (GET /repos/<owner>/<repo>/releases/latest). Tag the release
+# "vX.Y.Z" to match magic_video_editor.__version__ -- the updater's semver
+# compare strips a leading "v".
+#
+# This workflow never touches an existing release and is never triggered by
+# anything but an explicit tag push -- it will NOT create a release as a
+# side effect of normal development.
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+
+      # Build-time only -- imageio-ffmpeg vendors the runtime binary the app
+      # actually uses; this is just for `make dist` if any tooling shells
+      # out to a system ffmpeg during the build.
+      - name: Install ffmpeg
+        run: brew install ffmpeg
+
+      - name: uv sync
+        run: uv sync --group dev
+
+      - name: make dist (PyInstaller .app + .dmg + sha256)
+        run: make dist
+
+      - name: Verify expected dist artifacts exist
+        run: |
+          set -euo pipefail
+          test -d "dist/Magic Video Editor.app"
+          test -f "dist/Magic Video Editor.dmg"
+          test -f "dist/Magic Video Editor.dmg.sha256"
+          echo "sha256 sidecar: $(cat "dist/Magic Video Editor.dmg.sha256")"
+
+      - name: Attach assets to the GitHub Release for this tag
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/Magic Video Editor.dmg
+            dist/Magic Video Editor.dmg.sha256
+          # The tag push itself is the release trigger; create the release
+          # if it doesn't exist yet (draft off -- updater.py's "latest
+          # release" query only sees published, non-draft releases).
+          draft: false
+          generate_release_notes: true

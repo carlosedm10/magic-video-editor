@@ -72,6 +72,36 @@ Legacy `CUTROOM_LLM` / `CUTROOM_WHISPER` / `CUTROOM_DATA` (and `CUTROOM_HOST` /
 `CUTROOM_PORT` / `CUTROOM_FFMPEG`) are still honored as a fallback, with a
 one-time deprecation warning logged when used.
 
+## Releases & auto-update
+
+Packaged builds (`Magic Video Editor.app` / `.dmg`, built via `make dist`)
+check GitHub Releases for a newer version shortly after launch, in the
+background — this never blocks or slows down startup, and silently does
+nothing if GitHub is unreachable. When a newer version is published, a slim
+banner appears ("Nueva versión X.Y.Z — Actualizar ahora"). Clicking it:
+
+1. Downloads the new release's `.dmg` and its `.sha256` sidecar.
+2. Verifies the download's sha256 against the sidecar.
+3. Hands off to `packaging/update_helper.sh`, which waits for the app to
+   quit, copies the new `.app` over the current install, and relaunches it.
+
+Running from a source checkout (`uv run mve`) has no `.app` bundle to swap,
+so "Update now" refuses with a clear message telling you to `git pull`
+instead — it never tries to download/replace anything in dev mode.
+
+**Cutting a release** (maintainers): push a tag matching `vX.Y.Z` (matching
+`magic_video_editor.__version__`). `.github/workflows/release.yml` builds the
+`.app` + `.dmg` + `.sha256` on a macOS runner (`make dist`) and attaches them
+to the GitHub Release for that tag — this is the only thing that creates a
+release; nothing runs on ordinary pushes/PRs.
+
+The whole scheme is unsigned (no Apple Developer ID yet), same as the `.dmg`
+itself (recipients need right-click→Open, or `xattr -d com.apple.quarantine`,
+the first time). **Sparkle** (signed, delta updates, no manual
+right-click→Open step) is the natural next step once code signing is in
+place; this GitHub-Releases-plus-sha256 scheme is the pragmatic bridge
+until then.
+
 ## Honest v1 limitations
 
 - Take scoring is heuristic (transcript + loudness); DNSMOS/NISQA neural speech

@@ -12,6 +12,19 @@
 <canvas id="fx"></canvas>
 <div id="app">
 
+  <!-- Auto-update banner (spec v6 "Auto-update via GitHub Releases"):
+       hidden until ui/core.js's checkForUpdate() finds a newer GitHub
+       release; slim, sits above everything else so it's visible whatever
+       view is open. -->
+  <div id="update-banner" class="update-banner" hidden>
+    <i data-lucide="sparkles"></i>
+    <span id="update-banner-text"></span>
+    <span class="grow"></span>
+    <span id="update-banner-progress" class="update-banner-progress" hidden></span>
+    <button id="update-banner-cta" class="btn small primary">Actualizar ahora</button>
+    <button id="update-banner-dismiss" class="icon-btn" title="Dismiss"><i data-lucide="x"></i></button>
+  </div>
+
   <header id="topbar">
     <button id="home-btn" class="icon-btn topbar-icon" title="Home"><i data-lucide="home"></i></button>
     <div class="brand">
@@ -201,6 +214,10 @@
      in core.js guards every call with `typeof window.HomeView !== "undefined"`
      so load order / in-flight builds never throw. -->
 <script src="/ui/home.js"></script>
+<!-- Native macOS menu bar dispatch (spec v6 addendum), loaded last so every
+     global it references (state, setTab, openSettings, Editor, EditorUI…)
+     is already defined. -->
+<script src="/ui/menubus.js"></script>
 <script src="/ui/fx.js"></script>
 </body>
 </html>

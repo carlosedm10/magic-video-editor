@@ -5,3 +5,10 @@ dist/
 build/
 .DS_Store
 uv.lock
+packaging/icon.iconset/
+packaging/icon_preview.png
+
+# Bundled Ollama runtime (packaging/fetch_ollama.sh) -- large binary + dylibs,
+# re-fetched per release build. Keep the upstream LICENSE committed.
+packaging/vendor/ollama/*
+!packaging/vendor/ollama/LICENSE

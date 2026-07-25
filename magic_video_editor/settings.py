@@ -53,6 +53,15 @@ DEFAULTS: dict = {
         "position": "bottom",
         "words_per_cue": 4,
     },
+    # v6 native-shell addendum: last-known pywebview window geometry, saved on
+    # resize/move and restored on next launch (magic_video_editor/app.py). null
+    # fields mean "no saved geometry yet" -- app.py falls back to its defaults.
+    "window": {
+        "width": None,
+        "height": None,
+        "x": None,
+        "y": None,
+    },
 }
 
 
@@ -85,6 +94,7 @@ def load() -> dict:
     merged["task_models"] = {**DEFAULTS["task_models"], **(data.get("task_models") or {})}
     merged["performance"] = {**DEFAULTS["performance"], **(data.get("performance") or {})}
     merged["subtitles"] = {**DEFAULTS["subtitles"], **(data.get("subtitles") or {})}
+    merged["window"] = {**DEFAULTS["window"], **(data.get("window") or {})}
     if not p.exists():
         save(merged)
     return merged

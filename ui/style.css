@@ -17,6 +17,18 @@ body { margin: 0; font: 14px/1.45 -apple-system, BlinkMacSystemFont, "SF Pro Tex
 #fx { position: fixed; inset: 0; width: 100vw; height: 100vh; pointer-events: none; z-index: 0; }
 #app { display: flex; flex-direction: column; height: 100vh; position: relative; z-index: 1; }
 
+/* Auto-update banner (spec v6) -- slim strip above the topbar, garnet
+   accent, same "glass card" language as the rest of the chrome. */
+.update-banner { display: flex; align-items: center; gap: 10px; padding: 8px 16px;
+  background: linear-gradient(90deg, var(--accent), var(--accent-hover));
+  color: #fff; font-size: 13px; flex-shrink: 0; }
+.update-banner i[data-lucide] { width: 15px; height: 15px; }
+.update-banner .btn.primary { background: #fff; color: var(--accent-hover); border-color: #fff; }
+.update-banner .btn.primary:hover { background: #f5f6fa; }
+.update-banner .icon-btn { color: #fff; }
+.update-banner .icon-btn:hover { color: #fff; border-color: rgba(255,255,255,.5); }
+.update-banner-progress { font-variant-numeric: tabular-nums; opacity: .9; }
+
 .row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
 .grow { flex: 1; }
 .dim { color: var(--dim); font-size: 12px; }

@@ -13,7 +13,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse, Response, StreamingResponse
 from pydantic import BaseModel
 
-from . import __version__, config, ffmpeg_utils, llm, store
+from . import __version__, config, ffmpeg_utils, llm, ollama_manager, store, updater
 from .api import (
     audio,
     edl,
@@ -28,6 +28,7 @@ from .api import (
     suggestions,
     thumbs,
 )
+from .api import updater as updater_api
 
 app = FastAPI(title="Magic Video Editor")
 UI_DIR = Path(__file__).parent.parent / "ui"
@@ -44,6 +45,7 @@ app.include_router(subtitles.router)
 app.include_router(thumbs.router)
 app.include_router(reels.router)
 app.include_router(overlays.router)
+app.include_router(updater_api.router)
 
 
 # ---------- UI ----------
@@ -74,6 +76,7 @@ def health():
         "by": "carlosedm10",
         "ffmpeg": shutil.which("ffmpeg") is not None,
         "ollama": llm.available(),
+        "ollama_mode": llm.mode(),
         "model": config.OLLAMA_MODEL,
         "whisper": config.WHISPER_MODEL,
         "data_dir": str(config.DATA_DIR),
@@ -172,6 +175,16 @@ def main():
     import uvicorn
 
     config.ensure_dirs()
+
+    # v6 packaging Option B: prefer a system Ollama already reachable at
+    # config.OLLAMA_URL; else spawn our bundled binary if one was vendored
+    # (packaging/fetch_ollama.sh). Bounded (<=30s); logs and continues in
+    # "unreachable" mode rather than blocking startup forever.
+    ollama_manager.ensure_ollama()
+
+    # v6 auto-update: non-blocking GitHub Releases check (never delays boot,
+    # fail-silent -- see magic_video_editor/updater.py).
+    updater.start_check_async()
 
     # Resource safety: no ffmpeg child must survive the server (spec:
     # "Resource safety" -- orphaned ffmpeg used to outlive Ctrl-C by ~2min).

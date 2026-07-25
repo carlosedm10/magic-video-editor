@@ -4,7 +4,7 @@ magic_video_editor/agents/ as pydantic_ai agents — they only ever return typed
 
 import httpx
 
-from . import config
+from . import config, ollama_manager
 
 
 def available() -> bool:
@@ -13,3 +13,12 @@ def available() -> bool:
         return True
     except Exception:
         return False
+
+
+def mode() -> str:
+    """Which Ollama is currently serving config.OLLAMA_URL: "system" (an
+    external Ollama the user already had running -- always preferred),
+    "bundled" (our packaged binary, spawned by
+    ollama_manager.ensure_ollama() at server startup), or "unreachable".
+    v6 packaging Option B (see ollama_manager.py)."""
+    return ollama_manager.current_mode()

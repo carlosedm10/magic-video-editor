@@ -59,6 +59,24 @@ uv-remove:
 uv-lock-regenerate:
 	uv lock --refresh
 
+# ----------------------------- Distribution ----------------------------- #
+.PHONY: dist dist-app dist-dmg dist-icon
+
+# make dist: builds "Magic Video Editor.app" (PyInstaller, one-dir) then
+# wraps it in a .dmg with a sha256 sidecar. Output: dist/
+dist:
+	make dist-app
+	make dist-dmg
+
+dist-icon:
+	uv run python packaging/make_icon.py
+
+dist-app:
+	uv run pyinstaller packaging/mve.spec --noconfirm --clean --distpath dist --workpath build
+
+dist-dmg:
+	bash packaging/make_dmg.sh
+
 # ----------------------------- Code Formatting ----------------------------- #
 .PHONY: lint-backend format-backend lint format
 
@@ -83,8 +101,8 @@ health:
 		|| echo "server not running — start it with: make server"
 
 smoke:
-	uv run python -c "import magic_video_editor.server, magic_video_editor.app, magic_video_editor.settings; \
-		from magic_video_editor.api import projects, pipeline, settings, audio, filters, edl, suggestions, reels as reels_api, subtitles as subtitles_api, thumbs, ollama, overlays; \
+	uv run python -c "import magic_video_editor.server, magic_video_editor.app, magic_video_editor.settings, magic_video_editor.updater; \
+		from magic_video_editor.api import projects, pipeline, settings, audio, filters, edl, suggestions, reels as reels_api, subtitles as subtitles_api, thumbs, ollama, overlays, updater as updater_api; \
 		from magic_video_editor.pipeline import ingest, sync, transcribe, takes, ordering, render, reels, faces, filters as pfilters, audio_enhance, review, copywriter, subtitles; \
 		from magic_video_editor.agents import agents; \
 		print('all modules import OK')"
