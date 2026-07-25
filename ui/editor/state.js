@@ -675,6 +675,7 @@ window.EditorUI.onProjectSelected = async function (project) {
   // Manual overlay track's player-stage bounding box (spec v5.9b).
   try { window.EditorUI.overlaybox?.mount(); } catch (e) { console.error(e); }
   try { _mountSpeakerSelect(project); } catch (e) { console.error(e); }
+  try { _mountLanguageSelect(project); } catch (e) { console.error(e); }
 };
 
 window.EditorUI.onProjectRefreshed = function (project) {
@@ -690,6 +691,7 @@ window.EditorUI.onProjectRefreshed = function (project) {
   try { window.EditorUI.timeline?.refreshRenderBar?.(); } catch (e) { console.error(e); }
   try { window.EditorUI.player?.onProjectRefreshed?.(); } catch (e) { console.error(e); }
   try { _mountSpeakerSelect(project); } catch (e) { console.error(e); }
+  try { _mountLanguageSelect(project); } catch (e) { console.error(e); }
 };
 
 /* ---------- "Locutores" speaker-count field (spec v5.8c UI) ----------
@@ -739,4 +741,61 @@ function _mountSpeakerSelect(project) {
   }
   const cur = project?.speaker_count ?? 1;
   if (document.activeElement !== sel) sel.value = String(cur);
+}
+
+/* ---------- "Idioma" per-project transcription-language override ----------
+   Field bug follow-up (2026-07-25): whisper's per-clip auto language
+   detection can misfire on one clip's first window and TRANSLATE instead of
+   transcribe (fluent Spanish audio -> fluent English text, not garbage).
+   Sits right next to "Locutores" in the same media-bin header, same
+   fair-game DOM-injection pattern -- PATCHes project.language_override via
+   magic_video_editor/api/projects.py (ProjectUpdate.language_override,
+   values shared with api/settings.py LANGUAGE_CODES). "auto" means "no
+   project override, fall back to the Settings-level default" (see
+   pipeline/transcribe.py _resolve_language). */
+const _LANGUAGE_OPTIONS = [
+  ["auto", "Auto"],
+  ["es", "Español"],
+  ["en", "English"],
+  ["fr", "Français"],
+  ["de", "Deutsch"],
+  ["it", "Italiano"],
+  ["pt", "Português"],
+  ["ca", "Català"],
+];
+
+function _mountLanguageSelect(project) {
+  const head = document.querySelector("#media-bin .bin-head");
+  if (!head) return;
+  let sel = document.getElementById("language-override-select");
+  if (!sel) {
+    const wrap = document.createElement("label");
+    wrap.className = "row";
+    wrap.style.cssText = "gap:4px; font-size:12px;";
+    wrap.title = "Fija el idioma de transcripción para este proyecto -- \"Auto\" detecta el "
+      + "idioma clip a clip (y se autocorrige si un clip discrepa de la mayoría); fijar un "
+      + "idioma se lo aplica a todos los clips y evita que uno se transcriba/traduzca al "
+      + "idioma equivocado.";
+    const span = document.createElement("span");
+    span.className = "dim";
+    span.textContent = "Idioma";
+    sel = document.createElement("select");
+    sel.id = "language-override-select";
+    sel.innerHTML = _LANGUAGE_OPTIONS.map(([v, label]) => `<option value="${v}">${label}</option>`).join("");
+    sel.onchange = async () => {
+      const value = sel.value;
+      try {
+        await api(`/projects/${state.pid}`, { method: "PATCH", body: { language_override: value } });
+        if (state.project) state.project.language_override = value;
+      } catch (e) {
+        alert(`Couldn't update language: ${e.message}`);
+        sel.value = project.language_override || "auto";
+      }
+    };
+    wrap.appendChild(span);
+    wrap.appendChild(sel);
+    head.appendChild(wrap);
+  }
+  const cur = project?.language_override || "auto";
+  if (document.activeElement !== sel) sel.value = cur;
 }

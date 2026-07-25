@@ -1,14 +1,16 @@
-/* Reel Editor (spec v5 + v5.8a/v5.8b UI): full takeover of the editor area
-   when a reel is opened for editing — fix framing (crop_x), extend/trim the
-   cut beyond the AI window (in_override/out_override, now per-segment),
-   hand-edit subtitles (cue_overrides + subtitle_style), restyle, re-render
-   THAT reel, and (v5.8b) build/edit multi-segment "podcast case" reels.
+/* Reel Editor (spec v5 + v5.8a/v5.8b UI, framing rebuilt for spec v7.11):
+   full takeover of the editor area when a reel is opened for editing — fix
+   framing (a {zoom, offset_x, offset_y} transform, directly manipulated ON
+   the 9:16 preview stage), extend/trim the cut beyond the AI window
+   (in_override/out_override, now per-segment), hand-edit subtitles
+   (cue_overrides + subtitle_style), restyle, re-render THAT reel, and
+   (v5.8b) build/edit multi-segment "podcast case" reels.
 
    Entry point: ui/tabs/reels.js's "Edit" button calls window.ReelEditor.open(rid).
    "← Back to project" / Esc calls window.ReelEditor.close().
 
    Server contract (magic_video_editor/api/reels.py): PATCH /api/projects/{pid}/reels/{rid}
-   (in_override/out_override/crop_x/cue_overrides/subtitle_style/title/
+   (in_override/out_override/transform/cue_overrides/subtitle_style/title/
    description/segments/transitions — all optional, partial; `segments` and
    `transitions` REPLACE the whole list wholesale — see that file's
    SegmentInput/TransitionInput docstrings), POST .../regenerate-copy, GET
@@ -17,6 +19,29 @@
    Render itself reuses the existing POST .../render (magic_video_editor/api/pipeline.py),
    which enqueues through the queue (state.queue, kept fresh by core.js's
    global poll).
+
+   Framing (spec v7.11 "Reel framing v2"): reel["transform"] =
+   {zoom: 0.5..3.0, offset_x: -1..1, offset_y: -1..1} REPLACES the old
+   {crop_x, fit_mode, fit_scale} trio -- zoom 1.0 is the classic full-height
+   9:16 crop (unchanged geometry); >1 punches in; <1 opens the crop window
+   wider than the frame, auto-revealing a blurred cover-fill background of
+   THAT SAME crop window (never the original 16:9 frame -- that was the bug
+   spec v7.11 fixes). The math (transform_crop_rect/transform_needs_blur) is
+   mirrored client-side below in `_transformCropRect`/`_transformNeedsBlur`
+   from magic_video_editor/pipeline/faces.py so the live CSS preview and the
+   server's ffmpeg filter agree pixel-for-pixel on the geometry (mod integer
+   rounding). GET /api/projects/{pid} does NOT run the server's read-time
+   migration (that only happens via ensure_segments, invoked by the
+   single-reel GET/PATCH/render/safety endpoints) -- so a reel this session
+   hasn't touched yet may still arrive with only the legacy fields and no
+   "transform" key; `_deriveTransformFromReel` mirrors that migration too
+   (see pipeline/reels.py's `_normalize_transform` for the source of truth).
+   No API exposes the actual face-detected crop center used at render time,
+   so the live preview assumes the same (0.5, 0.45) frame-relative fallback
+   `transform_crop_rect` uses when no face was found -- an approximation,
+   not pixel-identical to a reel whose face detection found an off-center
+   speaker, same spirit as the old fit_blur ghost-video preview this
+   replaces.
 
    Multi-segment data model (spec v5.8b, magic_video_editor/pipeline/reels.py):
    reel.segments = [{clip_id, start, end, in_override, out_override}], one
@@ -93,6 +118,76 @@
     }
   }
 
+  /* ---------- transform model (spec v7.11) — client mirror of
+     magic_video_editor/pipeline/faces.py's transform_crop_rect/
+     transform_needs_blur. See this file's top docstring for why a mirror
+     (rather than a server round-trip) is needed for a live preview. ---- */
+
+  const TRANSFORM_ZOOM_MIN = 0.5, TRANSFORM_ZOOM_MAX = 3.0;
+  const TRANSFORM_ASSUMED_CENTER = { x: 0.5, y: 0.45 }; // same fallback transform_crop_rect uses when no face was found
+
+  function _clampNum(v, lo, hi) { return Math.min(hi, Math.max(lo, v)); }
+
+  // (x, y, w, h) of the source-frame crop window in source pixels, plus
+  // roomX/roomY (how far the window can still pan) and cx/cy (the assumed
+  // center in source pixels) so callers can invert a dragged/zoomed pixel
+  // position back into an offset_x/offset_y fraction. Mirrors
+  // faces.transform_crop_rect bit-for-bit (see that function's docstring
+  // for the derivation) — out_w/out_h default to the reel render's fixed
+  // 1080x1920 (magic_video_editor/config.py's REEL_W/REEL_H), only the
+  // 9:16 ratio matters here, not the absolute pixel size.
+  function _transformCropRect(srcW, srcH, zoom, offsetX, offsetY, outW, outH) {
+    outW = outW || 1080; outH = outH || 1920;
+    const targetAr = outW / outH;
+    let baseH = srcH, baseW = Math.round(baseH * targetAr);
+    if (baseW > srcW) { baseW = srcW; baseH = Math.round(baseW / targetAr); }
+
+    const z = _clampNum(Number(zoom) || 1, TRANSFORM_ZOOM_MIN, TRANSFORM_ZOOM_MAX);
+    const cropW = _clampNum(Math.round(baseW / z), 2, srcW);
+    const cropH = _clampNum(Math.round(baseH / z), 2, srcH);
+
+    const cx = TRANSFORM_ASSUMED_CENTER.x * srcW, cy = TRANSFORM_ASSUMED_CENTER.y * srcH;
+    const ox = _clampNum(Number(offsetX) || 0, -1, 1), oy = _clampNum(Number(offsetY) || 0, -1, 1);
+    const roomX = Math.max(0, (srcW - cropW) / 2), roomY = Math.max(0, (srcH - cropH) / 2);
+
+    let x = cx - cropW / 2 + ox * roomX;
+    let y = cy - cropH / 2 + oy * roomY;
+    x = _clampNum(x, 0, srcW - cropW);
+    y = _clampNum(y, 0, srcH - cropH);
+    return { x, y, w: cropW, h: cropH, roomX, roomY, cx, cy };
+  }
+
+  // zoom < 1.0 (the "cover threshold", spec v7.11) opens the crop window
+  // wider than the 9:16 frame -> needs the blurred cover background. See
+  // faces.transform_needs_blur's docstring for why this compares the raw
+  // zoom rather than the rounded crop_w/crop_h ratio.
+  function _transformNeedsBlur(zoom) { return Number(zoom) < 1 - 1e-9; }
+
+  // Read-time migration mirror of pipeline/reels.py's `_normalize_transform`
+  // (spec v7.11 "migration on read") — needed because GET /api/projects/
+  // {pid} does not itself run that migration (see top docstring); once a
+  // reel HAS a "transform" key (after any PATCH/render/safety-check this
+  // session, or if it was created post-migration), that's used as-is,
+  // clamped, and the legacy fields are never consulted again — same
+  // idempotence guarantee the server-side function documents.
+  function _deriveTransformFromReel(reel) {
+    if (reel && reel.transform) {
+      const t = reel.transform;
+      return {
+        zoom: _clampNum(Number(t.zoom != null ? t.zoom : 1), TRANSFORM_ZOOM_MIN, TRANSFORM_ZOOM_MAX),
+        offset_x: _clampNum(Number(t.offset_x != null ? t.offset_x : 0), -1, 1),
+        offset_y: _clampNum(Number(t.offset_y != null ? t.offset_y : 0), -1, 1),
+      };
+    }
+    let offsetX = 0;
+    if (reel && reel.crop_x != null) offsetX = _clampNum((Number(reel.crop_x) - 0.5) * 2, -1, 1);
+    let zoom = 1.0;
+    if (reel && reel.fit_mode === "fit_blur") {
+      zoom = _clampNum(Number(reel.fit_scale) || 0.82, 0.6, 1.0);
+    }
+    return { zoom, offset_x: offsetX, offset_y: 0 };
+  }
+
   const SUB_STYLES = [["clean", "Clean"], ["bold", "Bold"], ["karaoke", "Karaoke"]];
   const SUB_SIZES = [["S", "S"], ["M", "M"], ["L", "L"]];
   const SUB_POSITIONS = [["bottom", "Bottom"], ["center", "Center"]];
@@ -109,7 +204,8 @@
     _activeSeg: 0,          // index of the segment currently loaded in #re-video
     _segDragPreview: null,  // {idx, start, end} while dragging a segment edge, else null
     _segThumbs: {},         // clip_id -> {meta, stripUrl, failed} (one entry per distinct clip used by any segment)
-    _cropDragPreview: null, // 0..1 while dragging the framing window, else null
+    _transformPreview: null, // {zoom, offset_x, offset_y} while dragging/zooming the preview stage, else null
+    _lastStageDown: null,   // {t, x, y} of the last stage pointerdown, for manual double-click detection
     _timers: {},
     _tickTimer: null,
     _wired: false,
@@ -140,7 +236,8 @@
       this.clip = (state.project.clips || []).find((c) => c.id === reel.clip_id) || null;
       this._activeSeg = 0;
       this._segDragPreview = null;
-      this._cropDragPreview = null;
+      this._transformPreview = null;
+      this._lastStageDown = null;
       this._exportSig = null;
       this.playing = false;
       this.activeTab = this.activeTab || "reel";
@@ -171,7 +268,7 @@
       this._loadSubsBase();
       this.switchTab(this.activeTab);
       this._startTick();
-      this._renderFitBlurLayer();
+      this._renderStage();
 
       try {
         if (typeof window.SafeZonesUI !== "undefined") {
@@ -183,7 +280,7 @@
             onSeek: (t) => this._seekToGlobalTime(t),
             onReelPatched: (updated) => {
               this._mergeReel(updated);
-              this._renderFitBlurLayer();
+              this._renderStage();
               if (this.activeTab === "reel") this._renderReelTab();
             },
           });
@@ -247,28 +344,40 @@
         #re-preview-pane { grid-area: preview; display: flex; flex-direction: column; }
         #re-frame-wrap { flex: 1; min-height: 0; display: flex; align-items: center; justify-content: center;
           padding: 16px; overflow: hidden; }
-        #re-frame { position: relative; background: #000; overflow: hidden; border-radius: 8px; cursor: ew-resize; }
-        #re-video { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; background: #000;
+        /* The preview STAGE (spec v7.11 "direct manipulation on the preview"):
+           always the 9:16 OUTPUT rect (never the source clip's own aspect —
+           that's the whole point, the transform pans/zooms a source window
+           around INSIDE this fixed-aspect box). Sized in px by _layoutFrame
+           (aspect-ratio alone can't flex-shrink reliably inside the grid).
+           touch-action: none lets us own pinch/wheel/drag without the
+           browser's default scroll/zoom stepping on it. */
+        #re-frame { position: relative; background: #000; overflow: hidden; border-radius: 8px;
+          cursor: grab; touch-action: none; }
+        #re-frame.re-panning { cursor: grabbing; }
+        /* This is also the element ui/editor/safezones-ui.js mounts its
+           mockup/hatch overlay + face-box debug layer into (window.
+           SafeZonesUI, "the crop-window host") — its rect must always equal
+           the true 9:16 output rect, which is exactly what #re-frame now is,
+           so this is a plain inset:0 child (no more independent sizing). */
+        #re-crop-window { position: absolute; inset: 0; overflow: hidden; }
+        /* Automatic blurred cover-fill background (spec v7.11) — shows
+           THIS SAME crop window scaled to cover the stage, not the original
+           16:9 frame (that was the pre-v7.11 bug). Hidden entirely above
+           the zoom=1.0 cover threshold (see _renderStage). */
+        #re-bg-layer { position: absolute; inset: 0; overflow: hidden; background: #000; }
+        #re-bg-video { position: absolute; left: 0; top: 0; transform-origin: 0 0; pointer-events: none;
+          filter: blur(22px) brightness(.55) saturate(1.05); }
+        /* Foreground: the crop window fit to the stage's width, preserving
+           its own aspect (== exactly 9:16, filling the whole stage, whenever
+           zoom >= 1 — no blur, no letterbox) and centered vertically
+           otherwise. width/height/left/top set in px by _renderStage. */
+        #re-fg-box { position: absolute; left: 0; overflow: hidden; }
+        #re-video { position: absolute; left: 0; top: 0; transform-origin: 0 0; background: #000;
           pointer-events: none; }
-        .re-band { position: absolute; top: 0; bottom: 0; background: rgba(2, 3, 7, .62); pointer-events: none; z-index: 2; }
-        #re-band-l { left: 0; } #re-band-r { right: 0; }
-        #re-crop-window { position: absolute; top: 0; bottom: 0; border: 2px solid var(--accent-hover);
-          box-shadow: 0 0 0 1px rgba(0,0,0,.4), 0 0 18px rgba(194,32,48,.5); pointer-events: none; z-index: 3; }
-        #re-frame-note { position: absolute; left: 8px; right: 8px; bottom: 8px; text-align: center; z-index: 4;
-          background: rgba(0,0,0,.5); border-radius: 8px; padding: 4px 6px; }
+        #re-zoom-badge { position: absolute; right: 8px; bottom: 8px; z-index: 6; pointer-events: none;
+          background: rgba(0,0,0,.55); color: #fff; border-radius: 999px; padding: 2px 8px; font-size: 11px;
+          opacity: .85; }
         .re-transport { flex-shrink: 0; padding: 8px 16px; border-top: 1px solid var(--border); }
-
-        /* fit_blur CSS approximation (spec v7.7 item 3): lives INSIDE
-           #re-crop-window so it only ever covers the actual 9:16 output
-           rect, layered above the real #re-video via DOM order + z-index.
-           Hidden entirely unless the reel's fit_mode is "fit_blur" (see
-           _renderFitBlurLayer). Ghost <video>s are muted and kept in sync
-           with #re-video by the segment-load/timeupdate/play/pause hooks
-           below -- they never carry their own audio. */
-        #re-fitblur-layer { position: absolute; inset: 0; background: #000; overflow: hidden; z-index: 1; }
-        #re-fitblur-bg { position: absolute; inset: -12%; width: 124%; height: 124%; object-fit: cover;
-          filter: blur(22px) brightness(.55) saturate(1.05); pointer-events: none; }
-        #re-fitblur-fg { position: absolute; object-fit: contain; background: #000; pointer-events: none; }
 
         /* Reel Safety UI (spec v7.7 items 1-2): thin bar above the 9:16
            preview hosting platform toggle chips + the safety message; the
@@ -354,17 +463,16 @@
           <section id="re-preview-pane" class="re-area">
             <div id="re-safezone-bar"></div>
             <div id="re-frame-wrap">
-              <div id="re-frame" title="Drag to reframe the 9:16 crop">
-                <video id="re-video" playsinline preload="auto"></video>
-                <div id="re-band-l" class="re-band"></div>
-                <div id="re-band-r" class="re-band"></div>
+              <div id="re-frame" title="Drag to pan · Scroll/pinch to zoom · Double-click to reset">
                 <div id="re-crop-window">
-                  <div id="re-fitblur-layer" hidden>
-                    <video id="re-fitblur-bg" muted playsinline preload="auto"></video>
-                    <video id="re-fitblur-fg" muted playsinline preload="auto"></video>
+                  <div id="re-bg-layer" hidden>
+                    <video id="re-bg-video" muted playsinline preload="auto"></video>
+                  </div>
+                  <div id="re-fg-box">
+                    <video id="re-video" playsinline preload="auto"></video>
                   </div>
                 </div>
-                <div id="re-frame-note" class="dim" hidden></div>
+                <div id="re-zoom-badge" class="mono">100%</div>
               </div>
             </div>
             <div class="re-transport row">
@@ -434,7 +542,7 @@
       if (play) play.onclick = () => this.togglePlay();
       document.getElementById("re-tabs")?.querySelectorAll("[data-re-tab]").forEach((b) =>
         b.onclick = () => this.switchTab(b.dataset.reTab));
-      this._wireFrameDrag();
+      this._wireStageGestures();
       const addBtn = document.getElementById("re-add-segment-btn");
       if (addBtn) addBtn.onclick = () => this._openAddPicker();
       const cancelBtn = document.getElementById("re-add-cancel");
@@ -581,138 +689,239 @@
         const { start, end } = this._segEffectiveWindow(this._activeSeg);
         if (v.currentTime < start || v.currentTime > end) { try { v.currentTime = start; } catch (_e) { /* ignore */ } }
       }
-      this._renderFitBlurLayer(); // active segment's clip may have changed
+      this._renderStage(); // active segment's clip (and its src pixel dims) may have changed
       // in/out (segment trims) changed -> re-run the safety check (spec
       // v7.7 item 2: "after in/out/crop/fit changes, debounced").
       try { window.SafeZonesUI?.notifyChange(); } catch (_e) { /* ignore */ }
     },
 
-    /* ---------- framing (crop_x) ---------- */
+    /* ---------- framing: {zoom, offset_x, offset_y} transform (spec v7.11) ----------
+       Direct manipulation ON the 9:16 preview stage (the main ask, replacing
+       the old sweep/slider crop_x UX): drag pans, wheel/pinch zooms around
+       the cursor, double-click resets to the AI/face-centered default. See
+       this file's top docstring for the client-side math mirror this all
+       leans on (_transformCropRect/_transformNeedsBlur/_deriveTransformFromReel). */
+
+    _activeClipInfo() {
+      const seg = this._segments()[this._activeSeg];
+      const clip = seg ? this._clipFor(seg.clip_id) : null;
+      return (clip || this.clip)?.info || { width: 16, height: 9 };
+    },
+
+    _currentTransform() {
+      return this._transformPreview || _deriveTransformFromReel(this._reel());
+    },
 
     _layoutFrame() {
       const wrap = document.getElementById("re-frame-wrap");
       const frame = document.getElementById("re-frame");
       if (!wrap || !frame) return;
       const cw = wrap.clientWidth, ch = wrap.clientHeight;
-      const w = this.clip?.info?.width || 16, h = this.clip?.info?.height || 9;
-      const ar = w / h || 16 / 9;
+      // The stage is ALWAYS the 9:16 OUTPUT aspect (spec v7.11) -- never the
+      // source clip's own aspect, unlike the old wide-frame + highlighted
+      // crop-window UI this replaces.
+      const ar = 9 / 16;
       let fw = cw, fh = cw / ar;
       if (fh > ch) { fh = ch; fw = ch * ar; }
       frame.style.width = `${Math.max(1, fw)}px`;
       frame.style.height = `${Math.max(1, fh)}px`;
-      this._renderCropOverlay();
+      this._renderStage();
     },
 
-    _cropWidthFrac() {
-      const w = this.clip?.info?.width || 16, h = this.clip?.info?.height || 9;
-      const targetAr = 9 / 16;
-      let cropH = h, cropW = cropH * targetAr;
-      if (cropW > w) { cropW = w; cropH = cropW / targetAr; }
-      return cropW / w;
-    },
-
-    _renderCropOverlay() {
+    // Lays out the foreground (crop window fit to the stage's width,
+    // preserving its own aspect) and, when zoomed out below the cover
+    // threshold, the blurred background (the SAME crop window scaled to
+    // COVER the stage -- spec v7.11's explicit bug fix: never the original
+    // 16:9 frame). Mirrors faces.transform_vertical_crop_filter's fg/bg
+    // filtergraph chains, just in CSS transforms instead of ffmpeg. Called
+    // on layout/resize, on every drag/zoom tick (optimistic, via
+    // _transformPreview), after a PATCH settles, and whenever the active
+    // segment's clip (and therefore its source pixel dimensions) changes.
+    _renderStage() {
       const frame = document.getElementById("re-frame");
-      const bandL = document.getElementById("re-band-l");
-      const bandR = document.getElementById("re-band-r");
-      const win = document.getElementById("re-crop-window");
-      const note = document.getElementById("re-frame-note");
-      if (!frame || !bandL || !bandR || !win) return;
-      const fw = frame.clientWidth || 1;
-      const cropWFrac = this._cropWidthFrac();
-      if (cropWFrac >= 0.999) {
-        bandL.style.display = "none"; bandR.style.display = "none"; win.style.display = "none";
-        if (note) { note.hidden = false; note.textContent = "Source is already narrower than 9:16 — no horizontal crop available."; }
-        return;
+      const bgLayer = document.getElementById("re-bg-layer");
+      const bgVideo = document.getElementById("re-bg-video");
+      const fgBox = document.getElementById("re-fg-box");
+      const fgVideo = document.getElementById("re-video");
+      const badge = document.getElementById("re-zoom-badge");
+      if (!frame || !fgBox || !fgVideo) return;
+      const stageW = frame.clientWidth || 1, stageH = frame.clientHeight || 1;
+      const info = this._activeClipInfo();
+      const srcW = info.width || 16, srcH = info.height || 9;
+      const t = this._currentTransform();
+      const rect = _transformCropRect(srcW, srcH, t.zoom, t.offset_x, t.offset_y);
+      const blur = _transformNeedsBlur(t.zoom);
+
+      if (badge) badge.textContent = `${Math.round(t.zoom * 100)}%`;
+
+      const fgScale = stageW / rect.w;
+      const fgH = rect.h * fgScale;
+      fgBox.style.top = `${(stageH - fgH) / 2}px`;
+      fgBox.style.width = `${stageW}px`;
+      fgBox.style.height = `${fgH}px`;
+      fgVideo.style.width = `${srcW * fgScale}px`;
+      fgVideo.style.height = `${srcH * fgScale}px`;
+      fgVideo.style.transform = `translate(${-rect.x * fgScale}px, ${-rect.y * fgScale}px)`;
+
+      if (bgLayer) bgLayer.hidden = !blur;
+      if (blur && bgVideo) {
+        const bgScale = Math.max(stageW / rect.w, stageH / rect.h);
+        const offX = (stageW - rect.w * bgScale) / 2, offY = (stageH - rect.h * bgScale) / 2;
+        bgVideo.style.width = `${srcW * bgScale}px`;
+        bgVideo.style.height = `${srcH * bgScale}px`;
+        bgVideo.style.transform = `translate(${-rect.x * bgScale + offX}px, ${-rect.y * bgScale + offY}px)`;
       }
-      if (note) note.hidden = true;
-      bandL.style.display = ""; bandR.style.display = ""; win.style.display = "";
-      const reel = this._reel();
-      const centerFrac = this._cropDragPreview != null ? this._cropDragPreview
-        : (reel.crop_x != null ? Number(reel.crop_x) : 0.5);
-      let leftFrac = centerFrac - cropWFrac / 2;
-      leftFrac = Math.max(0, Math.min(leftFrac, 1 - cropWFrac));
-      const leftPx = leftFrac * fw, widthPx = cropWFrac * fw;
-      bandL.style.width = `${leftPx}px`;
-      bandR.style.width = `${Math.max(0, fw - (leftPx + widthPx))}px`;
-      win.style.left = `${leftPx}px`;
-      win.style.width = `${widthPx}px`;
     },
 
-    // Shows/hides + sizes the fit_blur CSS approximation (spec v7.7 item 3):
-    // when reel.fit_mode is "fit_blur", #re-fitblur-layer covers the whole
-    // crop-window rect (blurred underlay via #re-fitblur-bg, object-fit:
-    // cover) with #re-fitblur-fg centered and sized to fit_scale on top --
-    // the classic vertical-video zoom-out-with-blur-background treatment.
-    // Called on open, after any PATCH that can touch fit_mode/fit_scale,
-    // and after add/delete-segment (clip_id used by the ghosts can change).
-    _renderFitBlurLayer() {
-      const layer = document.getElementById("re-fitblur-layer");
-      const fg = document.getElementById("re-fitblur-fg");
-      if (!layer || !fg) return;
-      const reel = this._reel();
-      const mode = reel.fit_mode || "fill";
-      if (mode !== "fit_blur") {
-        layer.hidden = true;
-        // stop any decode work the ghosts were doing while active
-        const bg = document.getElementById("re-fitblur-bg");
-        try { bg?.pause(); fg.pause(); } catch (_e) { /* ignore */ }
-        return;
-      }
-      layer.hidden = false;
-      const scale = Math.max(0.6, Math.min(1.0, Number(reel.fit_scale) || 0.82));
-      const marginPct = ((1 - scale) / 2) * 100;
-      fg.style.width = `${scale * 100}%`;
-      fg.style.height = `${scale * 100}%`;
-      fg.style.left = `${marginPct}%`;
-      fg.style.top = `${marginPct}%`;
-      // bring the ghosts up to date with wherever #re-video currently is
-      // (covers the open()/tab-switch case where nothing is "loading" a
-      // fresh segment right now, just toggling the layer on).
-      const v = document.getElementById("re-video");
-      if (v?.dataset.src) this._syncFitBlurGhosts(v.dataset.src, v.currentTime, this.playing);
-    },
-
-    _wireFrameDrag() {
+    _wireStageGestures() {
       const frame = document.getElementById("re-frame");
       if (!frame) return;
-      frame.addEventListener("pointerdown", (e) => this._onFrameDown(e));
+      frame.addEventListener("pointerdown", (e) => this._onStagePointerDown(e));
+      frame.addEventListener("wheel", (e) => this._onStageWheel(e), { passive: false });
+      // NOT relied on as the primary mechanism: Chromium/Firefox/Safari all
+      // suppress the synthesized "dblclick" compatibility event once a
+      // "pointerdown" on the same target called preventDefault() (Pointer
+      // Events spec) -- which _onStagePointerDown must do (to stop native
+      // drag-image / text-selection while panning), so double-click reset
+      // is detected manually there instead (see that method). Kept as a
+      // harmless no-op-if-never-fires fallback for any environment that
+      // doesn't suppress it.
+      frame.addEventListener("dblclick", (e) => { e.preventDefault(); this._resetTransform(); });
     },
 
-    _onFrameDown(e) {
+    // Drag-to-pan: the crop window's (x, y) moves opposite the drag delta,
+    // in source pixels, using the foreground's own uniform "fit-width"
+    // scale factor (screen px -> source px) computed once at drag start --
+    // same optimistic-preview-then-patch-on-release pattern the old crop_x
+    // drag used (see this section's docstring / _cropDragPreview's old
+    // comment for why the value is kept until the PATCH confirms it).
+    //
+    // Also does its OWN double-click detection (two pointerdowns close in
+    // time and position) rather than trusting the "dblclick" event -- see
+    // _wireStageGestures' comment for why that event never reliably fires
+    // here.
+    _onStagePointerDown(e) {
+      if (e.button != null && e.button !== 0) return;
       const frame = document.getElementById("re-frame");
       if (!frame) return;
-      const rect = frame.getBoundingClientRect();
-      if (!rect.width || this._cropWidthFrac() >= 0.999) return;
-      const update = (clientX) => {
-        const frac = Math.max(0, Math.min(1, (clientX - rect.left) / rect.width));
-        this._cropDragPreview = frac;
-        this._renderCropOverlay();
+      const now = performance.now();
+      const last = this._lastStageDown;
+      this._lastStageDown = { t: now, x: e.clientX, y: e.clientY };
+      if (last && now - last.t < 400 && Math.hypot(e.clientX - last.x, e.clientY - last.y) < 8) {
+        this._lastStageDown = null; // consumed -- a 3rd rapid click starts fresh, not another reset
+        e.preventDefault();
+        this._resetTransform();
+        return;
+      }
+      e.preventDefault();
+      frame.classList.add("re-panning");
+      try { frame.setPointerCapture(e.pointerId); } catch (_e) { /* ignore */ }
+      const info = this._activeClipInfo();
+      const srcW = info.width || 16, srcH = info.height || 9;
+      const start = this._currentTransform();
+      const rect0 = _transformCropRect(srcW, srcH, start.zoom, start.offset_x, start.offset_y);
+      const stageRect = frame.getBoundingClientRect();
+      const scale = stageRect.width / rect0.w || 1; // uniform fg source-px -> screen-px scale
+      const startX = e.clientX, startY = e.clientY;
+      let moved = false;
+
+      const onMove = (ev) => {
+        moved = true;
+        const dx = ev.clientX - startX, dy = ev.clientY - startY;
+        const x = _clampNum(rect0.x - dx / scale, 0, srcW - rect0.w);
+        const y = _clampNum(rect0.y - dy / scale, 0, srcH - rect0.h);
+        const ox = rect0.roomX > 0 ? _clampNum((x - rect0.cx + rect0.w / 2) / rect0.roomX, -1, 1) : start.offset_x;
+        const oy = rect0.roomY > 0 ? _clampNum((y - rect0.cy + rect0.h / 2) / rect0.roomY, -1, 1) : start.offset_y;
+        this._transformPreview = { zoom: start.zoom, offset_x: ox, offset_y: oy };
+        this._renderStage();
       };
-      update(e.clientX);
-      const onMove = (ev) => update(ev.clientX);
       const onUp = () => {
         window.removeEventListener("pointermove", onMove);
         window.removeEventListener("pointerup", onUp);
-        const frac = this._cropDragPreview;
-        if (frac == null) return;
-        // Keep showing the dragged (optimistic) position until the PATCH
-        // settles -- clearing _cropDragPreview here would make the overlay
-        // snap back to the old crop_x for the round-trip's duration (or
-        // forever, on failure), which reads as "the drag didn't work" even
-        // though it visibly did. Only drop it once the server confirms the
-        // same value (success) so there's no visual jump either way.
-        this._patch({ crop_x: Math.round(frac * 1000) / 1000 }, {
-          afterSave: () => {
-            this._cropDragPreview = null;
-            this._renderCropOverlay();
-            // crop_x changed -> re-run the safety check (debounced).
-            try { window.SafeZonesUI?.notifyChange(); } catch (_e) { /* ignore */ }
-          },
-        });
+        frame.classList.remove("re-panning");
+        if (moved && this._transformPreview) this._commitTransform(this._transformPreview);
+        else this._transformPreview = null;
       };
       window.addEventListener("pointermove", onMove);
       window.addEventListener("pointerup", onUp);
+    },
+
+    // Scroll-wheel / trackpad-pinch zoom, anchored on the cursor (spec:
+    // "scroll-wheel/trackpad-pinch over the preview... to zoom") -- solves
+    // for the new offset_x/offset_y that keeps the SOURCE point currently
+    // under the cursor fixed on screen after the zoom changes the crop
+    // window's size. Debounced PATCH (rapid wheel ticks shouldn't each
+    // trigger a round-trip); the live preview itself is never debounced.
+    _onStageWheel(e) {
+      e.preventDefault();
+      const frame = document.getElementById("re-frame");
+      if (!frame) return;
+      const info = this._activeClipInfo();
+      const srcW = info.width || 16, srcH = info.height || 9;
+      const start = this._currentTransform();
+      const stageRect = frame.getBoundingClientRect();
+      if (!stageRect.width || !stageRect.height) return;
+
+      const rect0 = _transformCropRect(srcW, srcH, start.zoom, start.offset_x, start.offset_y);
+      const scale0 = stageRect.width / rect0.w;
+      const fgTop0 = (stageRect.height - rect0.h * scale0) / 2;
+      const cxScreen = e.clientX - stageRect.left, cyScreen = e.clientY - stageRect.top;
+      const sx = rect0.x + cxScreen / scale0;
+      const sy = rect0.y + (cyScreen - fgTop0) / scale0;
+
+      // deltaY < 0 (scroll up / pinch out) => zoom IN. Multiplicative step
+      // so it feels consistent across mouse wheels and trackpad pinch.
+      const factor = Math.exp(-e.deltaY * 0.0018);
+      const newZoom = _clampNum(start.zoom * factor, TRANSFORM_ZOOM_MIN, TRANSFORM_ZOOM_MAX);
+      if (newZoom === start.zoom) return;
+
+      const rect1 = _transformCropRect(srcW, srcH, newZoom, start.offset_x, start.offset_y);
+      const scale1 = stageRect.width / rect1.w;
+      const fgTop1 = (stageRect.height - rect1.h * scale1) / 2;
+      let x1 = sx - cxScreen / scale1;
+      let y1 = sy - (cyScreen - fgTop1) / scale1;
+      x1 = _clampNum(x1, 0, srcW - rect1.w);
+      y1 = _clampNum(y1, 0, srcH - rect1.h);
+      const ox1 = rect1.roomX > 0 ? _clampNum((x1 - rect1.cx + rect1.w / 2) / rect1.roomX, -1, 1) : 0;
+      const oy1 = rect1.roomY > 0 ? _clampNum((y1 - rect1.cy + rect1.h / 2) / rect1.roomY, -1, 1) : 0;
+
+      this._transformPreview = { zoom: newZoom, offset_x: ox1, offset_y: oy1 };
+      this._renderStage();
+      const val = document.getElementById("re-zoom-val");
+      if (val) val.textContent = `${Math.round(newZoom * 100)}%`;
+      const zoomInput = document.getElementById("re-zoom-input");
+      if (zoomInput) zoomInput.value = newZoom;
+      this._debouncedCommitTransform(this._transformPreview, 250);
+    },
+
+    // Double-click = reset to auto (spec): zoom 1.0, offset 0/0 -- the
+    // server always recomputes the face-centered crop from THIS pair
+    // (offset 0 has zero room to move at zoom 1.0 on the vertical axis for
+    // the common wider-than-9:16 source, and simply re-centers on the
+    // detected face horizontally -- see pipeline/faces.py's module note).
+    _resetTransform() {
+      this._transformPreview = { zoom: 1, offset_x: 0, offset_y: 0 };
+      this._renderStage();
+      this._commitTransform(this._transformPreview);
+    },
+
+    _commitTransform(t) {
+      this._patch({ transform: { zoom: t.zoom, offset_x: t.offset_x, offset_y: t.offset_y } }, {
+        afterSave: () => {
+          // Keep showing the just-applied (optimistic) numbers until the
+          // merged reel reflects them -- avoids a visible snap for the
+          // round-trip's duration (same pattern the old crop_x drag used).
+          this._transformPreview = null;
+          this._renderStage();
+          if (this.activeTab === "reel") this._renderFramingCard();
+          try { window.SafeZonesUI?.notifyChange(); } catch (_e) { /* ignore */ }
+        },
+      });
+    },
+
+    _debouncedCommitTransform(t, delay) {
+      clearTimeout(this._timers.transform);
+      this._timers.transform = setTimeout(() => this._commitTransform(t), delay);
     },
 
     /* ---------- playback (virtual multi-segment EDL, loop) ---------- */
@@ -750,32 +959,32 @@
       } else {
         doSeek();
       }
-      this._syncFitBlurGhosts(src, localTime, resumePlaying);
+      this._syncBgGhost(src, localTime, resumePlaying);
+      this._renderStage(); // the active segment's clip (and its src pixel dims) may differ
     },
 
-    // Mirrors #re-video's src/currentTime/play-state into the two muted
-    // ghost <video>s that approximate fit_blur (spec v7.7 item 3). Only
-    // loaded/seeked while fit_mode is actually "fit_blur" -- otherwise left
-    // paused with no src so a hidden reel never burns decode time on two
-    // extra video streams for nothing.
-    _syncFitBlurGhosts(src, localTime, resumePlaying) {
-      if ((this._reel().fit_mode || "fill") !== "fit_blur") return;
-      const bg = document.getElementById("re-fitblur-bg");
-      const fg = document.getElementById("re-fitblur-fg");
-      if (!bg || !fg) return;
-      [bg, fg].forEach((ghost) => {
-        const seekAndPlay = () => {
-          try { ghost.currentTime = localTime; } catch (_e) { /* not ready */ }
-          if (resumePlaying) ghost.play().catch(() => {});
-        };
-        if (ghost.dataset.src !== src) {
-          ghost.dataset.src = src;
-          ghost.src = src;
-          ghost.onloadedmetadata = seekAndPlay;
-        } else {
-          seekAndPlay();
-        }
-      });
+    // Mirrors #re-video's src/currentTime into the muted <video> that
+    // approximates the automatic blurred background (spec v7.11). Always
+    // kept in sync (src/time) so crossing the zoom<1 threshold mid-drag
+    // never needs a fresh load/seek/flash; only actually PLAYS while a blur
+    // is currently visible -- otherwise left paused so a reel that's never
+    // zoomed out doesn't burn decode time on a second video stream for
+    // nothing.
+    _syncBgGhost(src, localTime, resumePlaying) {
+      const bg = document.getElementById("re-bg-video");
+      if (!bg) return;
+      const shouldPlay = resumePlaying && _transformNeedsBlur(this._currentTransform().zoom);
+      const seekAndPlay = () => {
+        try { bg.currentTime = localTime; } catch (_e) { /* not ready */ }
+        if (shouldPlay) bg.play().catch(() => {}); else bg.pause();
+      };
+      if (bg.dataset.src !== src) {
+        bg.dataset.src = src;
+        bg.src = src;
+        bg.onloadedmetadata = seekAndPlay;
+      } else {
+        seekAndPlay();
+      }
     },
 
     _seekTo(idx, localTime) {
@@ -811,22 +1020,18 @@
       }
       this._updateTimeDisplay();
       this._renderPlayhead();
-      this._resyncFitBlurGhostsDrift(v.currentTime);
+      this._resyncBgGhostDrift(v.currentTime);
     },
 
     // Cheap periodic drift correction (called from the same ~4/s timeupdate
-    // tick as everything else above) rather than seeking the ghosts on
-    // every frame -- good enough for a live CSS approximation.
-    _resyncFitBlurGhostsDrift(currentTime) {
-      if ((this._reel().fit_mode || "fill") !== "fit_blur") return;
-      const bg = document.getElementById("re-fitblur-bg");
-      const fg = document.getElementById("re-fitblur-fg");
-      [bg, fg].forEach((ghost) => {
-        if (!ghost || !ghost.dataset.src) return;
-        if (Math.abs(ghost.currentTime - currentTime) > 0.35) {
-          try { ghost.currentTime = currentTime; } catch (_e) { /* not ready */ }
-        }
-      });
+    // tick as everything else above) rather than seeking the ghost on every
+    // frame -- good enough for a live CSS approximation.
+    _resyncBgGhostDrift(currentTime) {
+      const bg = document.getElementById("re-bg-video");
+      if (!bg || !bg.dataset.src) return;
+      if (Math.abs(bg.currentTime - currentTime) > 0.35) {
+        try { bg.currentTime = currentTime; } catch (_e) { /* not ready */ }
+      }
     },
 
     play() {
@@ -836,11 +1041,9 @@
       if (v.currentTime < start || v.currentTime >= end) { try { v.currentTime = start; } catch (_e) { /* ignore */ } }
       this.playing = true;
       v.play().catch(() => {});
-      if ((this._reel().fit_mode || "fill") === "fit_blur") {
-        const bg = document.getElementById("re-fitblur-bg");
-        const fg = document.getElementById("re-fitblur-fg");
+      if (_transformNeedsBlur(this._currentTransform().zoom)) {
+        const bg = document.getElementById("re-bg-video");
         if (bg?.dataset.src) bg.play().catch(() => {});
-        if (fg?.dataset.src) fg.play().catch(() => {});
       }
       const btn = document.getElementById("re-playpause");
       if (btn) { btn.innerHTML = '<i data-lucide="pause"></i>'; refreshIcons(); }
@@ -849,8 +1052,7 @@
       this.playing = false;
       const v = document.getElementById("re-video");
       v?.pause();
-      document.getElementById("re-fitblur-bg")?.pause();
-      document.getElementById("re-fitblur-fg")?.pause();
+      document.getElementById("re-bg-video")?.pause();
       const btn = document.getElementById("re-playpause");
       if (btn) { btn.innerHTML = '<i data-lucide="play"></i>'; refreshIcons(); }
     },
@@ -1210,22 +1412,7 @@
           </div>
           ${reel.composed && reel.composer_why ? `<div class="dim" style="margin-top:6px">${esc(reel.composer_why)}</div>` : ""}
         </div>
-        <div class="card">
-          <b>Framing</b>
-          <div class="hint">"Fit + blur" zooms the video out and fills the rest of the 9:16 frame with a
-            blurred copy of itself -- the fix offered when the face gets covered by a platform's UI.</div>
-          <div class="transition-btns" id="re-fitmode-btns">
-            <button type="button" class="btn small ${(reel.fit_mode || "fill") === "fill" ? "active" : ""}" data-v="fill">Fill</button>
-            <button type="button" class="btn small ${reel.fit_mode === "fit_blur" ? "active" : ""}" data-v="fit_blur">Fit + blur</button>
-          </div>
-          ${reel.fit_mode === "fit_blur" ? `
-            <div class="field-row" style="margin-top:8px">
-              <label>Fit scale</label>
-              <input type="range" id="re-fitscale-input" min="0.6" max="1.0" step="0.05"
-                value="${Number(reel.fit_scale) || 0.82}" style="flex:1">
-              <span class="dim mono" id="re-fitscale-val">${(Number(reel.fit_scale) || 0.82).toFixed(2)}</span>
-            </div>` : ""}
-        </div>`;
+        <div class="card" id="re-framing-card">${this._framingCardHtml()}</div>`;
 
       const titleInput = el.querySelector("#re-title-input");
       if (titleInput) titleInput.oninput = () => this._debouncedPatch("title", { title: titleInput.value }, 600, () => {
@@ -1259,34 +1446,60 @@
         }
       };
 
-      el.querySelectorAll("#re-fitmode-btns button").forEach((b) => {
-        b.onclick = () => {
-          const fields = { fit_mode: b.dataset.v };
-          if (b.dataset.v === "fit_blur" && reel.fit_scale == null) fields.fit_scale = 0.82;
-          this._patch(fields, {
-            afterSave: () => {
-              this._renderReelTab();
-              this._renderFitBlurLayer();
-              try { window.SafeZonesUI?.notifyChange(); } catch (_e) { /* ignore */ }
-            },
-          });
-        };
-      });
-      const fitScaleInput = el.querySelector("#re-fitscale-input");
-      if (fitScaleInput) fitScaleInput.oninput = () => {
-        const val = document.getElementById("re-fitscale-val");
-        if (val) val.textContent = Number(fitScaleInput.value).toFixed(2);
-        clearTimeout(this._timers.fitscale);
-        this._timers.fitscale = setTimeout(() => {
-          this._patch({ fit_scale: Number(fitScaleInput.value) }, {
-            afterSave: () => {
-              this._renderFitBlurLayer();
-              try { window.SafeZonesUI?.notifyChange(); } catch (_e) { /* ignore */ }
-            },
-          });
-        }, 300);
-      };
+      this._wireFramingCard(el.querySelector("#re-framing-card"));
       refreshIcons();
+    },
+
+    /* ---- Framing card (spec v7.11): secondary zoom slider + reset button
+       alongside the primary direct-manipulation gesture on the preview
+       stage itself (drag/wheel/dblclick, see the framing section above) --
+       kept as its own small render/wire pair (rather than folded into
+       _renderReelTab's one-shot innerHTML) so a drag/zoom-driven PATCH can
+       refresh JUST this card's numbers without rebuilding the whole Reel
+       tab (which would blow away focus/caret position in the title/
+       description inputs mid-edit). ---- */
+
+    _framingCardHtml() {
+      const t = this._currentTransform();
+      const pct = Math.round(t.zoom * 100);
+      return `
+        <b>Framing</b>
+        <div class="hint">Drag the preview to pan, scroll/pinch to zoom, double-click to reset to the
+          AI face-centered default. Zooming out below 100% reveals an automatic blurred background
+          (the source's own aspect, never stretched to 9:16).</div>
+        <div class="field-row" style="margin-top:8px">
+          <label>Zoom</label>
+          <input type="range" id="re-zoom-input" min="${TRANSFORM_ZOOM_MIN}" max="${TRANSFORM_ZOOM_MAX}" step="0.01"
+            value="${t.zoom}" style="flex:1">
+          <span class="dim mono" id="re-zoom-val">${pct}%</span>
+        </div>
+        <div class="row" style="margin-top:8px">
+          <button type="button" class="btn small" id="re-reset-framing-btn"><i data-lucide="rotate-ccw"></i> Reset to auto</button>
+        </div>`;
+    },
+
+    _renderFramingCard() {
+      const card = document.getElementById("re-framing-card");
+      if (!card) return;
+      card.innerHTML = this._framingCardHtml();
+      this._wireFramingCard(card);
+      refreshIcons();
+    },
+
+    _wireFramingCard(card) {
+      if (!card) return;
+      const zoomInput = card.querySelector("#re-zoom-input");
+      if (zoomInput) zoomInput.oninput = () => {
+        const zoom = _clampNum(Number(zoomInput.value) || 1, TRANSFORM_ZOOM_MIN, TRANSFORM_ZOOM_MAX);
+        const val = document.getElementById("re-zoom-val");
+        if (val) val.textContent = `${Math.round(zoom * 100)}%`;
+        const cur = this._currentTransform();
+        this._transformPreview = { zoom, offset_x: cur.offset_x, offset_y: cur.offset_y };
+        this._renderStage();
+        this._debouncedCommitTransform(this._transformPreview, 250);
+      };
+      const resetBtn = card.querySelector("#re-reset-framing-btn");
+      if (resetBtn) resetBtn.onclick = () => this._resetTransform();
     },
 
     /* ---- Subs tab: style overrides (partial over project defaults) + cue list ---- */

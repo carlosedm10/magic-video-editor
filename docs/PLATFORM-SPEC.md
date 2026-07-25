@@ -959,3 +959,156 @@ for tests. Verification for packaging/updater work = static only (ruff, bash -n,
 review, unit tests with pure-python fakes) + the GitHub Actions release build + user
 testing on their own hardware. scripts/dry_run_update_helper.sh is CI/other-machine
 material only.
+
+## v7.11 — Reel framing v2: direct manipulation (owner: fit+blur "no es lo que me refería")
+Replace the {crop_x, fit_mode, fit_scale} trio with a proper TRANSFORM model. Output is
+ALWAYS the 9:16 frame; the transform defines which source window fills it:
+- reel["transform"] = {zoom: 0.5..3.0 (1.0 = the classic full-height 9:16 crop exactly
+  covers the frame; >1 punches in; <1 opens the window WIDER than the frame),
+  offset_x, offset_y: -1..1 (pan, clamped to available room)}.
+- **Blur background is not a mode** — it appears automatically wherever the zoomed-out
+  source stops covering the 9:16 frame (zoom < cover threshold), exactly like CapCut.
+  THE BUG being fixed: today's zoom-out letterboxes the ORIGINAL 16:9 frame; the new
+  semantics zoom out FROM the 9:16 crop window, never switching aspect logic.
+- **Direct manipulation on the preview** (the main ask): drag the video to pan
+  (offset_x/y), scroll-wheel/trackpad-pinch over the preview OR a zoom slider to zoom,
+  double-click = reset to auto (face-centered, zoom 1.0). Live CSS preview (transform:
+  translate/scale on the video + blurred underlay element). Keep the side handles ("el
+  barrido") working as a secondary affordance but the canvas gesture is primary.
+- Migration on read: crop_x -> offset_x equivalent; fit_blur+fit_scale -> zoom=fit_scale;
+  plain fill -> zoom 1.0.
+- Render: derive the source crop rect from the transform (fg crop+scale; blurred cover
+  bg only when needed); PATCH accepts transform; safety analysis maps face boxes through
+  the SAME transform (single shared mapping helper so UI/render/safety can't drift —
+  the safety mapping update may need coordination with the in-flight safety agent).
+- Safety's one-click fix becomes "reduce zoom to X" (adjusts transform.zoom).
+
+## v7.12 — Preview mode broken + process logs unreachable (owner field report)
+1. **Preview mode does not play**: the player's Draft/Preview toggle fails to play
+   <project>/preview/preview.mp4. Diagnose the full chain: does preview.mp4 exist for
+   the project (preview_render ran?); the media/file endpoint URL the player builds
+   (cache-busted src correctness); mode-switch wiring after the stutter-fix changes;
+   and whether the WebAudio graph swallows the preview element's audio. Preview mode
+   must ALSO show a clear empty-state when no preview render exists yet ("Genera la
+   previsualización" CTA that enqueues preview_render) instead of failing silently.
+2. **Process logs are gone**: since the Activity popover redesign the run logs are
+   invisible in practice. Requirements: the popover's per-task "Details" disclosure must
+   work for running AND recent items (verify after the row redesign); the pipeline chip
+   popover gains a "Ver registro" link per stage opening the same log view; and while a
+   run-all is executing, the progress strip gains a small log icon opening the live log
+   (tail -f behavior, auto-scroll, monospace). A user must never wonder "where did the
+   logs go".
+
+## v7.13 — Subtitles in edit mode, kill the Draft/Preview concept, audio-preview UX (owner)
+1. **Subtitles overlay broken in edit (draft) playback**: enabled subtitles do not show
+   over the player. Diagnose (cue fetch? overlay z-index vs the new layers? gating?) and
+   fix: enabled subtitles always render live during draft playback and update on config
+   changes.
+2. **Kill the user-facing Draft/Preview distinction** — the owner rightly says they feel
+   like the same thing. New model: ONE play experience; the app AUTO-chooses the freshest
+   representation (rendered preview when its manifest matches, virtual otherwise), never
+   switching mid-playback. The explicit toggle leaves the primary UI; in its place a
+   subtle quality badge ("Borrador" dim / "Final ✓" green) with a tooltip explaining
+   background rendering, plus the v7.12 empty-state CTA when a preview render would help
+   (e.g. transitions/LUT active which draft can't show exactly). Keyboard/debug toggle
+   can stay hidden behind alt-click.
+3. **Audio enhance preview UX**: the clip dropdown + naked "0.5" number are opaque (the
+   number is the sample timestamp — the owner had to guess). Replace with: "La mejora se
+   aplica a TODO el audio del vídeo al renderizar" copy; the A/B sample controls become
+   "Probar desde: [posición actual del cursor] (botón) o [mm:ss] del vídeo final" — the
+   final-timeline time maps internally to clip+local offset via the EDL. No raw clip
+   selector, no unitless numbers.
+
+## v7.14 — Reel preview render (owner top complaint: dead `<video>` in the drawer)
+
+The Reels drawer had nothing decodable to point a player at: a suggestion has no
+rendered file yet, and pointing a `<video>` at the raw source clip fails outright for
+iPhone HEVC/10-bit sources (Chromium can't decode them — the same reason clips already
+get an H.264 720p preview proxy, `/media/preview/{cid}` in `magic_video_editor/server.py`) and,
+even where the proxy does decode, shows the wrong framing (no transform crop/pan/zoom,
+no blur background) for that specific reel. Every reel suggestion now gets its own cheap
+low-res 9:16 preview render, produced in the background via the per-project job queue,
+and the drawer plays THAT — never the raw source. Export/full render quality is
+untouched.
+
+- **Shared composition path**: `magic_video_editor/pipeline/reels.py`'s `_compose_reel(log, project,
+  reel, work, width, height, crf, preset)` factors the segment/filter construction
+  (multi-segment concat, the v7.11 framing transform `{zoom, offset_x, offset_y}` with its
+  blur background, subtitle burn, junction crossfades — via the SAME `render.py`
+  `_encode_segment`/`_merge_crossfades` reel rendering already reused) out of `render_reel`,
+  so both the full-quality render and the new preview render call the one implementation
+  with different width/height/crf/preset — no duplicated crop/subs/transition logic.
+- **Preview quality**: `PREVIEW_W, PREVIEW_H = 480, 854`, `PREVIEW_CRF = 30`,
+  `PREVIEW_PRESET = "ultrafast"`. No audio enhance (expensive, doesn't change
+  composition) and no export-dir placement — the file is an internal work artifact at
+  `<project_dir>/previews/reels/<reel_id>.mp4`, streamed straight from there.
+  Deviation from the original ask: the shared `render.py._encode_segment` hardcodes AAC
+  at 192kbps/48kHz (not parameterized, and `render.py` is out of this task's file
+  ownership) — the preview's audio stays at that bitrate rather than 96k; negligible
+  next to the video-size savings and not worth forking the encode path.
+- **Invalidation**: `reel_content_hash(reel)` hashes exactly `{segments, transform,
+  transitions}` (NOT title/description/cue text/subtitle style — those don't change a
+  single frame) and is stored in a sidecar `<reel_id>.json` next to the mp4, plus mirrored
+  onto `reel["preview_hash"]`/`reel["preview_ready"]` in `project.json`. The "reel_previews"
+  job (`render_all_reel_previews`) skips any reel whose sidecar hash still matches.
+  `PATCH /api/projects/{pid}/reels/{rid}` (`magic_video_editor/api/reels.py`) computes the hash
+  before and after applying the patch; if a composition-affecting field actually changed,
+  it flips `preview_ready` false and auto-enqueues `"reel_previews"` (deduped on kind) —
+  AFTER its own `store.save`, not before, to close a real race where the queue's
+  load-mutate-save (and a racing background worker) could otherwise clobber the just-
+  applied edit (caught live by `scripts/test_reel_previews.py`).
+- **Queue job**: kind `"reel_previews"` registered in `KIND_RUNNERS` (see
+  `magic_video_editor/queue.py` + the registration at the bottom of `pipeline/reels.py`, mirroring
+  `pipeline/thumbs.py`'s own registration pattern) — one job per project renders every
+  reel missing a fresh preview, logging and skipping (not failing the whole job) on a
+  per-reel ffmpeg error. Auto-enqueued right after the reels pipeline stage completes,
+  whether via `run-all` or a standalone `stage:reels` re-run (`queue.py`'s
+  `_run_auto_enqueue_hooks`), same spirit as thumbs/proxies auto-enqueuing after ingest.
+- **Endpoint**: `GET /api/projects/{pid}/media/reel-preview/{reel_id}` (`server.py`, route only
+  — reuses the existing `_stream` Range helper exactly like `/media/preview/{cid}`) — 206 on a
+  Range request, 404 while the reel has no rendered preview yet or doesn't exist.
+- **Frontend** (`ui/tabs/reels.js`): the filmstrip poster (`_reelsThumbEntry`/
+  `_reelsApplyPoster`) shows immediately regardless of preview state. Once
+  `reel.preview_ready` (a flag in the reels payload, no endpoint probing needed), hovering
+  the card lazily creates a muted looping `<video>` against the preview endpoint; clicking
+  unmutes it (sound-on, the explicit "play this" gesture) — at most 1-2 live decoders at
+  rest, created on hover/click and torn down on mouseleave, same as before. Before that,
+  the card shows a subtle "Generando previsualización…" badge and no video at all (never
+  a dead one). Refreshing on completion reuses the EXISTING queue poll
+  (`ui/core.js`'s `pollQueue`/`refreshProject`, triggered when the queue's running-item
+  count drops to zero) — no new poller was added.
+
+### v7.14 addendum — drawer never plays the export, and existing projects get backfilled
+
+Two seams left the drawer black in exactly the same way the original bug did, found by
+testing live against a real project:
+
+- **Drawer always plays the low-res preview, never the export.** A rendered reel
+  (`r.path` set, `r.status === "rendered"`) used to point the card's `<video>` at
+  `GET /media/file?path=<absolute export path>` instead of the poster/preview flow.
+  Exports land under `settings.export_dir` (`~/Movies/...` by default), which is outside
+  the project dir — `media_file()` (`server.py`) 403s anything outside it, so that player
+  was dead (`MediaError` code 4). Product decision: the drawer plays the cheap 9:16
+  preview unconditionally, rendered or not — full quality is an export-only concern.
+  `ui/tabs/reels.js` no longer branches on `r.path` at all; every card goes through the
+  same poster + `GET /media/reel-preview/{id}` path, and a rendered reel is distinguished
+  only by a "Rendered <time>" badge and the button reading "Re-render 9:16" instead of
+  "Render 9:16".
+- **Backfill for projects whose reels predate this feature.** `"reel_previews"` was only
+  ever auto-enqueued right after a reels-producing stage or a composition-changing PATCH
+  — any project that already had reels before v7.14 landed (or whose render never
+  finished) had no path to ever get one; `preview_ready` is simply absent and the
+  endpoint 404s forever. `GET /api/projects/{pid}` (`api/projects.py`'s `project_get`,
+  via `_backfill_reel_previews_once`) now self-heals this on read: for each reel, after
+  `reels.ensure_segments()` normalizes legacy shapes, `reels._preview_is_current()`
+  checks the on-disk mp4 + hash sidecar exactly like the queue job does; if any reel is
+  stale or missing one, `"reel_previews"` is enqueued once (`queue.enqueue(..., dedupe=
+  True)`). A module-level guard (same `_healed_once`-style pattern as `store.py`'s
+  legacy-path self-heal) makes sure a given project is only ever inspected once per
+  process, so this never re-checks on every poll/`refreshProject()` tick and never
+  enqueues when everything is already fresh. Deliberately NOT hooked into `store.load()`
+  itself: the `"reel_previews"` job's own runner calls `store.load()` while running,
+  which would let the read-path hook re-enqueue itself mid-run; the HTTP read path isn't
+  on that call graph. Covered by `scripts/test_reel_previews.py`'s
+  `ReelPreviewBackfillE2ETest` (legacy-shaped reel gets backfilled exactly once; an
+  already-fresh reel never enqueues, even on its very first GET).

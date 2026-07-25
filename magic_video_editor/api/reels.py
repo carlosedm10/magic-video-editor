@@ -1,6 +1,7 @@
-"""Reel Editor API (spec v5): per-reel overrides (in/out extension, crop_x,
-cue text overrides, per-reel subtitle style, editable title/description) and
-the copywriter "Regenerate copy" action.
+"""Reel Editor API (spec v5, framing updated to spec v7.11): per-reel
+overrides (in/out extension, framing transform, cue text overrides, per-reel
+subtitle style, editable title/description) and the copywriter "Regenerate
+copy" action.
 
 NOTE for the integrator: POST /api/projects/{pid}/reels/{rid}/render already
 exists in magic_video_editor/api/pipeline.py (enqueues "reel_render:{rid}" through the
@@ -18,7 +19,7 @@ from typing import Literal
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
-from .. import store
+from .. import queue, store
 from ..pipeline import reels, subtitles
 
 router = APIRouter(prefix="/api", tags=["reels"])
@@ -57,13 +58,24 @@ class TransitionInput(BaseModel):
     duration: float = Field(default=0.4, gt=0.0, le=1.5)
 
 
+class TransformInput(BaseModel):
+    """Partial update of reel["transform"] (spec v7.11 "Reel framing v2") —
+    every field optional; unset fields keep whatever the reel already has
+    (merged in `reel_patch` below, same pattern as `subtitle_style`). Ranges
+    match magic_video_editor/pipeline/faces.py's TRANSFORM_ZOOM_MIN/MAX and
+    TRANSFORM_OFFSET_MIN/MAX exactly."""
+
+    zoom: float | None = Field(default=None, ge=0.5, le=3.0)
+    offset_x: float | None = Field(default=None, ge=-1.0, le=1.0)
+    offset_y: float | None = Field(default=None, ge=-1.0, le=1.0)
+
+
 class ReelPatch(BaseModel):
     """All fields optional — only what's provided (model_dump(exclude_unset))
     is applied, so a client can PATCH just one override at a time."""
 
     in_override: float | None = None
     out_override: float | None = None
-    crop_x: float | None = Field(default=None, ge=0.0, le=1.0)
     cue_overrides: dict[str, str] | None = None
     subtitle_style: SubtitleStyleOverride | None = None
     title: str | None = None
@@ -72,11 +84,17 @@ class ReelPatch(BaseModel):
     # module docstring for the segments/transitions shape.
     segments: list[SegmentInput] | None = None
     transitions: list[TransitionInput] | None = None
-    # Fit mode / safe-zone one-click fix (spec v7.7) — see
-    # magic_video_editor/pipeline/reels.py's DEFAULT_FIT_MODE/DEFAULT_FIT_SCALE
-    # and _fit_blur_vf. Range matches pipeline/safezones.py's
-    # FIT_SCALE_MIN/MAX exactly (that module's `suggested_fit_scale` values
-    # are meant to be PATCHed straight back here).
+    # Framing transform (spec v7.11) — see magic_video_editor/pipeline/reels.py's
+    # DEFAULT_TRANSFORM / _normalize_transform and
+    # magic_video_editor/pipeline/faces.py's transform_crop_rect.
+    transform: TransformInput | None = None
+    # --- Legacy fields (spec v7.7), retired as of v7.11 but still ACCEPTED
+    # here and mapped onto `transform` so a caller that hasn't migrated yet
+    # (e.g. the safety-zone one-click fix, still PATCHing
+    # {fit_mode:"fit_blur", fit_scale} as of this writing) keeps working.
+    # Never written back to the reel as authoritative fields by this
+    # handler — see `_legacy_fields_to_transform` below.
+    crop_x: float | None = Field(default=None, ge=0.0, le=1.0)
     fit_mode: Literal["fill", "fit_blur"] | None = None
     fit_scale: float | None = Field(default=None, ge=0.6, le=1.0)
 
@@ -108,6 +126,34 @@ def _validate_window(
         raise HTTPException(400, f"{where}: out_override must be greater than in_override")
 
 
+def _legacy_fields_to_transform(fields: dict) -> dict:
+    """Maps the retired {crop_x, fit_mode, fit_scale} PATCH fields (spec
+    v7.7) onto an equivalent partial reel["transform"] update (spec v7.11),
+    mirroring magic_video_editor.pipeline.reels._normalize_transform's
+    read-time migration formula exactly, so a caller that hasn't migrated
+    yet (e.g. the safety-zone one-click fix's PATCH {fit_mode:"fit_blur",
+    fit_scale}) keeps landing on the same effective framing:
+      - crop_x -> offset_x = clamp((crop_x - 0.5) * 2, -1, 1)
+      - fit_mode == "fit_blur" -> zoom = fit_scale (falls back to the old
+        default 0.82 if fit_scale wasn't sent in the same PATCH)
+      - fit_mode == "fill" -> zoom = 1.0 (a fit_scale sent alongside it is
+        ignored -- it was only ever meaningful under fit_blur)
+      - fit_scale sent WITHOUT fit_mode -> zoom = fit_scale (the old
+        contract already treated a fit_scale-only PATCH as implicitly
+        fit_blur, since fit_scale had no effect under "fill")
+    Returns {} if none of the three legacy fields were sent."""
+    out: dict = {}
+    if fields.get("crop_x") is not None:
+        out["offset_x"] = max(-1.0, min(1.0, (float(fields["crop_x"]) - 0.5) * 2.0))
+    fit_mode = fields.get("fit_mode")
+    fit_scale = fields.get("fit_scale")
+    if fit_mode == "fill":
+        out["zoom"] = 1.0
+    elif fit_mode == "fit_blur" or (fit_mode is None and fit_scale is not None):
+        out["zoom"] = float(fit_scale if fit_scale is not None else reels.LEGACY_DEFAULT_FIT_SCALE)
+    return out
+
+
 @router.patch("/projects/{pid}/reels/{rid}")
 def reel_patch(pid: str, rid: str, body: ReelPatch):
     project, reel = _load_reel(pid, rid)
@@ -115,6 +161,12 @@ def reel_patch(pid: str, rid: str, body: ReelPatch):
     duration = (clip.get("info") or {}).get("duration")
 
     fields = body.model_dump(exclude_unset=True)
+    # Preview invalidation (spec v7.14): captured before any mutation below
+    # so we can tell, after applying the patch, whether the reel's rendered
+    # COMPOSITION (segments/transform/transitions -- see
+    # magic_video_editor/pipeline/reels.py's reel_content_hash) actually
+    # changed, as opposed to e.g. just a title/cue-text edit.
+    preview_hash_before = reels.reel_content_hash(reel)
 
     if "in_override" in fields or "out_override" in fields:
         new_in = fields.get("in_override", reel.get("in_override"))
@@ -162,18 +214,25 @@ def reel_patch(pid: str, rid: str, body: ReelPatch):
         # a segments/transitions replace (spec v5.8b).
         reels.ensure_segments(reel)
 
-    if "crop_x" in fields:
-        reel["crop_x"] = fields["crop_x"]
-
-    if "fit_mode" in fields or "fit_scale" in fields:
-        if "fit_mode" in fields and fields["fit_mode"] is not None:
-            reel["fit_mode"] = fields["fit_mode"]
-        if "fit_scale" in fields and fields["fit_scale"] is not None:
-            reel["fit_scale"] = fields["fit_scale"]
-        # Re-clamp/default via the same normalization ensure_segments already
-        # applies on read, so a partial PATCH (e.g. fit_scale only, before a
-        # fit_mode has ever been set) still lands on a valid pair.
-        reels._normalize_fit(reel)
+    # Framing transform (spec v7.11) + backward-compat mapping of the
+    # retired {crop_x, fit_mode, fit_scale} trio (spec v7.7) onto it — see
+    # `_legacy_fields_to_transform`'s docstring for exactly how each legacy
+    # field translates. Either shape (or a mix, e.g. a legacy fit_scale
+    # PATCH landing after `transform` already exists) is merged onto
+    # whatever transform the reel already has, then re-clamped/defaulted via
+    # the same normalization ensure_segments already applies on read.
+    transform_fields = {}
+    if "transform" in fields and fields["transform"]:
+        transform_fields.update({k: v for k, v in fields["transform"].items() if v is not None})
+    legacy_transform = _legacy_fields_to_transform(fields)
+    if legacy_transform:
+        # Legacy fields are the caller's only lever in that PATCH (spec:
+        # they map onto the WHOLE transform, not just one axis) — but an
+        # explicit `transform` field in the same request wins per-key.
+        transform_fields = {**legacy_transform, **transform_fields}
+    if transform_fields:
+        reel["transform"] = {**(reel.get("transform") or {}), **transform_fields}
+        reels._normalize_transform(reel)
 
     if "cue_overrides" in fields:
         merged = dict(reel.get("cue_overrides") or {})
@@ -201,7 +260,27 @@ def reel_patch(pid: str, rid: str, body: ReelPatch):
     if fields:
         reel["status"] = "edited"
 
+    # Preview invalidation (spec v7.14): only a composition change
+    # (segments/transform/transitions) makes the existing low-res preview
+    # stale -- flip preview_ready off immediately so the drawer can show its
+    # pending state right away. Decided (and applied to `reel`) BEFORE the
+    # save below, and the actual enqueue happens AFTER it, on purpose:
+    # queue.enqueue() does its own store.load-mutate-save cycle (see
+    # magic_video_editor/queue.py) and, once the item is picked up, may start the
+    # background worker thread immediately -- enqueuing (and thus letting a
+    # racing worker load the project) BEFORE this handler's own store.save()
+    # landed was found to let the worker's status-update save clobber this
+    # PATCH's edits right back to their pre-PATCH values (reproduced live by
+    # scripts/test_reel_previews.py). Saving first closes that window.
+    invalidated = fields and reels.reel_content_hash(reel) != preview_hash_before
+    if invalidated:
+        reel["preview_ready"] = False
+
     store.save(project)
+
+    if invalidated:
+        queue.enqueue(pid, "reel_previews", {}, dedupe=True)
+
     return reel
 
 

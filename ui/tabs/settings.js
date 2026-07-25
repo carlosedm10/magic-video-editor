@@ -66,6 +66,24 @@ const WHISPER_OPTIONS = [
 ];
 const WHISPER_CUSTOM = "__custom__";
 
+// Field bug follow-up (2026-07-25): whisper's per-clip auto language
+// detection can misfire on one clip's first window and TRANSLATE instead
+// of transcribing (fluent Spanish -> fluent English, not garbage). "Auto"
+// keeps today's per-clip detection (+ pipeline/transcribe.py's
+// majority-vote self-heal); any other code pins every clip's language,
+// skipping auto-detect. Kept in sync with magic_video_editor/api/settings.py
+// LANGUAGE_CODES and the "Idioma" per-project override in mediabin.js.
+const LANGUAGE_OPTIONS = [
+  ["auto", "Auto (detectar)"],
+  ["es", "Español"],
+  ["en", "English"],
+  ["fr", "Français"],
+  ["de", "Deutsch"],
+  ["it", "Italiano"],
+  ["pt", "Português"],
+  ["ca", "Català"],
+];
+
 const _sfs = {
   section: "general",
   settings: null,
@@ -658,6 +676,17 @@ function _sfsRenderModels(host) {
           value="${esc(whisperCustomVisible ? (s.whisper_model || "") : "")}"
           placeholder="mlx-community/whisper-..." />
       </div>
+      <div class="sfs-field">
+        <label class="sfs-label">Idioma del contenido</label>
+        <select class="sfs-select" id="s-transcription-language">
+          ${LANGUAGE_OPTIONS.map(([code, label]) =>
+            `<option value="${code}" ${s.transcription_language === code ? "selected" : ""}>${esc(label)}</option>`).join("")}
+        </select>
+        <div class="sfs-hint">Auto detecta el idioma clip a clip -- rara vez falla, pero un
+          único clip mal detectado puede salir TRADUCIDO a otro idioma en vez de transcrito
+          (Whisper traduce cuando confunde el idioma). Fijar un idioma aquí lo aplica a todos
+          los clips de todos los proyectos que no tengan su propio "Idioma" (bandeja de medios).</div>
+      </div>
       <div class="sfs-hint sfs-whisper-explainer">
         Speech-to-text uses Whisper — the open-source standard for transcription — not an
         Ollama LLM. It produces the word-level timestamps every edit decision depends on, and
@@ -685,6 +714,8 @@ function _sfsRenderModels(host) {
   };
   whisperCustom.onkeydown = (e) => { if (e.key === "Enter") whisperCustom.blur(); };
   whisperCustom.onblur = () => _sfsSaveWhisper(whisperCustom.value);
+
+  $("#s-transcription-language").onchange = (e) => _sfsSaveTranscriptionLanguage(e.target.value);
 }
 
 async function _sfsSaveModels() {
@@ -709,6 +740,16 @@ async function _sfsSaveWhisper(value) {
   if (_sfs.settings && _sfs.settings.whisper_model === value.trim()) return;
   try {
     _sfs.settings = await api("/settings", { method: "PUT", body: { whisper_model: value.trim() } });
+    _sfsToast("Saved ✓");
+  } catch (e) {
+    _sfsToast(`Couldn't save: ${e.message}`, true);
+  }
+}
+
+async function _sfsSaveTranscriptionLanguage(value) {
+  if (_sfs.settings && _sfs.settings.transcription_language === value) return;
+  try {
+    _sfs.settings = await api("/settings", { method: "PUT", body: { transcription_language: value } });
     _sfsToast("Saved ✓");
   } catch (e) {
     _sfsToast(`Couldn't save: ${e.message}`, true);

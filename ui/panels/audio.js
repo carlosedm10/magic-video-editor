@@ -45,6 +45,74 @@ function _audioEqNormalizeGains(gains) {
   return out;
 }
 
+function _audioEqIsFlat(gains) {
+  return !Array.isArray(gains) || gains.every((g) => Math.abs(Number(g) || 0) < 1e-6);
+}
+
+/* ---------- STUTTER-FIX root-cause note (reproduced by code walkthrough) ----------
+   Draft playback ("se ralla"/hangs at segment transitions, first clip dead
+   until the user leaves+reenters the project, breaks again on the very next
+   cross-clip auto-advance) was NOT a player.js regression — player.js's
+   segment-swap path (mount/_loadSegment/_advance/_preloadNext) is unchanged
+   and correct. It was this file:
+
+   render() used to call `this._ensureLiveEqGraph()` UNCONDITIONALLY, on
+   every single render — and this panel is rendered eagerly and unconditionally
+   by ui/editor/inspector.js's Inspector.mount() -> renderColorAudio() (ALL
+   inspector tabs pre-render, just hidden) AND again on every
+   EditorUI.onProjectRefreshed() (ui/editor/state.js), which fires on
+   literally every project open and every background job completion — none
+   of which are user gestures.
+
+   _ensureLiveEqGraph() built a real `new AudioContext()` and called
+   `createMediaElementSource()` on #video-a AND #video-b (the two
+   double-buffered elements player.js swaps between for gapless cross-clip
+   playback) the very first time this ran — i.e. at project-open, cold,
+   before any click. Per browser autoplay policy a context created outside a
+   user-gesture call stack starts (and, since our resume() call is likewise
+   not inside a gesture's synchronous stack at that point, STAYS) "suspended".
+
+   Once createMediaElementSource() has been called on a <video>, that
+   element's audio is PERMANENTLY rerouted through the WebAudio graph — there
+   is no way back to native routing. With the destination never pulling
+   samples (context suspended), Chromium/WebKit backpressure the media
+   element's own decode pipeline waiting on the stalled graph — which doesn't
+   just silence audio, it visibly stutters/stalls the <video>'s playback
+   too. That is the "se ralla" / hang. It reproduces on BOTH video-a and
+   video-b identically (both get wired at the same cold mount), which is why
+   it also breaks the very first cross-clip auto-advance (_advance()'s
+   doSwap() swaps to the OTHER element, already wired to the same suspended
+   graph) — not a separate bug in the swap logic.
+
+   "Leave and re-enter the project" only appeared to fix it because opening a
+   project from a click IS a user gesture — Inspector.mount() (and thus
+   _ensureLiveEqGraph()'s resume() call) then runs synchronously inside that
+   click's call stack, so resume() actually succeeds that time. It's a
+   coincidence of timing, not a real fix.
+
+   Fix (this file): build the AudioContext/graph LAZILY — only when the
+   project's EQ is already non-flat on load, or the moment the user first
+   touches a slider/preset/reset — and add a persistent, cheap, gesture-
+   linked kicker that resumes the context on the next pointerdown/keydown/
+   click anywhere, so even the "non-flat on cold load" case unsuspends on the
+   user's very first interaction instead of needing a leave+reenter. When the
+   EQ is flat and no graph has ever been created, render() now does nothing
+   WebAudio-related at all — playback is 100% native, exactly as before the
+   EQ feature existed. */
+function _audioEqWireGestureResume() {
+  if (window.__audioEqGestureResumeWired) return;
+  window.__audioEqGestureResumeWired = true;
+  const tryResume = () => {
+    const ctx = window.AudioPanel?._audioCtx;
+    if (ctx && ctx.state === "suspended") ctx.resume().catch(() => {});
+  };
+  // Capture phase, passive: cheap no-op until a graph actually exists, and
+  // never interferes with the app's own gesture handling either way.
+  window.addEventListener("pointerdown", tryResume, { capture: true, passive: true });
+  window.addEventListener("keydown", tryResume, { capture: true, passive: true });
+}
+_audioEqWireGestureResume();
+
 window.AudioPanel = window.AudioPanel || {
   _preview: null, // { clipId, original_url, enhanced_url } | null
   _eqGains: null, // current 8 gains (live working copy, pre-save)
@@ -144,10 +212,27 @@ window.AudioPanel = window.AudioPanel || {
     const enabled = !!project.audio_enhance;
     const clips = project.clips || [];
 
-    if (!this._eqGains) this._eqGains = _audioEqNormalizeGains(project.audio_eq);
+    // Bug fix: _eqGains/_preview are a module-level singleton that used to
+    // be seeded once ever (`if (!this._eqGains)`) and never revisited — the
+    // SPA never reloads on project switch, so opening project B after A
+    // kept showing AND live-applying A's EQ gains to B's playback until the
+    // user happened to touch a slider. Reset both whenever the project
+    // we're rendering for actually changed.
+    if (this._eqProjectId !== project.id) {
+      this._eqProjectId = project.id;
+      this._eqGains = _audioEqNormalizeGains(project.audio_eq);
+      this._preview = null;
+    } else if (!this._eqGains) {
+      this._eqGains = _audioEqNormalizeGains(project.audio_eq);
+    }
     const gains = this._eqGains;
 
-    this._ensureLiveEqGraph();
+    // LAZY by design (see the root-cause note above): only wire the WebAudio
+    // graph here if it already exists (keep it in sync with current gains)
+    // or the project's saved EQ is non-flat. A flat EQ with no prior graph
+    // means this render() call touches NOTHING WebAudio-related — playback
+    // stays 100% native.
+    if (this._audioCtx || !_audioEqIsFlat(gains)) this._ensureLiveEqGraph();
 
     const clipOptions = clips
       .map((c) => `<option value="${c.id}">${esc(c.filename || c.path)}</option>`)
@@ -277,6 +362,11 @@ window.AudioPanel = window.AudioPanel || {
 
     container.querySelectorAll(".audio-eq-slider").forEach((slider) => {
       slider.oninput = () => {
+        // Touching a slider is a real user gesture (this handler runs
+        // synchronously inside the browser's trusted "input" dispatch) — the
+        // exact trigger the lazy-creation policy is waiting for. Safe/
+        // idempotent if a graph already exists.
+        this._ensureLiveEqGraph();
         const i = Number(slider.dataset.band);
         const g = Math.max(AUDIO_EQ_MIN_DB, Math.min(AUDIO_EQ_MAX_DB, parseFloat(slider.value) || 0));
         this._eqGains[i] = g;
@@ -291,6 +381,9 @@ window.AudioPanel = window.AudioPanel || {
       const btn = container.querySelector(id);
       if (btn) {
         btn.onclick = () => {
+          // Same reasoning as the slider: a preset/reset click is a genuine
+          // gesture, in the trusted synchronous "click" call stack.
+          this._ensureLiveEqGraph();
           applyGainsToUi(gains.slice());
           this._scheduleEqSave(state.pid, this._eqGains);
         };

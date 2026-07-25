@@ -24,11 +24,17 @@ TASKS = (
 SUBTITLE_STYLES = ("clean", "bold", "karaoke")
 SUBTITLE_POSITIONS = ("bottom", "center")
 
+# Field bug follow-up (2026-07-25): "auto" per-clip language auto-detection
+# can misfire and TRANSLATE instead of transcribe. Shared with
+# api/projects.py's per-project language_override (same value space).
+LANGUAGE_CODES = ("auto", "es", "en", "fr", "de", "it", "pt", "ca")
+
 
 class SettingsIn(BaseModel):
     default_model: str | None = None
     task_models: dict[str, str | None] | None = None
     whisper_model: str | None = None
+    transcription_language: str | None = None
     export_dir: str | None = None
     subtitles: dict | None = None
     performance: dict | None = None
@@ -76,6 +82,13 @@ def put_settings(body: SettingsIn):
         if not isinstance(body.whisper_model, str) or not body.whisper_model.strip():
             raise HTTPException(422, "whisper_model must be a non-empty string")
         current["whisper_model"] = body.whisper_model
+
+    if body.transcription_language is not None:
+        if body.transcription_language not in LANGUAGE_CODES:
+            raise HTTPException(
+                422, f"transcription_language must be one of {LANGUAGE_CODES}"
+            )
+        current["transcription_language"] = body.transcription_language
 
     if body.export_dir is not None:
         current["export_dir"] = _validate_export_dir(body.export_dir)

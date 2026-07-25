@@ -325,9 +325,22 @@ def _run_auto_enqueue_hooks(pid: str, project: dict, item: dict) -> None:
     """Auto-enqueue rules (spec "Auto-enqueue rules"): completing run-all
     enqueues thumbs + reel_render for the top 5 reels. thumbs/reel_render
     kinds are fine to enqueue even before their runners exist -- an
-    unregistered kind just errors that one item (see _resolve_runner)."""
+    unregistered kind just errors that one item (see _resolve_runner).
+
+    Reel previews (spec v7.14): right after the reels pipeline stage
+    completes -- whether as the last step of a run-all or as a standalone
+    "stage:reels" re-run -- auto-enqueue "reel_previews" so every reel
+    suggestion gets its cheap low-res 9:16 preview render without the user
+    having to ask for it, same spirit as thumbs/proxies auto-enqueuing after
+    ingest. Dedupe on kind means a "reel_previews" already pending (e.g.
+    queued a moment earlier by a reel edit, see api/reels.py) just gets
+    reused rather than duplicated."""
     if item["kind"] == "run-all" and item["status"] == "done":
         enqueue(pid, "thumbs", {}, dedupe=True)
         top5 = sorted(project.get("reels", []), key=lambda r: r.get("rank", 999))[:5]
         for reel in top5:
             enqueue(pid, f"reel_render:{reel['id']}", {"reel_id": reel["id"]}, dedupe=True)
+        if project.get("reels"):
+            enqueue(pid, "reel_previews", {}, dedupe=True)
+    elif item["kind"] == "stage:reels" and item["status"] == "done" and project.get("reels"):
+        enqueue(pid, "reel_previews", {}, dedupe=True)

@@ -201,6 +201,21 @@ def media_preview(pid: str, cid: str, request: Request):
     return _stream(Path(path), request)
 
 
+@app.get("/api/projects/{pid}/media/reel-preview/{reel_id}")
+def media_reel_preview(pid: str, reel_id: str, request: Request):
+    """Low-res 9:16 reel preview stream (spec v7.14 "Reel preview render"):
+    <project_dir>/previews/reels/{reel_id}.mp4, produced in the background
+    by the "reel_previews" queue job (magic_video_editor/pipeline/reels.py). 404
+    while it hasn't been rendered yet (or the reel doesn't exist) -- same
+    Range-aware streaming as media_preview/media_clip above, so the drawer
+    can scrub it."""
+    project = store.load(pid)
+    if not any(r["id"] == reel_id for r in project.get("reels", [])):
+        raise HTTPException(404, "reel not found")
+    path = store.project_dir(pid) / "previews" / "reels" / f"{reel_id}.mp4"
+    return _stream(path, request)
+
+
 @app.get("/api/projects/{pid}/media/file")
 def media_file(pid: str, path: str, request: Request):
     pdir = store.project_dir(pid).resolve()

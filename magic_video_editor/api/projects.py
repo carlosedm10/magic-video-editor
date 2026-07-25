@@ -6,7 +6,8 @@ from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel
 
 from .. import queue, store
-from ..pipeline import copywriter, ingest, ordering
+from ..pipeline import copywriter, ingest, ordering, reels
+from .settings import LANGUAGE_CODES
 
 router = APIRouter(prefix="/api", tags=["projects"])
 
@@ -63,6 +64,12 @@ class ProjectUpdate(BaseModel):
     # for speaker_count=1).
     speaker_count: int | str | None = None
     speakers: list[SpeakerUpdate] | None = None
+    # Field bug follow-up (2026-07-25): per-project transcription language
+    # override -- "auto" (default, falls through to the settings-level
+    # transcription_language) or an ISO code that pins every clip in this
+    # project, skipping whisper's per-clip auto-detect. See
+    # pipeline/transcribe.py _resolve_language / LANGUAGE_CODES.
+    language_override: str | None = None
 
 
 @router.get("/projects")
@@ -82,7 +89,56 @@ def project_get(pid: str):
     except FileNotFoundError:
         raise HTTPException(404) from None
     p["edl_preview"] = ordering.build_edl(p) if p.get("sentences") else []
+    _backfill_reel_previews_once(pid, p)
     return p
+
+
+# Field bug fix (v7.14 addendum, SEAM 2): "reel_previews" was only ever
+# auto-enqueued right after a reels-producing pipeline stage (run-all,
+# stage:reels) or a composition-changing PATCH (api/reels.py's reel_patch).
+# Any project whose reels predate this feature -- or whose preview render
+# failed/was interrupted before it could flip preview_ready -- never gets a
+# second chance: GET /media/reel-preview/{id} 404s forever and the drawer
+# is back to the exact dead-player bug v7.14 exists to fix, just via a
+# different path. This is the cheapest read-side hook available: the GET
+# project payload IS the drawer's data source (ui/tabs/reels.js reads
+# r.preview_ready straight off it, per spec v7.14's own frontend note), so
+# checking here catches "opened a project" the same way the store.py
+# `_self_heal_legacy_paths` self-heal catches "loaded a project" -- same
+# _healed_once-style guard, so this only ever inspects a given project's
+# reels once per process (not on every single poll/refreshProject() tick),
+# and it must never enqueue on a fully-fresh project (verified in
+# scripts/test_reel_previews.py). Hooking store.load() itself (every
+# pipeline stage and the queue worker's own project loads go through it)
+# was considered and rejected: the "reel_previews" job itself calls
+# store.load() while running, which would let this hook re-enqueue itself
+# mid-run -- a self-perpetuating loop. The HTTP read path is not on that
+# call graph, so it can't recurse into the job it just started.
+_reel_preview_backfill_checked: set[str] = set()
+
+
+def _backfill_reel_previews_once(pid: str, project: dict) -> None:
+    if pid in _reel_preview_backfill_checked:
+        return
+    _reel_preview_backfill_checked.add(pid)
+
+    reels_list = project.get("reels") or []
+    if not reels_list:
+        return
+
+    stale = False
+    for reel in reels_list:
+        # In-memory only (mirrors api/reels.py's _load_reel): normalizes the
+        # legacy single-window shape so reel_content_hash/_preview_is_current
+        # have segments/transform to hash, without persisting a write for a
+        # plain read.
+        reels.ensure_segments(reel)
+        if not reels._preview_is_current(project, reel):
+            stale = True
+            break
+
+    if stale:
+        queue.enqueue(pid, "reel_previews", {}, dedupe=True)
 
 
 @router.patch("/projects/{pid}")
@@ -105,6 +161,10 @@ def project_update(pid: str, body: ProjectUpdate):
         if body.speaker_count not in SPEAKER_COUNTS:
             raise HTTPException(422, 'speaker_count must be one of 1, 2, 3, 4, "auto"')
         project["speaker_count"] = body.speaker_count
+    if body.language_override is not None:
+        if body.language_override not in LANGUAGE_CODES:
+            raise HTTPException(422, f"language_override must be one of {LANGUAGE_CODES}")
+        project["language_override"] = body.language_override
     if body.speakers is not None:
         by_id = {sp["id"]: sp for sp in project.get("speakers", [])}
         for upd in body.speakers:

@@ -15,6 +15,7 @@ window.EditorUI = window.EditorUI || {};
 const KIND_LABEL = {
   redundant: "Redundant", repeated_idea: "Repeated idea",
   off_topic: "Off topic", incoherent: "Incoherent",
+  placement: "New clip", duplicate_clip: "Possible duplicate",
 };
 
 const Suggestions = {
@@ -31,7 +32,14 @@ const Suggestions = {
     this.container.innerHTML = '<div class="card"><b>Suggestions</b><div class="hint">Loading…</div></div>';
     try {
       const res = await api(`/projects/${state.pid}/suggestions`);
-      this.items = Array.isArray(res) ? res : res.suggestions || [];
+      const all = Array.isArray(res) ? res : res.suggestions || [];
+      // Only ever show cards still awaiting a decision -- accepted/dismissed
+      // suggestions must not linger in the Ideas panel with live Accept/
+      // Dismiss buttons (bug found live: an already-accepted "placement"
+      // card kept rendering as actionable, since project["suggestions"] is
+      // an append-only log, not a queue of pending items). Missing status
+      // (old-format items) defaults to open for backward compat.
+      this.items = all.filter((s) => (s.status || "open") === "open");
       this._render();
     } catch (e) {
       const notReady = e.status === 404;

@@ -261,17 +261,56 @@ function updateTopbarForProject() {
    Replaces the old 8 always-visible stage pills with ONE compact chip
    ("Pipeline ✓" done / "Pipeline N/8" in progress / garnet error) that opens
    an anchored popover listing every stage with its status and a per-stage
-   re-run button (same runStage() the old pills called). The run-all
-   progress strip (#run-all-panel, renderRunAllPanel below) is untouched --
-   it stays visible during a run-all exactly as before; this chip is purely
-   the "what's each stage's last status, and let me re-run just one" surface,
-   always available (not just mid-run-all). Self-contained: injects its own
-   <style> + popover DOM into #stage-bar (still the anchor element from
-   ui/index.html) the first time renderStageBar() runs, the same "chrome
-   injection" pattern ui/editor/player.js and ui/editor/timeline.js already
-   use for pieces index.html/style.css don't know about. */
+   re-run button (same runStage() the old pills called). Self-contained:
+   injects its own <style> + popover DOM into #stage-bar (still the anchor
+   element from ui/index.html) the first time renderStageBar() runs, the
+   same "chrome injection" pattern ui/editor/player.js and
+   ui/editor/timeline.js already use for pieces index.html/style.css don't
+   know about.
+
+   SYNC-FIX root cause (field bug: strip showed all-green/near-100% while
+   the chip popover correctly showed "4 Takes ERROR" + stages 5-8 pending):
+   the chip/popover and the run-all strip used to read TWO DIFFERENT stage
+   objects. The chip read state.project.stages -- the persisted project
+   snapshot, which is only refreshed by refreshProject(), and refreshProject()
+   during a run-all only fires once the whole item stops running (pollQueue's
+   wasRunning->!nowRunning check) or incidentally from an unrelated action
+   elsewhere (e.g. ui/tabs/takes.js's own refreshProject() call, mediabin
+   uploads, watchJob() finishing a different job). So mid-run, state.project
+   .stages could be showing this project's PREVIOUS run's final stage
+   statuses (all done) for the entire duration, or the correct fresh ones,
+   depending entirely on which unrelated refresh happened to land last --
+   nondeterministic. The strip, meanwhile, read job.stages off the CURRENT
+   run's live job (state.jobs[runAllItem.job_id], refreshed every 2s poll
+   tick) -- a different object, on a different cadence, that could easily
+   disagree with whatever state.project.stages happened to be holding.
+   _derivePipelineStages() below is now the ONE place that decides, per
+   poll tick, what each stage's status/progress is; both renderStageBar
+   (chip + popover) and renderRunAllPanel (strip) call it and render off
+   the identical returned array -- there is no second path back to reading
+   state.project.stages directly while anything is running. */
 
 let _pipelineRows = [];
+
+function _derivePipelineStages() {
+  const persisted = state.project?.stages || {};
+  const raItem = state.runAllItem;
+  const raJob = raItem?.job_id ? state.jobs[raItem.job_id] : null;
+  const raLive = !!raItem && (raItem.status === "running" || raItem.status === "pending") && raJob?.stages;
+  return STAGES.map(([key]) => {
+    if (raLive && raJob.stages[key]) {
+      const st = raJob.stages[key];
+      return { key, status: st.status, progress: st.progress || 0, detail: st.detail || "" };
+    }
+    // A lone per-stage re-run (runStage(), not part of a run-all) has no
+    // job.stages map of its own -- its queue item's own live status IS the
+    // truth for that one key.
+    const solo = state.queue.some((i) => i.status === "running" && i.kind === `stage:${key}`);
+    if (solo) return { key, status: "running", progress: 0, detail: "" };
+    const st = persisted[key];
+    return { key, status: st?.status || "pending", progress: st?.status === "done" ? 1 : 0, detail: st?.detail || "" };
+  });
+}
 
 function _ensurePipelineChip() {
   let chip = document.getElementById("pipeline-chip");
@@ -385,24 +424,25 @@ function renderPipelinePopover() {
   refreshIcons();
 }
 
+// ONE source of truth for per-stage status (root-cause fix, see the long
+// comment on _derivePipelineStages below): renderStageBar (chip + popover)
+// and renderRunAllPanel (the progress strip) both call this, once per poll
+// tick, and render off the exact same returned array -- neither one is
+// allowed to independently read state.project.stages vs a job object again.
+const _STAGE_SHORT_LABELS = Object.fromEntries(STAGES);
+
 function renderStageBar() {
-  const stages = state.project.stages || {};
   const chip = _ensurePipelineChip();
+  const rows = _derivePipelineStages();
   let doneCount = 0;
   let runningCount = 0;
   let errorLabel = null;
-  _pipelineRows = STAGES.map(([key, label]) => {
-    // Queue-driven (spec v4 §2): a stage is "running" when its queue item
-    // (kind "stage:<key>") is currently the one the worker picked up, not
-    // via the old jobs.start() naming convention (queue jobs are all named
-    // "queue:<kind>:<pid>" now -- see magic_video_editor/queue.py _run_item).
-    const running = state.queue.some((i) => i.status === "running" && i.kind === `stage:${key}`);
-    const st = stages[key];
-    const status = running ? "running" : (st?.status || "pending");
+  _pipelineRows = rows.map(({ key, status, progress, detail }) => {
+    const label = _STAGE_SHORT_LABELS[key] || key;
     if (status === "done") doneCount++;
     else if (status === "running") runningCount++;
     else if (status === "error" && !errorLabel) errorLabel = label;
-    return { key, label, status, detail: st?.detail || "" };
+    return { key, label, status, progress, detail };
   });
   if (!chip) return;
   const total = STAGES.length;
@@ -450,7 +490,6 @@ function renderRunAllPanel() {
   const panel = $("#run-all-panel");
   const btn = $("#run-all-btn");
   const item = state.runAllItem;
-  const job = item?.job_id ? state.jobs[item.job_id] : null;
   const running = !!item && (item.status === "running" || item.status === "pending");
   if (btn) {
     // Resource safety: while a pipeline run is queued/running for this
@@ -471,17 +510,43 @@ function renderRunAllPanel() {
     panel.innerHTML = "";
     return;
   }
-  const stages = job?.stages || {};
+  // Same _pipelineRows the chip/popover just rendered from this tick
+  // (renderStageBar() always runs before renderRunAllPanel() -- see
+  // pollQueue()/watchJob() below) -- one source of truth, per the
+  // _derivePipelineStages comment above. A stage's progress freezes the
+  // instant it errors (the backend stops mutating job.stages for any stage
+  // past the one that raised), so the bar simply stops advancing there too.
   panel.hidden = false;
-  panel.innerHTML = STAGES.map(([key]) => {
-    const st = stages[key] || { status: "pending", progress: 0 };
-    const pct = Math.round((st.progress || 0) * 100);
-    return `<div class="run-all-row">
-      <span class="run-all-label">${esc(STAGE_LABELS[key] || key)}</span>
-      <div class="run-all-bar"><div class="run-all-fill ${st.status}" style="width:${pct}%"></div></div>
-      <span class="run-all-pct">${st.status === "error" ? "!" : `${pct}%`}</span>
+  panel.innerHTML = _pipelineRows.map(({ key, status, progress, detail }) => {
+    const pct = Math.round((progress || 0) * 100);
+    const errored = status === "error";
+    return `<div class="run-all-item">
+      <div class="run-all-row">
+        <span class="run-all-label">${esc(STAGE_LABELS[key] || key)}</span>
+        <div class="run-all-bar"><div class="run-all-fill ${status}" style="width:${pct}%"></div></div>
+        <span class="run-all-pct">${errored ? "!" : `${pct}%`}</span>
+      </div>
+      ${errored && detail ? `<span class="run-all-error" title="${esc(detail)}">${esc(detail)}</span>` : ""}
     </div>`;
   }).join("");
+}
+
+// Surfaces a toast ("<stage>: <first line of error>") the one time a
+// run-all transitions from running/pending to errored, using the exact same
+// job.stages the strip/chip just rendered from (_pipelineRows) to name the
+// stage that actually failed -- never re-derived from a second source, and
+// never re-fired on subsequent polls for the same finished item.
+function _maybeToastPipelineFailure(prevItem) {
+  if (!prevItem || state.runAllItem?.id === prevItem.id) return;
+  const finished = state.queue.find((i) => i.id === prevItem.id);
+  if (!finished || finished.status !== "error") return;
+  const toasted = (state._toastedRunAllErrorIds ??= new Set());
+  if (toasted.has(finished.id)) return;
+  toasted.add(finished.id);
+  const failedRow = _pipelineRows.find((r) => r.status === "error");
+  const stageLabel = failedRow ? (STAGE_LABELS[failedRow.key] || failedRow.key) : "Pipeline";
+  const detail = failedRow?.detail || finished.error || "";
+  showToast(`${stageLabel} failed${detail ? `: ${detail.split("\n")[0]}` : ""}`);
 }
 
 /* ---------- job queue polling (spec v4 §2) ----------
@@ -516,6 +581,7 @@ async function pollQueue() {
     }
     return;
   }
+  const prevRunAllItem = state.runAllItem;
   state.runAllItem = state.queue.find(
     (i) => i.kind === "run-all" && (i.status === "running" || i.status === "pending")) || null;
   if (state.runAllItem?.job_id) {
@@ -525,6 +591,7 @@ async function pollQueue() {
   updateActivityChip();
   renderStageBar();
   renderRunAllPanel();
+  _maybeToastPipelineFailure(prevRunAllItem);
   if (window.ActivityPopover?.isOpen()) window.ActivityPopover.render();
   if (state.project && (!state.runAllItem || state.runAllItem.status !== "running")) {
     // A run-all (or any stage) that just finished may have changed

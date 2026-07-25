@@ -2,10 +2,9 @@
   "version": "0.0.1",
   "configurations": [
     {
-      "name": "mve",
-      "cwd": "/Users/carlos.dominguez/projects/magic-video-editor",
-      "runtimeExecutable": "uv",
-      "runtimeArgs": ["run", "mve-server"],
+      "name": "mve-server",
+      "runtimeExecutable": "make",
+      "runtimeArgs": ["-C", "/Users/carlos.dominguez/projects/magic-video-editor", "server"],
       "port": 8765
     }
   ]

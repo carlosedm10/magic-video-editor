@@ -116,6 +116,9 @@ input[type=text] { width: 100%; }
 .run-all-fill.done { background: var(--accent2); }
 .run-all-fill.error { background: var(--danger); }
 .run-all-pct { width: 34px; text-align: right; color: var(--dim); }
+.run-all-item { display: flex; flex-direction: column; gap: 2px; }
+.run-all-error { margin-left: 160px; color: var(--danger); font-size: 11px;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis; cursor: default; }
 
 /* ============================= Content / empty ============================= */
 

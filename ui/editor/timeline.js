@@ -690,7 +690,8 @@ const Timeline = {
       entry.meta = await api(`/projects/${pid}/thumbs/${clipId}/meta`);
       entry.stripUrl = `/api/projects/${pid}/thumbs/${clipId}/strip`;
     } catch (_e) {
-      entry.metaFailed = true; // 404: no video track / not generated yet — plain block
+      entry.metaFailed = true; // 404: no video track / not generated yet — plain block fallback
+      this._enqueueThumbsRetry(pid, clipId, entry);
     }
     try {
       entry.peaks = await api(`/projects/${pid}/thumbs/${clipId}/peaks`);
@@ -699,6 +700,25 @@ const Timeline = {
     }
     entry.loading = false;
     if (Editor.pid === pid) this.render(); // reflow once — subsequent renders hit the cache
+  },
+
+  /* Missing artifacts (404 on /meta) usually just means the post-ingest
+     "thumbs" queue job hasn't run yet (or never got queued — e.g. clips
+     added by a manual EDL edit path that skipped it). Queue it once per
+     clip (server-side enqueue is itself dedupe'd on kind+payload, but we
+     still guard here so a busy timeline — render() fires on every pointer-
+     move during a drag — doesn't refire the POST every frame) and retry
+     the load a single time after it should have had a chance to finish. A
+     plain block (no filmstrip/waveform) renders in the meantime either way. */
+  _enqueueThumbsRetry(pid, clipId, entry) {
+    if (entry._thumbsRetryQueued) return;
+    entry._thumbsRetryQueued = true;
+    api(`/projects/${pid}/queue`, { method: "POST", body: { kind: "thumbs", payload: {} } }).catch(() => {});
+    setTimeout(() => {
+      if (Editor.pid !== pid) return; // project switched away — stale retry, drop it
+      entry.metaFailed = false; // allow _loadThumbs to try again; still falls back to plain block on repeat 404
+      this._loadThumbs(clipId, entry);
+    }, 5000);
   },
 
   _drawWaveform(canvas, peaks, clipDuration, segStart, segEnd) {
@@ -756,7 +776,7 @@ const Timeline = {
         style="left:${leftPx.toFixed(1)}px"
         title="${trLabel ? esc(trLabel) : "No transition"} — click to edit, or drag a transition here"
         >${trLabel ? esc(trLabel) : "·"}</div>
-      <div class="tl-block" data-idx="${i}" style="left:${leftPx.toFixed(1)}px;width:${widthPx.toFixed(1)}px"
+      <div class="tl-block" data-idx="${i}" style="left:${leftPx.toFixed(1)}px;width:${widthPx.toFixed(1)}px">
         ${filmHtml}
         <div class="tl-edge tl-edge-l" data-idx="${i}" data-edge="start"></div>
         <span class="tl-label">${esc(name)} · ${fmtT(dur)}</span>

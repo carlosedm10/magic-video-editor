@@ -31,6 +31,13 @@ DEFAULTS: dict = {
         "dedup_judge": None,
     },
     "whisper_model": config.WHISPER_MODEL,
+    # Field bug follow-up (2026-07-25): whisper's per-clip auto language
+    # detection can misfire on one clip's first window and TRANSLATE
+    # instead of transcribe (e.g. Spanish speech -> fluent English text).
+    # "auto" keeps today's per-clip detection (+ pipeline/transcribe.py's
+    # majority-vote self-heal); any other code pins every clip to it,
+    # skipping auto-detect. See pipeline/transcribe.py LANGUAGE_CODES.
+    "transcription_language": "auto",
     "performance": {
         "max_parallel_ffmpeg": 2,
         "ffmpeg_threads": None,

@@ -21,9 +21,19 @@
        as fractions of a 1080x1920 canvas]}, ...} -- fetched once per session
        (module-level cache, same pattern as reeleditor.js's _fontsCache).
      GET /api/projects/{pid}/reels/{rid}/safety?platform=<key> ->
-       {safe, coverage_pct, intervals: [{t0,t1,zone}], suggested_fit_scale}
-       -- t0/t1 are on the reel's own concatenated segment timeline (0 =
-       reel start), exactly what reeleditor.js's _seekToGlobalTime expects.
+       {safe, coverage_pct, intervals: [{t0,t1,zone,face_box,zone_rect}],
+       suggested_fit_scale, debug_samples, face_detection_ratio,
+       insufficient_face_data} -- t0/t1 are on the reel's own concatenated
+       segment timeline (0 = reel start), exactly what reeleditor.js's
+       _seekToGlobalTime expects. face_box/zone_rect are in OUTPUT
+       (1080x1920) fraction coords, same space as the zone mockup this
+       module already draws (2026-07-25 transparency follow-up to the false-
+       positive fix -- see pipeline/safezones.py's module docstring).
+     GET /api/projects/{pid}/reels/{rid}/safety/face-at?t=<seconds>&platform=
+       <key> -> {t, face_box, zone} -- on-demand single-frame lookup, used to
+       draw the face box LIVE while "Ver zonas" is active. Needs
+       `ctx.getCurrentTime()` wired by reeleditor.js (see setContext below);
+       degrades to no live box (interval-click debug still works) if absent.
      PATCH /api/projects/{pid}/reels/{rid} {fit_mode:"fit_blur", fit_scale}
        -- the one-click fix (magic_video_editor/api/reels.py, not this file's
        endpoint to define, just to call).
@@ -31,7 +41,17 @@
    Usage (see ui/editor/reeleditor.js for the call sites):
      SafeZonesUI.mount(barEl, cropWindowEl)   // once, first open
      SafeZonesUI.setContext({ pid, rid, getReel, getTotalDuration, onSeek,
-                              onReelPatched }) // every open / reel switch
+                              onReelPatched, getCurrentTime })
+                                               // every open / reel switch.
+                                               // getCurrentTime() -> seconds
+                                               // on the reel's own timeline
+                                               // (same space as onSeek) is
+                                               // OPTIONAL -- powers "Ver
+                                               // zonas" live face tracking;
+                                               // safe to omit (feature just
+                                               // stays inert, per this
+                                               // file's degrade-gracefully
+                                               // rule).
      SafeZonesUI.notifyChange()               // after in/out/crop/fit edits
      SafeZonesUI.reset()                      // on close
 
@@ -45,6 +65,7 @@
   const PLATFORM_ORDER = ["none", "tiktok", "reels", "shorts"];
   const NONE_LABEL = "Ninguno";
   const CHECK_DEBOUNCE_MS = 700;
+  const LIVE_POLL_MS = 500;
   const TOPBAR_LABELS = { tiktok: "Para ti", reels: "Reels", shorts: "Shorts" };
 
   let _specCache = null; // GET /api/safezones response, project-independent -- fetch once per session
@@ -73,6 +94,7 @@
     _zonesBtn: null,
     _msgEl: null,
     _overlayHost: null,
+    _debugHost: null,
     _spec: null,
     _ctx: null,
     _platform: "none",
@@ -82,6 +104,8 @@
     _safetyError: null,
     _checkSeq: 0,
     _debounceTimer: null,
+    _liveSeq: 0,
+    _liveTimer: null,
 
     /* ---------- one-time DOM + styles ---------- */
 
@@ -109,6 +133,8 @@
         this._showZones = !this._showZones;
         this._zonesBtn.classList.toggle("active", this._showZones);
         this._renderOverlay();
+        if (this._showZones) this._startLiveFaceTracking();
+        else this._stopLiveFaceTracking();
       };
 
       const overlay = document.createElement("div");
@@ -117,6 +143,17 @@
       overlay.hidden = true;
       cropWindowEl.appendChild(overlay);
       this._overlayHost = overlay;
+
+      // Separate host (sibling, not a child of `overlay`) for the
+      // face-box + offending-zone debug drawing: `_renderOverlay()`
+      // wholesale-replaces `overlay`'s innerHTML on every platform mockup
+      // redraw, which would otherwise wipe this out from under a live poll.
+      const debugHost = document.createElement("div");
+      debugHost.className = "szu-debug-overlay";
+      debugHost.id = "szu-debug-overlay";
+      debugHost.hidden = true;
+      cropWindowEl.appendChild(debugHost);
+      this._debugHost = debugHost;
 
       this._renderChips();
     },
@@ -148,6 +185,12 @@
         .szu-zone.szu-hatch { background-image: repeating-linear-gradient(45deg,
           rgba(194,32,48,.4) 0 6px, rgba(194,32,48,0) 6px 12px);
           outline: 1px dashed rgba(194,32,48,.8); outline-offset: -1px; }
+
+        .szu-debug-overlay { position: absolute; inset: 0; z-index: 11; pointer-events: none; }
+        .szu-facebox { position: absolute; box-sizing: border-box; border: 2px dashed #2dd4bf;
+          border-radius: 2px; box-shadow: 0 0 0 1px rgba(0,0,0,.55); }
+        .szu-zone-highlight { position: absolute; box-sizing: border-box;
+          border: 2px solid var(--danger, #e5484d); background: rgba(229,72,77,.14); }
 
         .szu-topbar { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
           background: linear-gradient(to bottom, rgba(0,0,0,.45), transparent); color: #fff; font-size: 10px;
@@ -188,6 +231,7 @@
       this._loading = false;
       clearTimeout(this._debounceTimer);
       this._checkSeq++;
+      this._stopLiveFaceTracking();
       if (this._zonesBtn) this._zonesBtn.disabled = true;
       if (this._zonesBtn) this._zonesBtn.classList.remove("active");
       this._renderChips();
@@ -205,6 +249,7 @@
       this._ctx = null;
       clearTimeout(this._debounceTimer);
       this._checkSeq++;
+      this._stopLiveFaceTracking();
       this._platform = "none";
       this._showZones = false;
       this._safety = null;
@@ -237,10 +282,12 @@
       this._safetyError = null;
       this._loading = false;
       clearTimeout(this._debounceTimer);
+      this._renderDebugBox(null, null);
       if (this._zonesBtn) this._zonesBtn.disabled = (key === "none");
       if (key === "none") {
         this._showZones = false;
         if (this._zonesBtn) this._zonesBtn.classList.remove("active");
+        this._stopLiveFaceTracking();
       }
       this._renderChips();
       this._renderOverlay();
@@ -264,6 +311,7 @@
         );
         if (seq !== this._checkSeq) return; // superseded by a newer platform/reel/close
         this._safety = data;
+        this._renderDebugBox(null, null); // stale interval indices -- clear until re-clicked
       } catch (e) {
         if (seq !== this._checkSeq) return;
         this._safety = null;
@@ -328,13 +376,20 @@
       const s = this._safety;
       if (!s) { el.hidden = true; el.innerHTML = ""; return; }
       el.hidden = false;
-      if (s.safe) {
-        el.innerHTML = `<span style="color:var(--accent2)">Encuadre seguro para ${esc(this._labelFor(this._platform))}.</span>`;
+      const label = this._labelFor(this._platform);
+      if (s.insufficient_face_data) {
+        const pct = s.face_detection_ratio != null ? Math.round(s.face_detection_ratio * 100) : null;
+        el.innerHTML = `<span class="dim">No se detectó cara en la mayoría de los fotogramas analizados` +
+          (pct != null ? ` (solo en el ${pct}% de las muestras)` : "") +
+          ` — no podemos confirmar el encuadre para ${esc(label)} con garantías.</span>`;
         return;
       }
-      const label = this._labelFor(this._platform);
+      if (s.safe) {
+        el.innerHTML = `<span style="color:var(--accent2)">Encuadre seguro para ${esc(label)}.</span>`;
+        return;
+      }
       const intervalSpans = (s.intervals || [])
-        .map((iv) => `<span class="szu-interval" data-t0="${iv.t0}">${fmtT(iv.t0)}–${fmtT(iv.t1)}</span>`)
+        .map((iv, idx) => `<span class="szu-interval" data-t0="${iv.t0}" data-idx="${idx}">${fmtT(iv.t0)}–${fmtT(iv.t1)}</span>`)
         .join(", ");
       let html = `<div>La cara queda tapada por la UI de ${esc(label)} en ${intervalSpans || "toda la duración"}` +
         (s.coverage_pct != null ? ` <span class="dim">(cobertura ${s.coverage_pct}%)</span>` : "") + "</div>";
@@ -343,7 +398,21 @@
       }
       el.innerHTML = html;
       el.querySelectorAll(".szu-interval").forEach((sp) => {
-        sp.onclick = () => { try { this._ctx?.onSeek?.(Number(sp.dataset.t0)); } catch (_e) { /* ignore */ } };
+        sp.onclick = () => {
+          try { this._ctx?.onSeek?.(Number(sp.dataset.t0)); } catch (_e) { /* ignore */ }
+          const iv = s.intervals?.[Number(sp.dataset.idx)];
+          if (!iv) return;
+          // Surface the exact geometry that triggered this warning: turn on
+          // the zone mockup (so the offending zone has visual context) and
+          // draw the detected face box + that zone's outline at this
+          // timestamp. Live tracking (if wired) takes over on its next poll
+          // once the player actually seeks there.
+          this._showZones = true;
+          if (this._zonesBtn) { this._zonesBtn.disabled = false; this._zonesBtn.classList.add("active"); }
+          this._renderOverlay();
+          this._renderDebugBox(iv.face_box || null, iv.zone_rect || null);
+          this._startLiveFaceTracking();
+        };
       });
       const fixBtn = el.querySelector("#szu-fix-btn");
       if (fixBtn) fixBtn.onclick = () => this._applyFix();
@@ -379,6 +448,77 @@
       });
       host.innerHTML = parts.join("");
       refreshIcons();
+    },
+
+    /* ---------- transparency: face box + offending-zone debug drawing ---------- */
+
+    _renderDebugBox(faceBox, zoneRect) {
+      const host = this._debugHost;
+      if (!host) return;
+      const parts = [];
+      if (zoneRect) {
+        const style = `left:${(zoneRect.x * 100).toFixed(2)}%;top:${(zoneRect.y * 100).toFixed(2)}%;` +
+          `width:${(zoneRect.w * 100).toFixed(2)}%;height:${(zoneRect.h * 100).toFixed(2)}%`;
+        parts.push(`<div class="szu-zone-highlight" style="${style}"></div>`);
+      }
+      if (faceBox) {
+        const style = `left:${(faceBox.x * 100).toFixed(2)}%;top:${(faceBox.y * 100).toFixed(2)}%;` +
+          `width:${(faceBox.w * 100).toFixed(2)}%;height:${(faceBox.h * 100).toFixed(2)}%`;
+        parts.push(`<div class="szu-facebox" style="${style}"></div>`);
+      }
+      host.innerHTML = parts.join("");
+      host.hidden = parts.length === 0;
+    },
+
+    /* ---------- "Ver zonas" live face-box tracking ---------- */
+
+    _clearLiveTimer() {
+      this._liveSeq++;
+      clearInterval(this._liveTimer);
+      this._liveTimer = null;
+    },
+
+    _startLiveFaceTracking() {
+      this._clearLiveTimer(); // stop any previous poll loop WITHOUT wiping a just-drawn static debug box
+      // Optional integration point (see file header): reeleditor.js must
+      // pass `getCurrentTime` in setContext's ctx for this to do anything --
+      // without it, this degrades to a no-op (the static interval-click
+      // debug box above still works).
+      if (!this._ctx || typeof this._ctx.getCurrentTime !== "function") return;
+      if (this._platform === "none" || !this._showZones) return;
+      const seq = ++this._liveSeq;
+      const poll = async () => {
+        if (seq !== this._liveSeq || !this._showZones || !this._ctx) return;
+        const pid = this._ctx.pid;
+        const rid = this._ctx.rid;
+        if (!pid || !rid) return;
+        let t;
+        try {
+          t = this._ctx.getCurrentTime();
+        } catch (_e) {
+          return;
+        }
+        if (typeof t !== "number" || !Number.isFinite(t)) return;
+        const platformQs = this._platform !== "none" ? `&platform=${encodeURIComponent(this._platform)}` : "";
+        try {
+          const data = await api(
+            `/projects/${pid}/reels/${rid}/safety/face-at?t=${encodeURIComponent(t)}${platformQs}`,
+          );
+          if (seq !== this._liveSeq || !this._showZones) return;
+          const zones = this._zonesFor(this._platform) || [];
+          const zoneRect = data.zone ? zones.find((z) => z.name === data.zone) : null;
+          this._renderDebugBox(data.face_box || null, zoneRect || null);
+        } catch (_e) {
+          // transient (seek mid-flight, 404 before the router's mounted, ...) -- try again next tick
+        }
+      };
+      poll();
+      this._liveTimer = setInterval(poll, LIVE_POLL_MS);
+    },
+
+    _stopLiveFaceTracking() {
+      this._clearLiveTimer();
+      this._renderDebugBox(null, null);
     },
   };
 
