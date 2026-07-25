@@ -41,6 +41,18 @@ v5.14 bugfix: `render_preview` writes to preview.tmp.mp4 and atomically
 overlays/audio-enhance) has succeeded, updating project["preview"]'s
 manifest only after that rename — so a concurrently-playing <video> pointed
 at preview.mp4 never observes a truncated/half-written file.
+
+Main audio track (spec vNext "Main audio track", music bed with
+auto-ducking): project["audio_track"] (CRUD lives entirely in api/audio.py,
+the only writer, alongside the separate project["audio_assets"] import
+list — this module only ever READS both) is mixed in by `_apply_music_bed`,
+run as a follow-up ffmpeg pass (`-c:v copy`, one audio filter graph) AFTER
+audio-enhance, for both `run()`/`render_preview()` (via `_build`) and
+`reels.render_reel` (which calls it directly — see that module). Ducking
+keys sidechaincompress off the program audio so it deliberately runs after
+audio-enhance: the music should duck under the FINAL (already-enhanced)
+voice, not a pre-enhance version of it. Reel *previews* skip this (like they
+already skip audio-enhance) since it doesn't affect reel composition.
 """
 
 import functools
@@ -270,13 +282,15 @@ def _export_dir_for(project: dict) -> Path:
 
 def _preview_manifest(project: dict) -> str:
     """Stable hash of the config a preview render corresponds to (edl + color
-    + subtitles + audio_enhance) so the UI render-bar can compare it against
-    current project state and know if the preview is stale."""
+    + subtitles + audio_enhance + audio_track) so the UI render-bar can
+    compare it against current project state and know if the preview is
+    stale."""
     payload = {
         "edl": project.get("edl"),
         "color": project.get("color"),
         "subtitles": project.get("subtitles"),
         "audio_enhance": project.get("audio_enhance"),
+        "audio_track": project.get("audio_track"),
     }
     blob = json.dumps(payload, sort_keys=True, default=str).encode()
     return hashlib.sha256(blob).hexdigest()[:16]
@@ -541,6 +555,113 @@ def _apply_overlays(
     return True
 
 
+def _apply_music_bed(log, project: dict, in_path: Path, out_path: Path) -> bool:
+    """Main audio track (spec vNext): project["audio_track"] = {asset_id,
+    start_s, gain_db, ducking} references one project["audio_assets"] entry
+    as a MUSIC BED that mixes UNDER the program's (clips') audio. When
+    ducking=True (the chosen MVP behavior) the music is auto-ducked under
+    the program audio via ffmpeg `sidechaincompress` — program audio is the
+    sidechain KEY, the music is the signal being compressed, so it drops
+    while there's voice/program audio and recovers in gaps; ducking=False is
+    a straight `amix` at `gain_db`. The music is looped (`-stream_loop -1`
+    on its input) and `atrim`med to exactly [0, program_duration-start_s),
+    then `adelay`ed by start_s so it lands at the right position on the
+    timeline — this loops/trims it to the program's length regardless of
+    the source file's own duration. `amix`'s `duration=first` pads the
+    (delayed, therefore shorter) music stream with silence to match input
+    0's length, so no manual `apad` is needed. `alimiter` guards against
+    clipping once both signals are summed (amix `normalize=0` keeps full
+    program-audio level, which clipping-limiting is the standard way to
+    protect against rather than the usual normalize=1 loudness halving).
+
+    Runs as a follow-up ffmpeg pass over the already-assembled `in_path`
+    (post overlays, post audio-enhance — see this module's docstring for
+    why) with `-c:v copy` (only a container remux + one audio filter graph,
+    no video re-encode). Returns False (out_path untouched, no-op) when
+    there's no audio_track, the referenced asset is missing/unreadable,
+    `in_path` has no audio stream at all, or start_s is already past the
+    program's end."""
+    audio_track = project.get("audio_track")
+    if not audio_track or not audio_track.get("asset_id"):
+        return False
+
+    asset = next(
+        (a for a in project.get("audio_assets") or [] if a["id"] == audio_track["asset_id"]),
+        None,
+    )
+    if asset is None or not Path(asset["path"]).exists():
+        log(f"main audio track: asset {audio_track.get('asset_id')} not found, skipping")
+        return False
+
+    info = ffmpeg_utils.clip_info(str(in_path))
+    if not info.get("has_audio"):
+        log("main audio track: program has no audio stream, skipping")
+        return False
+    program_duration = info["duration"]
+
+    start_s = max(0.0, float(audio_track.get("start_s") or 0.0))
+    if start_s >= program_duration:
+        log("main audio track: start_s is past the program's end, skipping")
+        return False
+
+    gain_db = audio_track.get("gain_db")
+    gain_db = float(gain_db) if gain_db is not None else config.MUSIC_GAIN_DEFAULT_DB
+    ducking = bool(audio_track.get("ducking", True))
+    music_needed = program_duration - start_s
+    delay_ms = int(round(start_s * 1000))
+
+    music_chain = (
+        f"[1:a]atrim=0:{music_needed:.3f},asetpts=PTS-STARTPTS,"
+        f"adelay={delay_ms}|{delay_ms},volume={gain_db:.2f}dB[mus]"
+    )
+    if ducking:
+        duck = (
+            f"[mus][0:a]sidechaincompress=threshold={config.MUSIC_DUCK_THRESHOLD}:"
+            f"ratio={config.MUSIC_DUCK_RATIO}:attack={config.MUSIC_DUCK_ATTACK_MS}:"
+            f"release={config.MUSIC_DUCK_RELEASE_MS}[ducked]"
+        )
+        filter_complex = (
+            f"{music_chain};{duck};[0:a][ducked]amix=inputs=2:duration=first:normalize=0[amix]"
+        )
+    else:
+        filter_complex = f"{music_chain};[0:a][mus]amix=inputs=2:duration=first:normalize=0[amix]"
+    filter_complex += f";[amix]alimiter=limit={config.MUSIC_MIX_LIMIT}[aout]"
+
+    kind = "ducked" if ducking else "straight"
+    log(f"Mixing main audio track ({kind} music bed, {gain_db:+.1f}dB)...")
+    cmd = [
+        ffmpeg_utils.ffmpeg_bin(),
+        "-y",
+        "-i",
+        str(in_path),
+        "-stream_loop",
+        "-1",
+        "-i",
+        asset["path"],
+        "-filter_complex",
+        filter_complex,
+        "-map",
+        "0:v",
+        "-map",
+        "[aout]",
+        "-c:v",
+        "copy",
+        "-c:a",
+        "aac",
+        "-b:a",
+        "192k",
+        "-shortest",
+        "-threads",
+        str(ffmpeg_utils.ffmpeg_threads()),
+        str(out_path),
+    ]
+    # heavy=True: same reasoning as _apply_overlays above -- goes through the
+    # RAM guard + concurrency gate like every other encode in this module,
+    # even though the video stream itself is just copied.
+    ffmpeg_utils.run(cmd, heavy=True)
+    return True
+
+
 def _build(
     log,
     project: dict,
@@ -651,6 +772,13 @@ def _build(
         audio_enhance.enhance(str(raw_wav), str(enhanced_wav))
         ffmpeg_utils.mux_audio(str(out_path), str(enhanced_wav), str(remuxed))
         remuxed.replace(out_path)
+
+    # Main audio track (spec vNext): AFTER audio-enhance -- ducking should
+    # key off the final, already-enhanced program audio (see _apply_music_bed
+    # and this module's docstring).
+    music_out = work / "music_bed.mp4"
+    if _apply_music_bed(log, project, out_path, music_out):
+        music_out.replace(out_path)
 
 
 def _ensure_edl(project: dict) -> list[dict]:

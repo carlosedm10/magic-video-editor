@@ -189,6 +189,31 @@ const Timeline = {
       .ov-edge { position: absolute; top: 0; bottom: 0; width: 6px; cursor: ew-resize; z-index: 2; }
       .ov-edge-l { left: 0; } .ov-edge-r { right: 0; }
       .ov-edge:hover { background: rgba(53,194,143,.6); }
+
+      /* ---- main audio track (spec vNext "Main audio track") ----
+         A third lane BELOW the main video track (mirrors the overlay
+         lane's pattern above it) for the single music-bed placement,
+         project["audio_track"]. Deliberately its own accent color (garnet,
+         var(--accent)) rather than the overlay lane's --accent2 so the two
+         manual tracks read as visually distinct at a glance. */
+      .tl-audio-track { position: absolute; left: 0; right: 0; bottom: 0; height: 26px; z-index: 1;
+        border-top: 1px solid var(--border); }
+      .tl-audio-track.tl-drop-target { outline: 2px dashed var(--accent); outline-offset: -2px; }
+      .tl-audio-empty { position: absolute; inset: 0; display: flex; align-items: center; padding: 0 8px;
+        font-size: 10px; color: var(--dim); opacity: .7; pointer-events: none; white-space: nowrap;
+        overflow: hidden; text-overflow: ellipsis; }
+      .tl-audio-track.tl-drop-target .tl-audio-empty { color: var(--accent); opacity: 1; }
+      .aud-block { position: absolute; top: 3px; height: 20px; border-radius: 6px; overflow: hidden;
+        background: rgba(160,24,40,.22); border: 1px solid var(--accent); cursor: grab;
+        display: flex; align-items: center; gap: 4px; }
+      .aud-block:hover { background: rgba(160,24,40,.32); }
+      .aud-block .aud-label { padding: 0 2px 0 6px; font-size: 10px; color: var(--text); white-space: nowrap;
+        overflow: hidden; text-overflow: ellipsis; pointer-events: none; }
+      .aud-block .aud-gain { width: 42px; flex-shrink: 0; font-size: 9px; background: transparent;
+        border: 1px solid var(--border); border-radius: 4px; color: var(--text); padding: 0 2px; }
+      .aud-block .aud-remove { flex-shrink: 0; cursor: pointer; color: var(--dim); padding: 0 4px 0 0;
+        line-height: 1; }
+      .aud-block .aud-remove:hover { color: var(--text); }
     `;
     document.head.appendChild(style);
   },
@@ -265,6 +290,7 @@ const Timeline = {
       }
     }
     this._ensureOverlayTrack();
+    this._ensureAudioTrack();
   },
 
   /* ---------- manual overlay track chrome (spec v5.9b) ----------
@@ -307,6 +333,165 @@ const Timeline = {
       const x = e.clientX - rect.left + (scroll?.scrollLeft || 0);
       Editor.insertOverlay(clipId, Math.max(0, x / this.pxPerSec));
     });
+  },
+
+  // TODO(main audio track, spec vNext): no live Draft-mode audio preview yet
+  // — mixing/ducking the music bed into the virtual (un-rendered) playback
+  // path would mean touching ui/editor/player.js, which is owned by a
+  // sibling agent this phase and explicitly off-limits here. The music is
+  // only actually heard on a real render (final_render/preview_render, both
+  // via pipeline/render.py's _apply_music_bed) for now; Draft playback keeps
+  // playing only the program audio, same as before this feature landed.
+
+  /* ---------- main audio track chrome (spec vNext "Main audio track") ----------
+     A third lane BELOW the main video track (mirrors _ensureOverlayTrack's
+     pattern, just the opposite edge): reserves a 26px band at the BOTTOM of
+     #timeline-content and shrinks #timeline-track's bottom to make room,
+     the same "inline style beats external stylesheet" trick used above.
+
+     Deliberately NOT routed through Editor/ui/editor/state.js (this task
+     doesn't own that file, and project["audio_track"] is a single small
+     object with no undo-history requirement) — mutations go straight to
+     api/audio.py via the global `api()` helper, then `refreshProject()`
+     (both already used elsewhere in this app) reloads project.json and
+     re-renders. `state.project.audio_track`/`.audio_assets` (populated by
+     GET /api/projects/{pid}, which already includes both fields) are this
+     module's read model, exactly like the render-bar already reads
+     `state.project.preview` a few methods below. */
+  _ensureAudioTrack() {
+    const content = document.getElementById("timeline-content");
+    const mainTrack = document.getElementById("timeline-track");
+    if (!content || !mainTrack || document.getElementById("timeline-audio-track")) return;
+    const track = document.createElement("div");
+    track.id = "timeline-audio-track";
+    track.className = "tl-audio-track"; // position/height come from the injected stylesheet above
+    content.appendChild(track);
+    mainTrack.style.bottom = "28px"; // was 0 (CSS) — reserve a 28px lane at the bottom for the main audio track
+
+    track.addEventListener("dragover", (e) => {
+      if (!e.dataTransfer?.types?.includes("application/x-mve-audio")) return;
+      e.preventDefault();
+      e.stopPropagation();
+      e.dataTransfer.dropEffect = "copy";
+      track.classList.add("tl-drop-target");
+    });
+    track.addEventListener("dragleave", (e) => { e.stopPropagation(); track.classList.remove("tl-drop-target"); });
+    track.addEventListener("drop", (e) => {
+      track.classList.remove("tl-drop-target");
+      const assetId = e.dataTransfer?.getData("application/x-mve-audio");
+      if (!assetId) return;
+      e.preventDefault();
+      e.stopPropagation();
+      const rect = track.getBoundingClientRect();
+      const scroll = document.getElementById("timeline-scroll");
+      const x = e.clientX - rect.left + (scroll?.scrollLeft || 0);
+      this._putAudioTrack({ asset_id: assetId, start_s: Math.max(0, x / this.pxPerSec) });
+    });
+  },
+
+  /* PUTs the FULL audio_track shape every time (the API's contract — see
+     api/audio.py's AudioTrackUpdate): `patch` overrides just the fields the
+     caller cares about (a drop sets asset_id+start_s; the gain input/ducking
+     checkbox/reposition-drag below each set just their one field), the rest
+     fall back to whatever's already on state.project.audio_track (or the
+     server-side default, e.g. gain_db -> config.MUSIC_GAIN_DEFAULT_DB, on a
+     brand new placement). */
+  async _putAudioTrack(patch) {
+    const pid = Editor.pid;
+    if (!pid) return;
+    const current = state.project?.audio_track || {};
+    const body = {
+      asset_id: patch.asset_id ?? current.asset_id,
+      start_s: patch.start_s ?? current.start_s ?? 0,
+      ducking: patch.ducking ?? current.ducking ?? true,
+    };
+    if (patch.gain_db != null) body.gain_db = patch.gain_db;
+    else if (current.gain_db != null) body.gain_db = current.gain_db;
+    if (!body.asset_id) return;
+    try {
+      await api(`/projects/${pid}/audio-track`, { method: "PUT", body });
+      await refreshProject();
+    } catch (e) {
+      alert(`Couldn't update the main audio track: ${e.message}`);
+    }
+  },
+
+  async _clearAudioTrack() {
+    const pid = Editor.pid;
+    if (!pid) return;
+    await api(`/projects/${pid}/audio-track`, { method: "DELETE" });
+    await refreshProject();
+  },
+
+  /* ---------- main audio track rendering ---------- */
+  renderAudioTrack() {
+    const track = document.getElementById("timeline-audio-track");
+    if (!track) return;
+    const audioTrack = state.project?.audio_track;
+    if (!audioTrack) {
+      track.innerHTML = `<div class="tl-audio-empty">Main audio — arrastra un archivo de audio aquí</div>`;
+      return;
+    }
+    const px = this.pxPerSec;
+    const asset = (state.project?.audio_assets || []).find((a) => a.id === audioTrack.asset_id);
+    const name = asset?.filename || audioTrack.asset_id;
+    const segs = this._previewSegments || Editor.segments || [];
+    const total = segs.reduce((acc, s) => acc + Math.max(0, s.end - s.start), 0);
+    const startS = Math.max(0, audioTrack.start_s || 0);
+    const leftPx = startS * px;
+    const widthPx = Math.max((total - startS) * px, 3);
+    const gain = audioTrack.gain_db ?? 0;
+
+    track.innerHTML = `<div class="aud-block" data-aud="1"
+        style="left:${leftPx.toFixed(1)}px;width:${widthPx.toFixed(1)}px"
+        title="${esc(name)} (main audio track${audioTrack.ducking ? ", auto-ducked under program audio" : ""})">
+        <span class="aud-label">${esc(name)}</span>
+        <input class="aud-gain" type="number" step="0.5" value="${gain}" title="Gain (dB)">
+        <span class="aud-remove" title="Remove the main audio track">✕</span>
+      </div>`;
+
+    const block = track.querySelector(".aud-block");
+    if (!block) return;
+
+    block.addEventListener("pointerdown", (e) => {
+      if (e.target.closest(".aud-gain") || e.target.closest(".aud-remove")) return;
+      const startX = e.clientX;
+      const startPos = startS;
+      let moved = false;
+      const onMove = (ev) => {
+        const dt = (ev.clientX - startX) / px;
+        if (Math.abs(dt) * px > 2) moved = true;
+        block.style.left = `${Math.max(0, (startPos + dt) * px).toFixed(1)}px`;
+      };
+      const onUp = (ev) => {
+        window.removeEventListener("pointermove", onMove);
+        window.removeEventListener("pointerup", onUp);
+        if (moved) {
+          const dt = (ev.clientX - startX) / px;
+          this._putAudioTrack({ start_s: Math.round(Math.max(0, startPos + dt) * 1000) / 1000 });
+        }
+      };
+      window.addEventListener("pointermove", onMove);
+      window.addEventListener("pointerup", onUp);
+    });
+
+    const gainInput = block.querySelector(".aud-gain");
+    if (gainInput) {
+      gainInput.onchange = () => {
+        const v = Number(gainInput.value);
+        this._putAudioTrack({ gain_db: Number.isFinite(v) ? v : 0 });
+      };
+      gainInput.onclick = (e) => e.stopPropagation();
+      gainInput.onpointerdown = (e) => e.stopPropagation();
+    }
+    const removeBtn = block.querySelector(".aud-remove");
+    if (removeBtn) {
+      removeBtn.onclick = (e) => {
+        e.stopPropagation();
+        this._clearAudioTrack();
+      };
+      removeBtn.onpointerdown = (e) => e.stopPropagation();
+    }
   },
 
   _toggleSnapping(force) {
@@ -504,6 +689,7 @@ const Timeline = {
     this.renderSelection();
     this.renderMarkers();
     this.renderOverlays();
+    this.renderAudioTrack();
     this.updatePlayhead(window.EditorUI.player?.currentEdlTime?.() ?? 0);
     this.refreshRenderBar();
     refreshIcons();
@@ -758,6 +944,11 @@ const Timeline = {
       const name = clip?.filename || s.clip_id;
       const trType = s.transition?.type || "none";
       const trLabel = trType === "none" ? null : (window.EditorUI.transitions?.labelFor(trType) || trType);
+      // Draft playback only ever approximates a named xfade catalog type
+      // (anything beyond plain "fade"/"crossfade") as a generic dissolve —
+      // the exact wipe/circle/pixelize/etc. shape is baked on export only
+      // (spec v7.5 §7.5). Surface that as a subtle "≈" cue on the chip.
+      const isApproxOnly = trType !== "none" && trType !== "fade" && trType !== "crossfade";
 
       const thumbs = this._getThumbEntry(s.clip_id);
       let filmHtml = "";
@@ -774,8 +965,8 @@ const Timeline = {
 
       html += `<div class="tl-chip ${trType}${trLabel ? " tl-chip-named" : ""}${i === 0 ? " tl-chip-first" : ""}" data-chip="${i}"
         style="left:${leftPx.toFixed(1)}px"
-        title="${trLabel ? esc(trLabel) : "No transition"} — click to edit, or drag a transition here"
-        >${trLabel ? esc(trLabel) : "·"}</div>
+        title="${trLabel ? esc(trLabel) : "No transition"}${isApproxOnly ? " — preview shows a dissolve; exact effect renders on export" : ""} — click to edit, or drag a transition here"
+        >${trLabel ? esc(trLabel) + (isApproxOnly ? " ≈" : "") : "·"}</div>
       <div class="tl-block" data-idx="${i}" style="left:${leftPx.toFixed(1)}px;width:${widthPx.toFixed(1)}px">
         ${filmHtml}
         <div class="tl-edge tl-edge-l" data-idx="${i}" data-edge="start"></div>

@@ -58,15 +58,34 @@ class VideoTopic(BaseModel):
     topic: str = Field(..., description="One short line describing what the video is about")
 
 
-class ContextCheck(BaseModel):
-    """Flat per-sentence judgement: does this sentence belong in a video
-    about the given topic? Cut only clear meta/out-of-context asides; keep
-    anything that is plausibly content, even if terse or plain."""
+class ContextFlag(BaseModel):
+    """One sentence (by its local number in the numbered chunk) that is a
+    meta-aside / out-of-context for the video's topic, with a confidence
+    used to gate auto-cut vs. suggestion (same idea as DedupJudge.confidence).
+    Flat object held in a short list -- same pattern as TakeSequencer's
+    cut_runs, NOT a deeply nested/batch schema."""
 
-    in_context: bool = Field(
-        ..., description="True if the sentence belongs in a video about the given topic"
+    id: int = Field(..., description="Local sentence number (from the numbered input)")
+    confidence: int = Field(
+        ..., ge=1, le=5, description="Confidence this sentence doesn't belong, 1-5"
     )
     reason: str = Field(default="", description="One-line rationale")
+
+
+class ContextCheck(BaseModel):
+    """Batched chunk verdict: given a numbered list of consecutive sentences
+    from one clip and the video's topic, which ones are meta-asides /
+    out-of-context? Only the sentences that DON'T belong are returned (with a
+    confidence); everything else is implicitly in-context. Batched per chunk
+    instead of one call per sentence -- small-model friendly, mirrors
+    TakeSequencer's cut_runs list."""
+
+    out_of_context: list[ContextFlag] = Field(
+        default_factory=list,
+        max_length=15,
+        description="Sentences that are meta-asides or out-of-context, with confidence. "
+        "Empty list if every sentence belongs.",
+    )
 
 
 class DedupJudge(BaseModel):

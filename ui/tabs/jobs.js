@@ -65,6 +65,11 @@ function _activityOutsideClick(e) {
   closeActivityPopover();
 }
 
+// How close to the bottom (px) counts as "pinned" -- if the user is within
+// this threshold we keep auto-scrolling as new lines arrive; otherwise we
+// leave their scroll position alone (see _preserveActivityLogScroll below).
+const ACTIVITY_LOG_BOTTOM_SLOP = 40;
+
 function _logDisclosure(item, job) {
   const open = _activityExpanded.has(item.id);
   const log = job?.log || [];
@@ -72,7 +77,30 @@ function _logDisclosure(item, job) {
     <button class="btn small activity-details-toggle" data-details="${item.id}">
       ${open ? '<i data-lucide="chevron-down"></i> Hide details' : '<i data-lucide="chevron-right"></i> Details'}
     </button>
-    ${open ? `<div class="log activity-log">${log.length ? log.map(esc).join("\n") : "No log output yet."}</div>` : ""}`;
+    ${open ? `<div class="log activity-log" data-log-id="${item.id}">${log.length ? log.map(esc).join("\n") : "No log output yet."}</div>` : ""}`;
+}
+
+// pop.innerHTML gets fully rebuilt on every poll (see renderActivityPopover),
+// which would otherwise recreate each .activity-log div and reset its
+// scrollTop to 0, yanking the user back up mid-read. Capture each open log's
+// scroll position (and whether it was pinned to the bottom) before the
+// rebuild, then restore it after -- growing logs only auto-scroll if the
+// user was already at the bottom.
+function _snapshotActivityLogScroll(pop) {
+  const snapshot = {};
+  pop.querySelectorAll(".activity-log[data-log-id]").forEach((el) => {
+    const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight <= ACTIVITY_LOG_BOTTOM_SLOP;
+    snapshot[el.dataset.logId] = { scrollTop: el.scrollTop, atBottom };
+  });
+  return snapshot;
+}
+
+function _restoreActivityLogScroll(pop, snapshot) {
+  pop.querySelectorAll(".activity-log[data-log-id]").forEach((el) => {
+    const prev = snapshot[el.dataset.logId];
+    if (!prev) return; // newly-opened log: leave at natural (top) position
+    el.scrollTop = prev.atBottom ? el.scrollHeight : prev.scrollTop;
+  });
 }
 
 function _activityRow(item, { pending = false, finished = false } = {}) {
@@ -111,6 +139,8 @@ function renderActivityPopover() {
     .slice(-3)
     .reverse();
 
+  const _logScroll = _snapshotActivityLogScroll(pop);
+
   pop.innerHTML = `
     <div class="activity-popover-inner">
       <div class="activity-section">
@@ -147,6 +177,7 @@ function renderActivityPopover() {
     renderActivityPopover();
   });
   _wireActivityDrag(pop.querySelector("#activity-pending"));
+  _restoreActivityLogScroll(pop, _logScroll);
 
   // Fetch fresh job detail for every visible running item (and any
   // finished item whose log disclosure is open) so progress/log stay live.

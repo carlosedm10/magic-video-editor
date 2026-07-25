@@ -149,6 +149,27 @@ CROSS_DEDUP_MAX_PAIRS = 40  # cap on candidate pairs sent to the LLM per takes r
 CROSS_DEDUP_AUTOCUT_CONFIDENCE = 4  # >= this + same_content -> auto-cut
 CROSS_DEDUP_SUGGEST_CONFIDENCE = 2  # >= this (and < autocut) -> open suggestion
 
+# Cross-clip dedup candidate PRE-FILTER (perf fix, v4 write-up never
+# implemented this): before the O(kept^2) fuzzy token_set_ratio loop, bucket
+# kept sentences by RARE keywords (words that appear in only a handful of
+# sentences project-wide) and only fuzzy-compare cross-clip pairs that share
+# one -- a long recording no longer does hundreds of thousands of
+# comparisons. CROSS_DEDUP_MAX_PAIRS below still caps what's sent to the LLM.
+CROSS_DEDUP_KEYWORD_MIN_LEN = 5  # chars; short words are rarely a useful bucket key
+CROSS_DEDUP_KEYWORD_MAX_DF = 6  # a word used in more than this many sentences is too common
+
+# Context check (out-of-context / meta-aside pass, v4 section 1 point 2).
+# Chunked+capped the same way as CLEANER_CHUNK_SIZE/SEQUENCER_WINDOW_SIZE
+# (was one LLM call PER SENTENCE -- O(sentences); now O(sentences/chunk)).
+CONTEXT_CHECK_CHUNK_SIZE = 15
+CONTEXT_CHECK_CHUNK_OVERLAP = 3
+CONTEXT_CHECK_MAX_SENTENCES = 300  # hard cap on sentences fed to context_check per takes run
+# Confidence gate ("suggest, don't delete"): only high-confidence verdicts
+# auto-cut; lower-confidence ones become project["suggestions"] instead of a
+# silent cut. Same shape/naming as CROSS_DEDUP_AUTOCUT_CONFIDENCE/SUGGEST_CONFIDENCE.
+CONTEXT_CHECK_AUTOCUT_CONFIDENCE = 4
+CONTEXT_CHECK_SUGGEST_CONFIDENCE = 2
+
 # Video topic summary (v4)
 TOPIC_INPUT_CHARS = 3000  # truncate full transcript to ~this many chars for video_topic
 
@@ -163,6 +184,21 @@ REEL_MIN_S = 15.0
 REEL_MAX_S = 60.0
 REEL_SUGGESTIONS = 20
 REEL_W, REEL_H = 1080, 1920
+
+# Main audio track / music bed (vNext "MUSIC BED WITH AUTO-DUCKING"):
+# project["audio_track"] mixes an imported audio_assets entry under the
+# program (clips') audio on final render + reels. See
+# pipeline/render.py:_apply_music_bed for the filtergraph these feed.
+# sidechaincompress threshold (linear 0..1) -- program audio above this ducks the music
+MUSIC_DUCK_THRESHOLD = 0.05
+MUSIC_DUCK_RATIO = 8.0  # sidechaincompress ratio applied to the music while ducked
+MUSIC_DUCK_ATTACK_MS = 20.0  # sidechaincompress attack (ms) -- how fast the duck kicks in
+# sidechaincompress release (ms) -- how fast the music recovers in gaps
+MUSIC_DUCK_RELEASE_MS = 400.0
+# default project["audio_track"]["gain_db"] when first placed on the timeline
+MUSIC_GAIN_DEFAULT_DB = -6.0
+# alimiter ceiling (linear, ~-0.4 dBFS) applied after mixing music + program audio
+MUSIC_MIX_LIMIT = 0.95
 
 
 def _maybe_migrate_default_data_dir() -> None:

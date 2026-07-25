@@ -84,11 +84,34 @@ def luts_dir() -> Path:
     return d
 
 
+def _first_run_default_model() -> str:
+    """Hardware-aware default_model for a settings.json that doesn't exist
+    yet (first run). Reuses the exact RAM-tier logic api/ollama.py's
+    /api/ollama/recommendation endpoint uses (recommended_default_model(),
+    factored there to avoid duplicating the tier table) instead of the old
+    static "qwen2.5:14b" -- on an 8GB Mac that model is either never
+    installed (raw ollama errors) or, worse, gets loaded anyway and swaps
+    the machine to death. Imported lazily (not at module load) to sidestep
+    any import-order sensitivity; falls back to the static DEFAULT_MODEL if
+    the recommendation helper itself blows up (e.g. psutil unavailable)."""
+    try:
+        from .api.ollama import recommended_default_model
+
+        return recommended_default_model()
+    except Exception:
+        return DEFAULT_MODEL
+
+
 def load() -> dict:
     """Read settings.json, merged over DEFAULTS (missing/unknown keys are
-    filled in / tolerated so the schema can grow without migrations)."""
+    filled in / tolerated so the schema can grow without migrations).
+    On first run only (no settings.json yet) default_model is seeded from
+    the hardware recommendation rather than the static DEFAULTS entry --
+    see _first_run_default_model(). An existing settings.json is never
+    touched: the user's saved choice always wins."""
     config.ensure_dirs()
     p = _path()
+    first_run = not p.exists()
     data: dict = {}
     if p.exists():
         with _lock:
@@ -102,7 +125,9 @@ def load() -> dict:
     merged["performance"] = {**DEFAULTS["performance"], **(data.get("performance") or {})}
     merged["subtitles"] = {**DEFAULTS["subtitles"], **(data.get("subtitles") or {})}
     merged["window"] = {**DEFAULTS["window"], **(data.get("window") or {})}
-    if not p.exists():
+    if first_run:
+        if "default_model" not in data:
+            merged["default_model"] = _first_run_default_model()
         save(merged)
     return merged
 

@@ -29,7 +29,21 @@
    the timeline") — ui/editor/timeline.js is the drop target and inserts a
    full-clip segment at the drop index via Editor.insertClip(). The MIME
    type "application/x-mve-clip" (clip id as payload) is this app's own,
-   private contract between the two files. */
+   private contract between the two files.
+
+   Main audio track (spec vNext "Main audio track", music bed with
+   auto-ducking): a separate "+ Music" import path (Files picker via the
+   pywebview dialog / hidden <input>, "add by path…", and Finder drag&drop,
+   routed here by extension) accepts .mp3/.wav/.m4a into project
+   ["audio_assets"] — a list wholly separate from project["clips"] (see
+   pipeline/ingest.py's MUSIC_EXTS comment: the camera-clip pipeline never
+   sees these). Rendered as its own "Audio" section below the camera-group
+   list, draggable with the private MIME type "application/x-mve-audio"
+   (asset id as payload) onto the timeline's main-audio lane
+   (ui/editor/timeline.js's _ensureAudioTrack/renderAudioTrack), which PUTs
+   project["audio_track"] via api/audio.py directly (no Editor/history
+   integration — this is deliberately NOT routed through ui/editor/state.js,
+   which this task doesn't own/touch). */
 
 window.EditorUI = window.EditorUI || {};
 
@@ -40,6 +54,7 @@ window.EditorUI.mediabin = {
 
   render(project) {
     if (!this._wired) this._wireStatic();
+    this._renderAudioAssets(project);
     const list = document.getElementById("media-bin-list");
     if (!list || !project) return;
 
@@ -136,6 +151,56 @@ window.EditorUI.mediabin = {
     return "";
   },
 
+  /* ---------- main audio track: audio_assets section (spec vNext) ----------
+     A separate list from project.clips/the camera-clip pipeline — see
+     pipeline/ingest.py's MUSIC_EXTS comment. Its own injected container
+     (#media-bin-audio, created once in _wireStatic) so this never gets
+     clobbered by / doesn't have to duplicate the camera-group rebuild logic
+     above. Draggable with the private "application/x-mve-audio" MIME (asset
+     id payload) onto the timeline's main-audio lane. */
+  _renderAudioAssets(project) {
+    const el = document.getElementById("media-bin-audio");
+    if (!el) return;
+    const assets = project?.audio_assets || [];
+    if (!assets.length) {
+      el.hidden = true;
+      el.innerHTML = "";
+      return;
+    }
+    el.hidden = false;
+    el.innerHTML = `
+      <div class="bin-group-head row">
+        <b>Audio</b>
+        <span class="grow"></span>
+        <span class="dim">${assets.length}</span>
+      </div>
+      ${assets.map((a) => `
+        <div class="bin-clip row bin-audio-clip" data-audio="${a.id}" draggable="true"
+          title="Drag onto the main audio lane in the timeline">
+          <i data-lucide="music"></i>
+          <span class="bin-clip-name grow" title="${esc(a.filename)}">${esc(a.filename)}</span>
+          <span class="dim mono">${fmtT(a.duration || 0)}</span>
+          <button class="icon-btn danger" data-del-audio="${a.id}" title="Remove"><i data-lucide="x"></i></button>
+        </div>`).join("")}`;
+
+    el.querySelectorAll(".bin-audio-clip").forEach((row) => {
+      row.addEventListener("dragstart", (e) => {
+        e.dataTransfer.effectAllowed = "copy";
+        e.dataTransfer.setData("application/x-mve-audio", row.dataset.audio);
+        e.dataTransfer.setData("text/plain", row.dataset.audio);
+      });
+    });
+    el.querySelectorAll("[data-del-audio]").forEach((btn) => {
+      btn.onclick = async (e) => {
+        e.stopPropagation();
+        if (!confirm("Remove this audio file from the project?")) return;
+        await api(`/projects/${project.id}/audio-assets/${btn.dataset.delAudio}`, { method: "DELETE" });
+        refreshProject();
+      };
+    });
+    refreshIcons();
+  },
+
   _wireStatic() {
     this._wired = true;
     this._injectStyle();
@@ -154,6 +219,16 @@ window.EditorUI.mediabin = {
     uploads.hidden = true;
     if (list?.parentElement) list.parentElement.insertBefore(uploads, list);
 
+    // Main audio track (spec vNext): its own injected container for the
+    // "Audio" (audio_assets) section, placed above the camera-group list —
+    // _renderAudioAssets owns its content, this module's clip-list rebuild
+    // never touches it.
+    const audioSection = document.createElement("div");
+    audioSection.id = "media-bin-audio";
+    audioSection.className = "bin-group";
+    audioSection.hidden = true;
+    if (list?.parentElement) list.parentElement.insertBefore(audioSection, list);
+
     // Hidden native-style inputs feeding the upload endpoint (browser-mode
     // fallback only — pywebview's real dialogs are tried first below).
     const fileInput = document.createElement("input");
@@ -171,6 +246,18 @@ window.EditorUI.mediabin = {
     folderInput.hidden = true;
     document.body.appendChild(folderInput);
 
+    // Music-bed import (spec vNext "Main audio track") — a dedicated input/
+    // button, deliberately separate from the camera-clip fileInput above
+    // (which also technically accepts audio/* for the pre-existing
+    // role="audio" external-mic-sync clips): this one always lands in
+    // project["audio_assets"], never project["clips"].
+    const audioInput = document.createElement("input");
+    audioInput.type = "file";
+    audioInput.multiple = true;
+    audioInput.accept = "audio/*,.mp3,.wav,.m4a";
+    audioInput.hidden = true;
+    document.body.appendChild(audioInput);
+
     fileInput.onchange = async () => {
       const files = Array.from(fileInput.files || []);
       fileInput.value = "";
@@ -180,6 +267,11 @@ window.EditorUI.mediabin = {
       const files = Array.from(folderInput.files || []);
       folderInput.value = "";
       await Promise.all(files.map((f) => this._uploadOne(f, f.webkitRelativePath || f.name)));
+    };
+    audioInput.onchange = async () => {
+      const files = Array.from(audioInput.files || []);
+      audioInput.value = "";
+      await Promise.all(files.map((f) => this._uploadAudioOne(f)));
     };
 
     if (addFiles) addFiles.onclick = async () => {
@@ -199,6 +291,28 @@ window.EditorUI.mediabin = {
       }
     };
 
+    // "+ Music" button (music-bed import) — injected next to Files/Folder,
+    // same DOM-injection pattern ui/editor/timeline.js already uses for
+    // chrome ui/index.html (owned by another agent this phase) doesn't know
+    // about yet.
+    if (addFolder && !document.getElementById("add-audio")) {
+      const addAudio = document.createElement("button");
+      addAudio.id = "add-audio";
+      addAudio.className = "btn small";
+      addAudio.title = "Import a music bed (.mp3/.wav/.m4a) for the main audio track";
+      addAudio.innerHTML = '<i data-lucide="music"></i> Music';
+      addAudio.onclick = async () => {
+        if (window.pywebview?.api?.pick_files) {
+          const paths = (await window.pywebview.api.pick_files()).filter((p) => this._isMusicPath(p));
+          if (paths.length) await this._addAudioPaths(paths);
+        } else {
+          audioInput.click();
+        }
+      };
+      addFolder.parentElement?.insertBefore(addAudio, addFolder.nextSibling);
+      refreshIcons();
+    }
+
     // "add by path…" disclosure — dev/power-user escape hatch, not primary UI.
     if (pathInput) {
       pathInput.hidden = true;
@@ -216,9 +330,14 @@ window.EditorUI.mediabin = {
 
       pathInput.onkeydown = async (e) => {
         if (e.key !== "Enter") return;
-        const paths = e.target.value.split(",").map((s) => s.trim()).filter(Boolean);
-        if (!paths.length) return;
-        await this._addPaths(paths);
+        const raw = e.target.value.split(",").map((s) => s.trim()).filter(Boolean);
+        if (!raw.length) return;
+        // Route by extension: .mp3/.wav/.m4a are music-bed imports
+        // (audio_assets), everything else is the existing clip/folder path.
+        const musicPaths = raw.filter((p) => this._isMusicPath(p));
+        const clipPaths = raw.filter((p) => !this._isMusicPath(p));
+        if (clipPaths.length) await this._addPaths(clipPaths);
+        if (musicPaths.length) await this._addAudioPaths(musicPaths);
         e.target.value = "";
       };
     }
@@ -229,7 +348,7 @@ window.EditorUI.mediabin = {
       const overlay = document.createElement("div");
       overlay.className = "mvebin-dropzone";
       overlay.hidden = true;
-      overlay.innerHTML = '<div class="mvebin-dropzone-inner">Drop clips or a camera folder</div>';
+      overlay.innerHTML = '<div class="mvebin-dropzone-inner">Drop clips, a camera folder, or an audio file for the music bed</div>';
       bin.appendChild(overlay);
 
       const showOverlay = () => { overlay.hidden = false; };
@@ -281,7 +400,17 @@ window.EditorUI.mediabin = {
       pairs = Array.from(dt.files || []).map((f) => [f, f.name]);
     }
     if (!pairs.length) return;
-    await Promise.all(pairs.map(([f, relPath]) => this._uploadOne(f, relPath)));
+    // Route by extension (spec vNext "Main audio track"): a lone .mp3/.wav/
+    // .m4a dropped onto the bin is treated as a music-bed import
+    // (audio_assets), everything else keeps going through the existing
+    // camera-clip upload path.
+    await Promise.all(pairs.map(([f, relPath]) =>
+      this._isMusicPath(relPath) ? this._uploadAudioOne(f) : this._uploadOne(f, relPath)
+    ));
+  },
+
+  _isMusicPath(p) {
+    return /\.(mp3|wav|m4a)$/i.test(p || "");
   },
 
   // Recursively resolves a DataTransferItem's FileSystemEntry into
@@ -308,7 +437,10 @@ window.EditorUI.mediabin = {
     return [];
   },
 
-  _uploadOne(file, relPath) {
+  // `endpoint` defaults to the camera-clip upload path; _uploadAudioOne below
+  // reuses this same progress-bar plumbing against the music-bed endpoint
+  // (spec vNext "Main audio track") instead of duplicating it.
+  _uploadOne(file, relPath, endpoint) {
     return new Promise((resolve) => {
       const id = `${Date.now()}_${Math.random().toString(36).slice(2)}`;
       const rec = { name: file.name, relPath, progress: 0, done: false, error: false };
@@ -319,7 +451,7 @@ window.EditorUI.mediabin = {
       fd.append("files", file, relPath);
 
       const xhr = new XMLHttpRequest();
-      xhr.open("POST", `/api/projects/${state.pid}/upload`);
+      xhr.open("POST", endpoint || `/api/projects/${state.pid}/upload`);
       xhr.upload.onprogress = (e) => {
         if (!e.lengthComputable) return;
         rec.progress = e.loaded / e.total;
@@ -341,6 +473,10 @@ window.EditorUI.mediabin = {
       xhr.onerror = () => finish(false);
       xhr.send(fd);
     });
+  },
+
+  _uploadAudioOne(file) {
+    return this._uploadOne(file, file.name, `/api/projects/${state.pid}/audio-assets/upload`);
   },
 
   _renderUploads() {
@@ -386,6 +522,11 @@ window.EditorUI.mediabin = {
         text-align: center; pointer-events: none; }
       .mvebin-dropzone-inner { color: var(--text, #f5f6fa); font-weight: 600;
         padding: 0 16px; }
+      /* main audio track: audio_assets section (spec vNext), visually
+         distinct from camera clips via an accented music icon. */
+      #media-bin-audio { margin-bottom: 6px; }
+      .bin-audio-clip { cursor: grab; }
+      .bin-audio-clip > i[data-lucide="music"] { color: var(--accent2, #35c28f); flex-shrink: 0; }
     `;
     document.head.appendChild(style);
   },
@@ -393,6 +534,12 @@ window.EditorUI.mediabin = {
   async _addPaths(paths) {
     if (!state.pid || !paths.length) return;
     await api(`/projects/${state.pid}/clips`, { method: "POST", body: { paths } });
+    await refreshProject();
+  },
+
+  async _addAudioPaths(paths) {
+    if (!state.pid || !paths.length) return;
+    await api(`/projects/${state.pid}/audio-assets`, { method: "POST", body: { paths } });
     await refreshProject();
   },
 };

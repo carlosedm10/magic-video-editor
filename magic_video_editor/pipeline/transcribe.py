@@ -24,6 +24,7 @@ in "auto" mode a lone clip whose detected language disagrees with the
 majority of the project's other clips gets one automatic re-transcription
 pinned to the majority language (see _majority_language_retry)."""
 
+import logging
 from collections import Counter
 
 import numpy as np
@@ -31,6 +32,26 @@ import soundfile as sf
 
 from .. import config, settings, store
 from . import speakers
+
+logger = logging.getLogger(__name__)
+
+
+def _load_wav_array_or_path(wav_path: str) -> np.ndarray | str:
+    """`_load_wav_array(wav_path)`, falling back to the raw path string on
+    any failure so the whisper backend decodes it itself. That fallback was
+    previously silent (bare `except Exception: audio = wav_path`), so a
+    transcription-quality regression caused by array decoding failing
+    open into this fallback -- and thus back onto ffmpeg-via-mlx-whisper --
+    had no signal in the logs. Log once here so it's visible in the field."""
+    try:
+        return _load_wav_array(wav_path)
+    except Exception as exc:
+        logger.warning(
+            "%s: ndarray audio decode failed, falling back to path-based decode: %s",
+            wav_path,
+            exc,
+        )
+        return wav_path
 
 
 def _load_wav_array(wav_path: str) -> np.ndarray:
@@ -51,10 +72,7 @@ def _load_wav_array(wav_path: str) -> np.ndarray:
 def _transcribe_mlx(wav_path: str, language: str | None = None) -> dict:
     import mlx_whisper
 
-    try:
-        audio = _load_wav_array(wav_path)
-    except Exception:
-        audio = wav_path  # fallback: let mlx-whisper load it itself
+    audio = _load_wav_array_or_path(wav_path)
 
     try:
         result = mlx_whisper.transcribe(
@@ -98,10 +116,7 @@ def _transcribe_faster(wav_path: str, language: str | None = None) -> dict:
 
     model = WhisperModel("large-v3", device="auto", compute_type="int8")
 
-    try:
-        audio = _load_wav_array(wav_path)
-    except Exception:
-        audio = wav_path
+    audio = _load_wav_array_or_path(wav_path)
 
     try:
         segs, info = model.transcribe(audio, word_timestamps=True, language=language)

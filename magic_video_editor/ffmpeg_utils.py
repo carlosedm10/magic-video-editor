@@ -15,6 +15,7 @@ import subprocess
 import sys
 import threading
 import time
+from collections.abc import Callable
 from pathlib import Path
 
 import numpy as np
@@ -27,32 +28,89 @@ class FFmpegError(RuntimeError):
     pass
 
 
+class FFmpegCancelled(FFmpegError):
+    """Raised by _wait_for_ram()/_EncodeGate.acquire() when the CURRENT
+    job's cancel-check (see begin_job/_raise_if_cancelled) reports it has
+    been cancelled, instead of completing the full RAM-guard/concurrency-
+    gate wait (finding 7). Subclasses FFmpegError so existing
+    `except FFmpegError` call sites keep working unchanged; jobs.py's
+    _execute() additionally attributes ANY exception raised while
+    job["cancel_requested"] is set to a "cancelled" job status regardless
+    of type, so this doesn't need special-casing there either."""
+
+
 # ---------- child-process registry + shutdown ----------
 
 _procs: set[subprocess.Popen] = set()
+# job_id -> the tracked Popens spawned while that job was "current" on
+# their own thread (see begin_job/_spawn). Lets jobs.cancel(job_id)
+# terminate only THAT job's children (finding 12+17) instead of every
+# ffmpeg child process-wide -- which used to also kill unrelated
+# concurrent jobs AND the untracked live color-preview-frame path
+# (api/filters.py's preview_frame runs on a plain request thread, never
+# inside a job, so it never gets a job_id here and can never be hit by
+# terminate_job()).
+_procs_by_job: dict[str, set[subprocess.Popen]] = {}
 _procs_lock = threading.Lock()
+
+# Per-THREAD "what job (if any) is currently executing on this thread"
+# context, set by jobs.py's _execute() around running a job's fn (its own
+# thread for start(), the caller's thread -- the sole queue worker -- for
+# run_sync()) and cleared afterwards. A thread-local rather than a
+# parameter threaded through run()/probe()/etc.: those are called from
+# pipeline modules several layers away (and several packwerk-style
+# ownership boundaries away, in this repo's terms) that shouldn't need to
+# change just to opt a job into cancellation/per-job process tracking.
+_job_context = threading.local()
+
+
+def begin_job(job_id: str, cancel_check: Callable[[], bool]) -> None:
+    """Mark `job_id` as the current job on THIS thread: _spawn() will file
+    every Popen it creates on this thread under this job_id (see
+    _procs_by_job), and _wait_for_ram()/_EncodeGate.acquire() will poll
+    `cancel_check()` and raise FFmpegCancelled promptly if it returns True.
+    Must be paired with end_job(job_id) in a finally block."""
+    _job_context.job_id = job_id
+    _job_context.cancel_check = cancel_check
+
+
+def end_job(job_id: str) -> None:
+    """Clear this thread's job context and drop `job_id`'s entry from the
+    per-job process registry (its children, if any, have already been
+    individually _unregister()'d as they finished/were killed -- this just
+    stops the registry from accumulating one empty set per job ever run)."""
+    _job_context.job_id = None
+    _job_context.cancel_check = None
+    with _procs_lock:
+        _procs_by_job.pop(job_id, None)
+
+
+def _raise_if_cancelled() -> None:
+    check = getattr(_job_context, "cancel_check", None)
+    if check is not None and check():
+        raise FFmpegCancelled("cancelled")
 
 
 def _spawn(cmd: list[str], **kwargs) -> subprocess.Popen:
     kwargs.setdefault("stdout", subprocess.PIPE)
     kwargs.setdefault("stderr", subprocess.PIPE)
     proc = subprocess.Popen(cmd, **kwargs)
+    job_id = getattr(_job_context, "job_id", None)
     with _procs_lock:
         _procs.add(proc)
+        if job_id is not None:
+            _procs_by_job.setdefault(job_id, set()).add(proc)
     return proc
 
 
 def _unregister(proc: subprocess.Popen) -> None:
     with _procs_lock:
         _procs.discard(proc)
+        for bucket in _procs_by_job.values():
+            bucket.discard(proc)
 
 
-def terminate_all() -> None:
-    """SIGTERM every tracked ffmpeg child, wait up to 5s, then SIGKILL any
-    still alive. Called on server shutdown (atexit/SIGTERM/SIGINT) and on
-    job cancel."""
-    with _procs_lock:
-        procs = list(_procs)
+def _terminate(procs: list[subprocess.Popen]) -> None:
     for p in procs:
         try:
             p.terminate()
@@ -67,6 +125,29 @@ def terminate_all() -> None:
                 p.kill()
             except Exception:
                 pass
+
+
+def terminate_job(job_id: str) -> None:
+    """SIGTERM (then SIGKILL after a 5s grace period) only the ffmpeg
+    children tracked under `job_id` -- see begin_job/_spawn. Used by
+    jobs.cancel(job_id) so cancelling one job can no longer kill a
+    different, concurrently-running job's encode, nor the untracked live
+    color-preview-frame path (finding 12+17). A no-op if `job_id` has no
+    (or no longer any) tracked children."""
+    with _procs_lock:
+        procs = list(_procs_by_job.get(job_id, ()))
+    _terminate(procs)
+
+
+def terminate_all() -> None:
+    """SIGTERM every tracked ffmpeg child process-wide, wait up to 5s, then
+    SIGKILL any still alive. Real app shutdown ONLY (atexit/SIGTERM/
+    SIGINT) -- job cancellation goes through terminate_job() instead so
+    cancelling one job doesn't collaterally kill unrelated concurrent work
+    (finding 12+17)."""
+    with _procs_lock:
+        procs = list(_procs)
+    _terminate(procs)
 
 
 # ---------- concurrency gate + RAM guard ----------
@@ -92,7 +173,9 @@ class _EncodeGate:
     def acquire(self) -> None:
         with self._cond:
             while self._active >= self._limit():
+                _raise_if_cancelled()
                 self._cond.wait(timeout=1)
+            _raise_if_cancelled()
             self._active += 1
 
     def release(self) -> None:
@@ -122,27 +205,97 @@ def ffmpeg_threads() -> int:
     return _ffmpeg_threads()
 
 
+# ---------- subprocess timeouts (finding 11) ----------
+#
+# Every ffmpeg/ffprobe subprocess call in this module is now bounded: one
+# stalled or corrupt media file used to hang its `communicate()` forever,
+# and since there is exactly one global queue worker thread, that wedged
+# every project's queue, not just the one that hit the bad file. A timeout
+# kills that one child and fails just that stage with a clear error
+# instead. Three tiers (probe/light/heavy), each overridable via
+# settings.performance the same way as max_parallel_ffmpeg/ffmpeg_threads/
+# min_free_ram_gb -- re-read on every call, no restart needed.
+
+_DEFAULT_PROBE_TIMEOUT_S = 30.0
+_DEFAULT_LIGHT_TIMEOUT_S = 300.0  # non-"heavy" run() calls: wav extract, mux, concat
+_DEFAULT_HEAVY_TIMEOUT_S = 1800.0  # heavy encodes: cut_segment, make_proxy
+
+
+def _timeout_s(key: str, default: float) -> float:
+    try:
+        return float(settings.load().get("performance", {}).get(key, default))
+    except Exception:
+        return default
+
+
+def _probe_timeout_s() -> float:
+    return _timeout_s("ffprobe_timeout_s", _DEFAULT_PROBE_TIMEOUT_S)
+
+
+def _light_timeout_s() -> float:
+    return _timeout_s("ffmpeg_light_timeout_s", _DEFAULT_LIGHT_TIMEOUT_S)
+
+
+def _encode_timeout_s() -> float:
+    return _timeout_s("ffmpeg_timeout_s", _DEFAULT_HEAVY_TIMEOUT_S)
+
+
+def _kill_after_timeout(proc: subprocess.Popen) -> None:
+    """Best-effort: the child ignored/couldn't act on communicate()'s
+    implicit SIGTERM-less timeout (communicate() itself does NOT kill the
+    process on TimeoutExpired -- that's on us), so kill it directly and
+    reap it with a short grace period."""
+    try:
+        proc.kill()
+    except Exception:
+        pass
+    try:
+        proc.communicate(timeout=5)
+    except Exception:
+        pass
+
+
 def _wait_for_ram() -> None:
-    """Block (log-waiting in 5s increments) while available RAM is below the
-    configured guard, up to 10 minutes total, then proceed anyway --
-    graceful degradation over refusing to run."""
+    """Block while available RAM is below the configured guard, up to 10
+    minutes total, then proceed anyway -- graceful degradation over
+    refusing to run.
+
+    Cooperative (finding 7): polls the current job's cancel-check (see
+    begin_job(), set by jobs.py's _execute()) every ~1s and raises
+    FFmpegCancelled promptly instead of riding out the full wait -- before
+    this, Cancel was a no-op for up to 10 minutes while the sole queue
+    worker sat here, and the whole queue stalled behind it. Logs a
+    "waiting for RAM" line every ~5s (not every poll, to avoid log spam)
+    and a clear "timed out, proceeding anyway" line if the full max_wait
+    elapses without the threshold being met."""
     min_gb = settings.load().get("performance", {}).get("min_free_ram_gb", 4)
     threshold = min_gb * 2**30
     waited = 0.0
     max_wait = 600.0
+    last_log = -5.0
     while True:
+        _raise_if_cancelled()
         try:
             available = psutil.virtual_memory().available
         except Exception:
             return
-        if available >= threshold or waited >= max_wait:
+        if available >= threshold:
             return
-        print(
-            f"[ffmpeg_utils] low memory ({available / 2**30:.1f}GB free < "
-            f"{min_gb}GB): waiting 5s before encoding..."
-        )
-        time.sleep(5)
-        waited += 5
+        if waited >= max_wait:
+            print(
+                f"[ffmpeg_utils] low memory wait timed out after {max_wait:.0f}s "
+                f"({available / 2**30:.1f}GB free < {min_gb}GB): proceeding anyway"
+            )
+            return
+        if waited - last_log >= 5.0:
+            print(
+                f"[ffmpeg_utils] low memory ({available / 2**30:.1f}GB free < "
+                f"{min_gb}GB): waiting for RAM..."
+            )
+            last_log = waited
+        step = min(1.0, max_wait - waited)
+        time.sleep(step)
+        waited += step
 
 
 @functools.cache
@@ -414,14 +567,24 @@ def export_binaries_to_path() -> str | None:
 
 def run(cmd: list[str], heavy: bool = False) -> None:
     """Run an ffmpeg command via a tracked Popen. `heavy=True` (real
-    video encodes) gates on the RAM guard + the concurrency gate first."""
+    video encodes) gates on the RAM guard + the concurrency gate first, and
+    is allowed a longer bounded timeout than lighter operations (wav
+    extract/mux/concat) before its child is killed and the stage fails
+    (finding 11) -- see _encode_timeout_s()/_light_timeout_s()."""
     if heavy:
         _wait_for_ram()
         _gate.acquire()
+    timeout = _encode_timeout_s() if heavy else _light_timeout_s()
     try:
         proc = _spawn(cmd, text=True)
         try:
-            _, stderr = proc.communicate()
+            try:
+                _, stderr = proc.communicate(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                _kill_after_timeout(proc)
+                raise FFmpegError(
+                    f"{' '.join(cmd[:6])}... timed out after {timeout:.0f}s (stage timed out)"
+                ) from None
         finally:
             _unregister(proc)
         if proc.returncode != 0:
@@ -432,20 +595,25 @@ def run(cmd: list[str], heavy: bool = False) -> None:
 
 
 def probe(path: str) -> dict:
-    proc = subprocess.run(
-        [
-            ffprobe_bin(),
-            "-v",
-            "error",
-            "-print_format",
-            "json",
-            "-show_format",
-            "-show_streams",
-            path,
-        ],
-        capture_output=True,
-        text=True,
-    )
+    timeout = _probe_timeout_s()
+    try:
+        proc = subprocess.run(
+            [
+                ffprobe_bin(),
+                "-v",
+                "error",
+                "-print_format",
+                "json",
+                "-show_format",
+                "-show_streams",
+                path,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        raise FFmpegError(f"ffprobe timed out after {timeout:.0f}s for {path}") from None
     if proc.returncode != 0:
         raise FFmpegError(f"ffprobe failed for {path}: {proc.stderr[-500:]}")
     return json.loads(proc.stdout)
@@ -510,8 +678,13 @@ def load_wav_mono(path: str) -> np.ndarray:
             "-",
         ]
     )
+    timeout = _light_timeout_s()
     try:
-        stdout, _ = proc.communicate()
+        try:
+            stdout, _ = proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            _kill_after_timeout(proc)
+            raise FFmpegError(f"ffmpeg decode timed out after {timeout:.0f}s for {path}") from None
     finally:
         _unregister(proc)
     if proc.returncode != 0:

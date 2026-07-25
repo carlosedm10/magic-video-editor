@@ -53,6 +53,26 @@ _OLLAMA_GITHUB_REPO = "ollama/ollama"
 _DOWNLOAD_ASSET_NAME = "ollama-darwin.tgz"
 _CHECKSUMS_ASSET_NAME = "sha256sum.txt"
 
+# Ollama-robustness hardening (findings #5/#16): the GitHub release lookup
+# used to be a single unbounded-retry-free call, and the asset download
+# stream used timeout=None -- a stalled transfer (dead peer, captive
+# portal, etc.) wedged ensure_ollama() forever since nothing ever raised.
+# Read/write timeouts below act as an IDLE timeout for the streamed
+# download: httpx re-arms them on every successful read, so a healthy
+# multi-hundred-MB transfer is unaffected, but a stall with no bytes for
+# _DOWNLOAD_IDLE_TIMEOUT_S raises promptly instead of hanging.
+_GITHUB_API_TIMEOUT_S = 10.0
+_GITHUB_API_RETRIES = 3
+_GITHUB_API_BACKOFF_S = 1.5
+# Pinned known-good release used only if the GitHub API lookup keeps failing
+# (rate limiting, DNS, transient outage) -- matches the version vendored at
+# build time (packaging/vendor/ollama/VERSION) as of this fix. GitHub's
+# release-download URLs are deterministic (github.com/<repo>/releases/
+# download/<tag>/<asset>), so this fallback needs no extra API call.
+_OLLAMA_FALLBACK_TAG = "v0.32.3"
+_DOWNLOAD_CONNECT_TIMEOUT_S = 10.0
+_DOWNLOAD_IDLE_TIMEOUT_S = 30.0
+
 _proc: subprocess.Popen | None = None
 _proc_lock = threading.Lock()
 # "system" | "bundled" | "downloaded" | "starting" | "downloading" | "unreachable"
@@ -260,6 +280,73 @@ def _safe_extract(tf: tarfile.TarFile, dest_dir: Path) -> None:
         tf.extractall(dest_dir)  # older interpreter without the `filter` kwarg
 
 
+def _release_asset_urls(tag: str) -> tuple[str, str]:
+    """Deterministic GitHub release-download URLs for `tag` -- no API call
+    needed, so the pinned-tag fallback below works even when the API
+    lookup itself is what's failing."""
+    base = f"https://github.com/{_OLLAMA_GITHUB_REPO}/releases/download/{tag}"
+    return f"{base}/{_DOWNLOAD_ASSET_NAME}", f"{base}/{_CHECKSUMS_ASSET_NAME}"
+
+
+def _lookup_latest_release(log) -> tuple[str, str, str | None]:
+    """Resolve (tag, asset_url, checksums_url) for the release to download.
+
+    Tries GET /repos/.../releases/latest with a short timeout, retrying
+    with backoff on any failure (network error, rate limit, timeout).
+    If every attempt fails -- or a real response somehow lacks the asset
+    we need -- falls back to the pinned _OLLAMA_FALLBACK_TAG so a GitHub
+    API hiccup doesn't permanently kill the self-provisioning path for the
+    session (finding #16)."""
+    last_exc: Exception | None = None
+    for attempt in range(1, _GITHUB_API_RETRIES + 1):
+        try:
+            resp = httpx.get(
+                f"https://api.github.com/repos/{_OLLAMA_GITHUB_REPO}/releases/latest",
+                timeout=_GITHUB_API_TIMEOUT_S,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            tag = data.get("tag_name") or _OLLAMA_FALLBACK_TAG
+            assets = data.get("assets") or []
+            asset_url = next(
+                (
+                    a["browser_download_url"]
+                    for a in assets
+                    if a.get("name") == _DOWNLOAD_ASSET_NAME
+                ),
+                None,
+            )
+            checksums_url = next(
+                (
+                    a["browser_download_url"]
+                    for a in assets
+                    if a.get("name") == _CHECKSUMS_ASSET_NAME
+                ),
+                None,
+            )
+            if asset_url:
+                return tag, asset_url, checksums_url
+            last_exc = RuntimeError(f"no {_DOWNLOAD_ASSET_NAME} asset found in release {tag}")
+            logger.warning(
+                "ollama: %s -- falling back to pinned %s", last_exc, _OLLAMA_FALLBACK_TAG
+            )
+            break
+        except Exception as e:
+            last_exc = e
+            logger.warning(
+                "ollama: github release lookup attempt %d/%d failed: %s",
+                attempt,
+                _GITHUB_API_RETRIES,
+                e,
+            )
+            if attempt < _GITHUB_API_RETRIES:
+                time.sleep(_GITHUB_API_BACKOFF_S * attempt)
+
+    log(f"github release lookup failed ({last_exc}) -- using pinned {_OLLAMA_FALLBACK_TAG}")
+    asset_url, checksums_url = _release_asset_urls(_OLLAMA_FALLBACK_TAG)
+    return _OLLAMA_FALLBACK_TAG, asset_url, checksums_url
+
+
 def _download_ollama_binary(log) -> None:
     """jobs.py job body: fetch the latest official ollama-darwin.tgz release
     asset (same one packaging/fetch_ollama.sh vendors at build time),
@@ -267,30 +354,28 @@ def _download_ollama_binary(log) -> None:
     into _downloaded_binary_path().parent. Progress/log lines are visible
     like any other background job (GET /api/jobs/<id>)."""
     log("looking up latest ollama release")
-    resp = httpx.get(
-        f"https://api.github.com/repos/{_OLLAMA_GITHUB_REPO}/releases/latest", timeout=10
-    )
-    resp.raise_for_status()
-    data = resp.json()
-    tag = data.get("tag_name", "unknown")
-    assets = data.get("assets") or []
-    asset_url = next(
-        (a["browser_download_url"] for a in assets if a.get("name") == _DOWNLOAD_ASSET_NAME), None
-    )
-    checksums_url = next(
-        (a["browser_download_url"] for a in assets if a.get("name") == _CHECKSUMS_ASSET_NAME), None
-    )
-    if not asset_url:
-        raise RuntimeError(f"no {_DOWNLOAD_ASSET_NAME} asset found in release {tag}")
+    tag, asset_url, checksums_url = _lookup_latest_release(log)
 
     log(f"downloading ollama {tag}")
     dest_dir = _downloaded_binary_path().parent
     dest_dir.mkdir(parents=True, exist_ok=True)
 
+    # Read/write timeouts double as an idle-transfer timeout: httpx re-arms
+    # them on every chunk received, so a healthy large download runs as
+    # long as it needs to, but a stall (no bytes for _DOWNLOAD_IDLE_TIMEOUT_S)
+    # raises httpx.ReadTimeout instead of hanging ensure_ollama() forever
+    # (finding #5). Never timeout=None here.
+    download_timeout = httpx.Timeout(
+        connect=_DOWNLOAD_CONNECT_TIMEOUT_S,
+        read=_DOWNLOAD_IDLE_TIMEOUT_S,
+        write=_DOWNLOAD_IDLE_TIMEOUT_S,
+        pool=_DOWNLOAD_CONNECT_TIMEOUT_S,
+    )
+
     with tempfile.TemporaryDirectory(prefix="mve-ollama-dl-") as tmp:
         tgz_path = Path(tmp) / _DOWNLOAD_ASSET_NAME
-        with httpx.Client() as client:
-            with client.stream("GET", asset_url, timeout=None, follow_redirects=True) as res:
+        with httpx.Client(timeout=download_timeout) as client:
+            with client.stream("GET", asset_url, follow_redirects=True) as res:
                 res.raise_for_status()
                 total = int(res.headers.get("content-length") or 0)
                 done = 0
@@ -400,44 +485,58 @@ def ensure_ollama() -> str:
         if _proc is not None and _proc.poll() is None:
             return _mode
 
-        logger.info("ollama: checking reachability at %s", config.OLLAMA_URL)
-        if _reachable(config.OLLAMA_URL):
-            logger.info("ollama: system install reachable at %s -- using it", config.OLLAMA_URL)
-            _mode = "system"
-            return _mode
-        logger.info("ollama: unreachable at %s", config.OLLAMA_URL)
+        # Finding #16 (c): every path below must end with either a live
+        # _proc + a non-"unreachable"/"downloading" mode, or with _mode
+        # explicitly reset to "unreachable" -- never left stuck mid-flight
+        # (e.g. permanently "downloading") if something in here raises
+        # unexpectedly. That guarantee is what makes retry_ensure_ollama()
+        # safe to call after any kind of failure.
+        try:
+            logger.info("ollama: checking reachability at %s", config.OLLAMA_URL)
+            if _reachable(config.OLLAMA_URL):
+                logger.info(
+                    "ollama: system install reachable at %s -- using it", config.OLLAMA_URL
+                )
+                _mode = "system"
+                return _mode
+            logger.info("ollama: unreachable at %s", config.OLLAMA_URL)
 
-        binary = bundled_binary_path()
-        if binary is not None:
-            logger.info("ollama: bundled binary found at %s", binary)
-            proc = _spawn_binary(binary)
+            binary = bundled_binary_path()
+            if binary is not None:
+                logger.info("ollama: bundled binary found at %s", binary)
+                proc = _spawn_binary(binary)
+                if proc is not None:
+                    _proc = proc
+                    _mode = "bundled"
+                    return _mode
+                logger.warning("ollama: bundled binary present but failed to come up")
+            else:
+                logger.warning(
+                    "ollama: no bundled binary found (checked: %s)",
+                    ", ".join(
+                        str(r / "packaging" / "vendor" / "ollama" / "ollama")
+                        for r in _candidate_bundle_roots()
+                    ),
+                )
+
+            _mode = "downloading"
+            proc = _download_and_spawn()
             if proc is not None:
                 _proc = proc
-                _mode = "bundled"
+                _mode = "downloaded"
                 return _mode
-            logger.warning("ollama: bundled binary present but failed to come up")
-        else:
+
             logger.warning(
-                "ollama: no bundled binary found (checked: %s)",
-                ", ".join(
-                    str(r / "packaging" / "vendor" / "ollama" / "ollama")
-                    for r in _candidate_bundle_roots()
-                ),
+                "ollama: neither system, bundled, nor a freshly-downloaded Ollama came up -- "
+                "LLM features will be unavailable."
             )
-
-        _mode = "downloading"
-        proc = _download_and_spawn()
-        if proc is not None:
-            _proc = proc
-            _mode = "downloaded"
+            _mode = "unreachable"
             return _mode
-
-        logger.warning(
-            "ollama: neither system, bundled, nor a freshly-downloaded Ollama came up -- "
-            "LLM features will be unavailable."
-        )
-        _mode = "unreachable"
-        return _mode
+        except Exception:
+            logger.exception("ollama: ensure_ollama() failed unexpectedly")
+            _proc = None
+            _mode = "unreachable"
+            return _mode
 
 
 def ensure_ollama_async() -> None:
@@ -458,6 +557,23 @@ def ensure_ollama_async() -> None:
         _ensure_started = True
     _mode = "starting"
     threading.Thread(target=ensure_ollama, name="ollama-ensure", daemon=True).start()
+
+
+def retry_ensure_ollama() -> None:
+    """Public retry entry point (finding #16 (c)): ensure_ollama_async() is
+    a one-shot latch -- once it has run, a later call is a no-op even if
+    the outcome was "unreachable" (e.g. a transient GitHub rate-limit or a
+    stalled download that has since cleared up). That made a transient
+    failure terminal for the whole session with no way back to "system"/
+    "bundled"/"downloaded" short of restarting the app. This clears that
+    latch (via terminate(), which also tears down any half-alive process
+    and resets _mode) and kicks off a fresh probe/spawn/download attempt
+    on a background thread, exactly like the original startup call.
+    Safe to call any time (e.g. from a "Retry" action hitting
+    POST /api/ollama/retry) -- a no-op race with an in-flight ensure_ollama()
+    just means the fresh attempt starts right after the old one finishes."""
+    terminate()
+    ensure_ollama_async()
 
 
 def current_mode() -> str:

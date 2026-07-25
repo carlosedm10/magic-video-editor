@@ -3,9 +3,12 @@ UI polls /api/jobs/<id> for status and log lines.
 
 Resource safety additions (spec: "Resource safety"): per-lock-key exclusivity
 (one running job per project) via `lock_key`, and cooperative cancellation
-(`cancel()`) that also tears down any ffmpeg children via
-ffmpeg_utils.terminate_all() -- acceptable globally since the per-project
-lock means at most one heavy job runs at a time."""
+(`cancel()`) that tears down only THAT job's own ffmpeg children
+(ffmpeg_utils.terminate_job(), keyed off a per-thread job context set by
+_execute() via ffmpeg_utils.begin_job/end_job) -- different lock_keys (i.e.
+different projects) can have jobs running concurrently via start(), so a
+global terminate_all() on every cancel would kill unrelated work; that stays
+reserved for real process shutdown."""
 
 import threading
 import time
@@ -91,12 +94,26 @@ def _new_job(name: str, lock_key: str | None) -> dict:
     return job
 
 
+def _job_cancel_requested(job: dict) -> bool:
+    with _lock:
+        return bool(job.get("cancel_requested"))
+
+
 def _execute(job: dict, fn, args) -> None:
     """Run fn(log, *args) against job, updating job["status"]/["error"]/["log"]
     to done/cancelled/error. Shared by start()'s worker thread and run_sync()'s
     synchronous execution -- the only difference between the two is which
-    thread calls this."""
+    thread calls this.
+
+    Registers this job as the "current job" on THIS thread for the duration
+    (ffmpeg_utils.begin_job/end_job) so, without needing to thread a job_id
+    or cancel-check through every pipeline module's ffmpeg_utils.run()/
+    probe() call site: (a) _wait_for_ram()/_EncodeGate.acquire() can poll
+    this job's own cancel_requested and bail out promptly (finding 7), and
+    (b) every ffmpeg child this job spawns is filed under its own job_id so
+    cancel(job_id) can terminate only THOSE children (finding 12+17)."""
     log = JobLog(job)
+    ffmpeg_utils.begin_job(job["id"], lambda: _job_cancel_requested(job))
     try:
         fn(log, *args)
         with _lock:
@@ -108,10 +125,11 @@ def _execute(job: dict, fn, args) -> None:
             job["log"].append(f"[{time.strftime('%H:%M:%S')}] cancelled")
     except Exception as e:
         with _lock:
-            # cancel() kills the job's ffmpeg children directly, which
-            # usually surfaces as some other exception (e.g. FFmpegError
-            # from the terminated process) rather than JobCancelled --
-            # attribute it to the cancellation the caller asked for.
+            # cancel() terminates the job's OWN ffmpeg children directly,
+            # which usually surfaces as some other exception (e.g.
+            # FFmpegError/FFmpegCancelled from the terminated/interrupted
+            # process) rather than JobCancelled -- attribute it to the
+            # cancellation the caller asked for.
             if job.get("cancel_requested"):
                 job["status"] = "cancelled"
                 job["log"].append(f"[{time.strftime('%H:%M:%S')}] cancelled")
@@ -120,6 +138,7 @@ def _execute(job: dict, fn, args) -> None:
                 job["error"] = str(e)
                 job["log"].append(traceback.format_exc()[-2000:])
     finally:
+        ffmpeg_utils.end_job(job["id"])
         _release_lock(job)
 
 
@@ -166,15 +185,18 @@ def run_sync(name: str, fn, *args, lock_key: str | None = None, on_start=None) -
 
 
 def cancel(job_id: str) -> bool:
-    """Request cooperative cancellation of a running job and terminate any
-    ffmpeg children (global -- fine given the per-lock-key exclusivity).
-    Returns False if the job isn't running (already finished/unknown)."""
+    """Request cooperative cancellation of a running job and terminate ONLY
+    that job's ffmpeg children (finding 12+17: previously terminate_all()
+    killed every tracked ffmpeg child process-wide, so cancelling one job
+    also killed unrelated concurrent jobs and the untracked live
+    color-preview-frame path). Returns False if the job isn't running
+    (already finished/unknown)."""
     with _lock:
         job = _jobs.get(job_id)
         if not job or job["status"] != "running":
             return False
         job["cancel_requested"] = True
-    ffmpeg_utils.terminate_all()
+    ffmpeg_utils.terminate_job(job_id)
     return True
 
 

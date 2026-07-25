@@ -248,6 +248,14 @@
       try { closeDrawer(); } catch (_e) { /* drawer may not be open */ }
       try { if (!$("#settings-overlay").hidden) closeSettings(); } catch (_e) { /* settings not open */ }
 
+      // The Color-tab comparison overlay (rAF loop + hidden <video>) lives on
+      // #player-stage, underneath #project-view -- if it's active when we
+      // take over the view, hiding #project-view leaves it running with
+      // nothing ever tearing it down (mirrors the guard Inspector.mount()
+      // already applies for the same reason: "a previous surface may have
+      // left the Color-tab comparison overlay mounted").
+      try { window.EditorUI.compare?.deactivate(); } catch (e) { console.error(e); }
+
       const pv = document.getElementById("project-view");
       if (pv) pv.hidden = true;
       const view = document.getElementById("re-view");
@@ -1651,7 +1659,7 @@
           ${last?.status === "error" ? `<div class="dim" style="color:var(--danger);margin-top:6px">${esc(last.error || "Render failed")}</div>` : ""}
           ${reel.path ? `
             <div style="margin-top:10px">
-              <video controls preload="metadata" src="/api/projects/${this.pid}/media/file?path=${encodeURIComponent(reel.path)}"></video>
+              <video controls preload="metadata" src="/api/projects/${this.pid}/media/reel-preview/${this.rid}"></video>
               <div class="row" style="margin-top:6px">
                 <button class="btn small" id="re-open-folder"><i data-lucide="folder-open"></i> Open in Finder</button>
               </div>

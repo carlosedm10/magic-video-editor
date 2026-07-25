@@ -11,9 +11,10 @@ replaces the old per-endpoint 409 (JobBusyError) guard."""
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
-from .. import jobs, queue, store
+from .. import jobs, queue, settings, store
 from ..jobs import JobCancelled
 from ..pipeline import ingest, ordering, reels, render, review, sync, takes, transcribe
+from . import ollama as ollama_api
 
 router = APIRouter(prefix="/api", tags=["pipeline"])
 
@@ -46,6 +47,43 @@ STAGE_LABELS = {
 # KIND_RUNNERS: callable(log, project, payload) registered into magic_video_editor.queue
 # --------------------------------------------------------------------------
 
+# Root-cause fix (2026-07-25): which settings.py task(s) each LLM-backed
+# stage resolves a model for (see the get_agent(...) calls in the matching
+# magic_video_editor/pipeline/*.py module). Stages not listed here (ingest,
+# sync, transcribe, render) never touch an Ollama agent and are skipped by
+# _preflight_stage below. This is the ONE place both _run_stage_kind and
+# _run_all_kind go through before invoking a stage, so every LLM stage gets
+# the same preflight regardless of whether it's run individually or as part
+# of run-all.
+LLM_TASKS_BY_STAGE: dict[str, list[str]] = {
+    "takes": [
+        "transcript_cleaner",
+        "take_sequencer",
+        "video_topic",
+        "context_check",
+        "dedup_judge",
+        "take_judge",
+    ],
+    "order": ["clip_order"],
+    "review": ["reviewer"],
+    "reels": ["reel_composer", "reel_scorer"],
+}
+
+
+def _preflight_stage(stage: str) -> None:
+    """Preflight guard: before an LLM-backed stage actually runs, verify its
+    resolved model(s) are reachable/installed/fit RAM (see
+    api/ollama.py's preflight_check_models). Runs INSIDE the job (called
+    from the queue runners below, never from the FastAPI event loop) so a
+    failure becomes a visible job/stage error instead of a raw ollama
+    error or, on an oversized model, a silent hang while the Mac swaps.
+    No-ops for stages that don't call any agent."""
+    tasks = LLM_TASKS_BY_STAGE.get(stage)
+    if not tasks:
+        return
+    models = {settings.model_for(t) for t in tasks}
+    ollama_api.preflight_check_models(models)
+
 
 def _run_stage_kind(log, project: dict, payload: dict) -> None:
     """Runner for queue kind "stage:<name>". Accepts stage either explicitly
@@ -58,6 +96,7 @@ def _run_stage_kind(log, project: dict, payload: dict) -> None:
         raise RuntimeError(f"unknown stage {stage}")
     fn = STAGES[stage]
     try:
+        _preflight_stage(stage)
         fn(log, project)
         store.mark_stage(project, stage, "done")
     except JobCancelled:
@@ -101,6 +140,7 @@ def _run_all_kind(log, project: dict, payload: dict) -> None:
         log.stage(stage, status="running", progress=0.0)
         proxy = _StageLogProxy(log, stage, i, total)
         try:
+            _preflight_stage(stage)
             fn(proxy, project)
             store.mark_stage(project, stage, "done")
             log.stage(stage, status="done", progress=1.0)

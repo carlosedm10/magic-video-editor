@@ -862,6 +862,14 @@ def render_reel(log, project: dict, reel_id: str) -> None:
         ffmpeg_utils.mux_audio(str(work_out), str(enhanced_wav), str(remuxed))
         remuxed.replace(work_out)
 
+    # Main audio track (spec vNext "Main audio track"): reuses render.py's
+    # own _apply_music_bed (source of truth for the ducking filtergraph, same
+    # reuse pattern as _encode_segment/_merge_crossfades above), AFTER
+    # audio-enhance for the same reason render.py's _build applies it there.
+    music_out = work / f"reel_{reel_id}_music.mp4"
+    if render_mod._apply_music_bed(log, project, work_out, music_out):
+        music_out.replace(work_out)
+
     # Exported artifact, title-named (spec v5 addendum "export filenames"):
     # settings.export_dir/<project name>/<sanitized reel title>.mp4.
     export_dir = _export_dir_for(project)

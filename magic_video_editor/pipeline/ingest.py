@@ -12,6 +12,7 @@ import uuid
 from pathlib import Path
 
 from .. import ffmpeg_utils, store
+from . import ordering
 
 MEDIA_EXTS = {
     ".mp4",
@@ -27,6 +28,19 @@ MEDIA_EXTS = {
     ".flac",
 }
 AUDIO_EXTS = {".m4a", ".wav", ".mp3", ".aac", ".flac"}
+
+# Main audio track / music bed (vNext "MUSIC BED WITH AUTO-DUCKING"): files
+# imported through add_audio_assets/register_uploaded_audio_assets below
+# become project["audio_assets"] entries -- deliberately a SEPARATE list from
+# project["clips"], never touched by the camera-clip pipeline (build_edl/
+# ordering/takes all filter role=="camera" over project["clips"]; an
+# audio_assets entry has no "role" field and isn't in that list at all, so
+# it structurally can't leak in). No proxy/thumbs/transcribe -- those are
+# camera-clip concerns this import path skips entirely. Deliberately a
+# strict subset of AUDIO_EXTS/MEDIA_EXTS above (this is a distinct import
+# path -- api/audio.py's /audio-assets endpoints -- from the existing
+# role="audio" external-mic-sync clips that go through add_clips/MEDIA_EXTS).
+MUSIC_EXTS = {".mp3", ".wav", ".m4a"}
 
 
 def _import_into_project(src: Path, project_id: str) -> Path:
@@ -141,6 +155,8 @@ def add_clips(project: dict, paths: list[str], camera_group: str | None = None) 
             added.append(clip)
             existing.add(str(f))
     _finalize_main_group(project, added)
+    if added:
+        ordering.invalidate_after_clipset_change(project)
     store.save(project)
     _enqueue_analyze_for_new_clips(project, added)
     return added
@@ -162,8 +178,67 @@ def register_uploaded_clips(project: dict, saved: list[tuple[Path, str]]) -> lis
         added.append(clip)
         existing.add(str(dest))
     _finalize_main_group(project, added)
+    if added:
+        ordering.invalidate_after_clipset_change(project)
     store.save(project)
     _enqueue_analyze_for_new_clips(project, added)
+    return added
+
+
+def _new_audio_asset_record(imported: Path) -> dict:
+    info = ffmpeg_utils.clip_info(str(imported))
+    return {
+        "id": uuid.uuid4().hex[:8],
+        "path": str(imported),
+        "filename": imported.name,
+        "duration": round(info.get("duration") or 0.0, 3),
+    }
+
+
+def add_audio_assets(project: dict, paths: list[str]) -> list[dict]:
+    """Path-based import of music-bed audio files (native pywebview picker /
+    "add by path" power-user link) into project["audio_assets"]. Mirrors
+    add_clips' hardlink-import (_import_into_project, same macOS-TCC
+    sidestep) but appends to the separate audio_assets list -- never to
+    project["clips"] -- and skips proxy/thumbs/wav-extract/transcribe
+    entirely (see MUSIC_EXTS comment above)."""
+    added = []
+    existing = {a["path"] for a in project.get("audio_assets", [])}
+    for raw in paths:
+        p = Path(raw).expanduser()
+        if not p.is_file() or p.suffix.lower() not in MUSIC_EXTS or str(p) in existing:
+            continue
+        imported = _import_into_project(p, project["id"])
+        try:
+            asset = _new_audio_asset_record(imported)
+        except Exception:
+            continue  # unreadable/unprobeable file -- skip rather than fail the whole batch
+        project.setdefault("audio_assets", []).append(asset)
+        added.append(asset)
+        existing.add(str(p))
+    if added:
+        store.save(project)
+    return added
+
+
+def register_uploaded_audio_assets(project: dict, saved: list[Path]) -> list[dict]:
+    """Same as add_audio_assets, for files api/audio.py's upload endpoint
+    (v5.3-style streaming multipart, browser-mode drag&drop/file-picker
+    fallback for the music bed) already streamed straight onto disk."""
+    added = []
+    existing = {a["path"] for a in project.get("audio_assets", [])}
+    for dest in saved:
+        if dest.suffix.lower() not in MUSIC_EXTS or str(dest) in existing:
+            continue
+        try:
+            asset = _new_audio_asset_record(dest)
+        except Exception:
+            continue
+        project.setdefault("audio_assets", []).append(asset)
+        added.append(asset)
+        existing.add(str(dest))
+    if added:
+        store.save(project)
     return added
 
 

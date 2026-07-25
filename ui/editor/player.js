@@ -134,7 +134,7 @@ const Player = {
     this._currentIndex = 0;
     this.videos.forEach((v, i) => {
       v.classList.toggle("active", i === 0);
-      v.onerror = () => console.error("player video error", v.dataset.clipId, v.error);
+      v.onerror = () => this._onVideoError(v);
     });
     this._active().ontimeupdate = () => this._onTimeUpdate();
 
@@ -486,8 +486,25 @@ const Player = {
     } else {
       this._showEmpty(false);
       if (this.mode === "draft") {
+        // v_FIX §9: any EDL edit while playing (add/split/delete/reorder a
+        // segment, etc.) lands here mid-playback. The old `andPlay: false`
+        // unconditionally paused the underlying <video> while leaving
+        // `this.playing`/the play-pause button UNTOUCHED -- so the UI kept
+        // showing "playing" (pause icon) with a frozen frame, or, on the
+        // reverse case (edit while paused racing a stray play), the video
+        // could keep rolling under a "paused" UI. Thread the REAL desired
+        // state through instead: capture `this.playing` before reloading and
+        // hand it to _loadSegment as `andPlay`, then reconcile this.playing
+        // and the button to whatever we actually just did (loadSegment's
+        // play() call can itself fail/reject silently, e.g. autoplay-block,
+        // so we don't just assume success).
+        const wasPlaying = this.playing;
         const i = Math.min(Editor.selected, Editor.segments.length - 1);
-        this._loadSegment(i, Editor.segments[i].start, { andPlay: false });
+        this._loadSegment(i, Editor.segments[i].start, { andPlay: wasPlaying });
+        this.playing = wasPlaying;
+        const btn = document.getElementById("pp-playpause");
+        if (btn) { btn.innerHTML = `<i data-lucide="${wasPlaying ? "pause" : "play"}"></i>`; refreshIcons(); }
+        this._updateSubtitleInteractivity();
       }
     }
     this.reloadSubtitles();
@@ -761,6 +778,49 @@ const Player = {
     idle.onloadedmetadata = () => { try { idle.currentTime = next.start; } catch (_e) { /* ignore */ } };
   },
 
+  /* ---------- v_FIX §15: recover from a missing/corrupt clip file ----------
+     Previously video.onerror only console.error'd -- the <video> element was
+     left in its errored state forever: this.playing stayed true (if it was),
+     the play/pause button kept showing "pause", and the raf loop's
+     _onTimeUpdate() never fires again for a video that can't decode, so
+     _advance() never runs either. Draft playback just silently stalled with
+     no user-visible sign anything was wrong. Now: only react when the error
+     is on the currently ACTIVE video in Draft/non-Source mode (a failed
+     background preload on the idle element just means "can't cross-fade
+     smoothly" -- not a playback stall -- so that path is left to degrade on
+     its own via _advance()'s existing canSwap fallback). Reset the play
+     state + button, toast the failure, and skip forward to the next segment
+     (if any) preserving whatever the real play intent was, so a single bad
+     clip doesn't hang the whole cut. */
+  _onVideoError(video) {
+    console.error("player video error", video.dataset.clipId, video.error);
+    if (this.mode !== "draft" || this.sourceClipId || video !== this._active()) return;
+    const wasPlaying = this.playing;
+    const clip = Editor?.clip?.(video.dataset.clipId);
+    const name = clip?.filename || video.dataset.clipId || "this clip";
+    try { showToast(`Couldn't play "${name}" — skipping to the next segment.`); } catch (_e) { /* toast is best-effort */ }
+    const nextIndex = this._currentIndex + 1;
+    const next = Editor.segments?.[nextIndex];
+    const btn = document.getElementById("pp-playpause");
+    if (next) {
+      // Keep the real play intent alive across the skip -- _loadSegment's
+      // `andPlay` re-issues play() on the next clip if we were playing, so
+      // this.playing/the button stay truthful instead of freezing on
+      // whatever they happened to say when the error fired.
+      Editor.select(nextIndex);
+      this._loadSegment(nextIndex, next.start, { andPlay: wasPlaying });
+      this.playing = wasPlaying;
+      if (btn) { btn.innerHTML = `<i data-lucide="${wasPlaying ? "pause" : "play"}"></i>`; refreshIcons(); }
+    } else {
+      // Last (or only) segment errored -- nothing to skip forward to; stop
+      // cleanly and make sure the UI actually says "stopped" instead of
+      // hanging forever under a stale "playing" button.
+      this.playing = false;
+      if (btn) { btn.innerHTML = '<i data-lucide="play"></i>'; refreshIcons(); }
+    }
+    this._updateSubtitleInteractivity();
+  },
+
   play() {
     if (this.sourceClipId) {
       // v7 §7.1: "Transport keys work on the source clip."
@@ -865,13 +925,22 @@ const Player = {
     if (video.currentTime >= seg.end - this.epsilon) this._advance();
   },
 
-  /* ---------- draft-mode transition approximation (spec v4 §3/§4) ----------
+  /* ---------- draft-mode transition approximation (spec v4 §3/§4, v7.5) ----
      The transition on Editor.segments[nextIndex] is the transition INTO
      that segment. "fade": a quick to-black overlay flash independent of the
      configured duration (real fade is baked by ffmpeg; this is just a live
-     approximation cue). "crossfade": both stacked <video> elements' opacity
-     cross-fades over the configured duration, overriding style.css's fast
-     .08s default transition just for this swap. */
+     approximation cue). "crossfade" AND every other named xfade catalog type
+     (wipeleft, circleopen, slideup, pixelize, dissolve, ... ~58 entries,
+     spec v7.5 §7.5): both stacked <video> elements' opacity cross-fades over
+     the configured duration, overriding style.css's fast .08s default
+     transition just for this swap. The editor can't cheaply reproduce each
+     exact GPU xfade shape, so every non-fade named type gets this generic
+     dissolve approximation in draft mode — the exact styled transition (wipe/
+     circle/pixelize/etc.) is only ever baked by ffmpeg at render/export time
+     (see pipeline/render.py). Only "none" is a real hard cut. If the idle
+     buffer isn't ready for a cross-fade, fall back to the quick to-black
+     flash rather than a bare cut, so the user always SEES something happen
+     at the junction. */
   _advance() {
     const nextIndex = this._currentIndex + 1;
     const next = Editor.segments?.[nextIndex];
@@ -880,6 +949,7 @@ const Player = {
     const transition = next.transition || { type: "none", duration: 0.5 };
     const idle = this._idle();
     const canSwap = idle.dataset.clipId === next.clip_id && idle.readyState >= 2;
+    const hasTransition = transition.type && transition.type !== "none";
 
     const doSwap = () => {
       this._active().pause();
@@ -897,8 +967,14 @@ const Player = {
 
     if (transition.type === "fade") {
       this._quickFadeThenSwap(doSwap, canSwap, nextIndex, next, wasPlaying);
-    } else if (transition.type === "crossfade" && canSwap) {
+    } else if (hasTransition && canSwap) {
+      // "crossfade" and every other named catalog type (circleopen, wipeleft,
+      // slideup, pixelize, ...) all get the same generic dissolve preview.
       this._crossfadeSwap(next, transition.duration, wasPlaying, nextIndex);
+    } else if (hasTransition && !canSwap) {
+      // Idle buffer not ready for a cross-fade — still show a visible
+      // transition cue rather than silently hard-cutting.
+      this._quickFadeThenSwap(doSwap, canSwap, nextIndex, next, wasPlaying);
     } else if (canSwap) {
       doSwap();
     } else {

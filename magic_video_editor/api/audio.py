@@ -5,21 +5,35 @@ magic_video_editor/pipeline/eq.py's build_audio_filter), and an A/B preview
 endpoint that extracts a short sample from a clip, runs it through the same
 enhance() used at render time plus the current EQ chain, and hands back URLs
 for both the original and enhanced wav so the UI can play them side by
-side."""
+side.
+
+vNext "Main audio track" (music bed with auto-ducking) additive section:
+CRUD for project["audio_assets"] (imported .mp3/.wav/.m4a music files -- see
+pipeline/ingest.py's add_audio_assets/register_uploaded_audio_assets, a
+SEPARATE list from project["clips"]/the camera-clip pipeline) and
+project["audio_track"] (the single main-audio-track placement: {asset_id,
+start_s, gain_db, ducking}, or null). Mixed into the final render + reels'
+audio by pipeline/render.py's _apply_music_bed (reused by
+pipeline/reels.py's render_reel) -- this router only ever persists the
+config, never touches ffmpeg."""
 
 import uuid
+from pathlib import Path
 from urllib.parse import quote
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, File, HTTPException, UploadFile
 from pydantic import BaseModel, field_validator
 
-from .. import store
+from .. import config, store
 from ..ffmpeg_utils import FFmpegError, ffmpeg_bin, run
-from ..pipeline import audio_enhance, eq
+from ..pipeline import audio_enhance, eq, ingest
 
 router = APIRouter(prefix="/api", tags=["audio"])
 
 PREVIEW_SECONDS = 10.0
+_UPLOAD_CHUNK = 1024 * 1024
+GAIN_MIN_DB = -60.0
+GAIN_MAX_DB = 12.0
 
 
 class AudioEnhanceUpdate(BaseModel):
@@ -134,3 +148,156 @@ def audio_preview(pid: str, body: AudioPreviewRequest):
         "original_url": media_url(original_path),
         "enhanced_url": media_url(enhanced_path),
     }
+
+
+# ---------- main audio track / music bed (vNext) ----------
+
+
+class AddAudioAssets(BaseModel):
+    paths: list[str]
+
+
+class AudioTrackUpdate(BaseModel):
+    asset_id: str
+    start_s: float = 0.0
+    gain_db: float | None = None
+    ducking: bool = True
+
+    @field_validator("start_s")
+    @classmethod
+    def _validate_start(cls, v):
+        if v < 0:
+            raise ValueError("start_s must be >= 0")
+        return v
+
+    @field_validator("gain_db")
+    @classmethod
+    def _validate_gain(cls, v):
+        if v is not None and not (GAIN_MIN_DB <= v <= GAIN_MAX_DB):
+            raise ValueError(f"gain_db must be between {GAIN_MIN_DB} and {GAIN_MAX_DB}")
+        return v
+
+
+@router.get("/projects/{pid}/audio-assets")
+def audio_assets_list(pid: str):
+    try:
+        project = store.load(pid)
+    except FileNotFoundError:
+        raise HTTPException(404) from None
+    return {"audio_assets": project.get("audio_assets") or []}
+
+
+@router.post("/projects/{pid}/audio-assets")
+def audio_assets_add(pid: str, body: AddAudioAssets):
+    """Native path-based import (pywebview picker / "add by path" power-user
+    link) -- mirrors POST /projects/{pid}/clips but into the separate
+    audio_assets list (pipeline/ingest.py.add_audio_assets)."""
+    try:
+        project = store.load(pid)
+    except FileNotFoundError:
+        raise HTTPException(404) from None
+    added = ingest.add_audio_assets(project, body.paths)
+    return {"added": len(added), "audio_assets": project.get("audio_assets") or []}
+
+
+@router.post("/projects/{pid}/audio-assets/upload")
+def audio_assets_upload(
+    pid: str,
+    files: list[UploadFile] = File(...),  # noqa: B008 (standard FastAPI upload idiom)
+):
+    """Browser-mode fallback (drag&drop / hidden file input) for importing
+    music-bed audio, streamed straight to disk exactly like
+    api/projects.py's clips_upload (plain `def`, not `async def` -- same
+    threadpool reasoning documented there: a multi-GB write must never block
+    the single asyncio event loop)."""
+    try:
+        project = store.load(pid)
+    except FileNotFoundError:
+        raise HTTPException(404) from None
+
+    media_dir = store.project_dir(pid) / "media"
+    media_dir.mkdir(parents=True, exist_ok=True)
+
+    saved: list[Path] = []
+    for f in files:
+        raw_name = (f.filename or "upload").replace("\\", "/").lstrip("/")
+        name = next((p for p in reversed(raw_name.split("/")) if p and p != ".."), None)
+        if not name or Path(name).suffix.lower() not in ingest.MUSIC_EXTS:
+            f.file.close()
+            continue
+
+        stem, suffix = Path(name).stem, Path(name).suffix
+        dest = media_dir / name
+        n = 1
+        while dest.exists():
+            dest = media_dir / f"{stem}_{n}{suffix}"
+            n += 1
+
+        with open(dest, "wb") as out:
+            while chunk := f.file.read(_UPLOAD_CHUNK):
+                out.write(chunk)
+        f.file.close()
+        saved.append(dest)
+
+    added = ingest.register_uploaded_audio_assets(project, saved)
+    return {"added": len(added), "audio_assets": project.get("audio_assets") or []}
+
+
+@router.delete("/projects/{pid}/audio-assets/{aid}")
+def audio_asset_remove(pid: str, aid: str):
+    try:
+        project = store.load(pid)
+    except FileNotFoundError:
+        raise HTTPException(404) from None
+    project["audio_assets"] = [a for a in project.get("audio_assets") or [] if a["id"] != aid]
+    # An audio_track pointing at the asset just removed would otherwise dangle
+    # (render.py's _apply_music_bed already no-ops defensively on a missing
+    # asset, but clearing it here keeps the UI's state honest too).
+    if (project.get("audio_track") or {}).get("asset_id") == aid:
+        project["audio_track"] = None
+    store.save(project)
+    return {"ok": True}
+
+
+@router.get("/projects/{pid}/audio-track")
+def audio_track_get(pid: str):
+    try:
+        project = store.load(pid)
+    except FileNotFoundError:
+        raise HTTPException(404) from None
+    return {"audio_track": project.get("audio_track")}
+
+
+@router.put("/projects/{pid}/audio-track")
+def audio_track_put(pid: str, body: AudioTrackUpdate):
+    """Sets the ONE main-audio-track placement (spec vNext): project
+    ["audio_track"] = {asset_id, start_s, gain_db, ducking}. `gain_db` omitted
+    -> config.MUSIC_GAIN_DEFAULT_DB (the sensible music-bed default when
+    first placed); the UI can PUT again with an explicit value once the user
+    adjusts the gain control."""
+    try:
+        project = store.load(pid)
+    except FileNotFoundError:
+        raise HTTPException(404) from None
+    if not any(a["id"] == body.asset_id for a in project.get("audio_assets") or []):
+        raise HTTPException(400, f"audio asset {body.asset_id} not found")
+    gain_db = body.gain_db if body.gain_db is not None else config.MUSIC_GAIN_DEFAULT_DB
+    project["audio_track"] = {
+        "asset_id": body.asset_id,
+        "start_s": body.start_s,
+        "gain_db": gain_db,
+        "ducking": body.ducking,
+    }
+    store.save(project)
+    return {"audio_track": project["audio_track"]}
+
+
+@router.delete("/projects/{pid}/audio-track")
+def audio_track_clear(pid: str):
+    try:
+        project = store.load(pid)
+    except FileNotFoundError:
+        raise HTTPException(404) from None
+    project["audio_track"] = None
+    store.save(project)
+    return {"ok": True}

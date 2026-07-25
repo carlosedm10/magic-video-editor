@@ -18,7 +18,16 @@ from fastapi.responses import (
 )
 from pydantic import BaseModel
 
-from . import __version__, config, ffmpeg_utils, llm, ollama_manager, store, updater
+from . import (
+    __version__,
+    config,
+    ffmpeg_utils,
+    llm,
+    ollama_manager,
+    single_instance,
+    store,
+    updater,
+)
 from .api import (
     audio,
     edl,
@@ -233,6 +242,14 @@ def main():
 
     config.ensure_dirs()
 
+    # Bug fix: block a second `mve-server` (or a packaged app.py instance)
+    # from binding the same config.HOST/PORT / config.DATA_DIR. Shares the
+    # detection helper with app.py -- see single_instance.py.
+    if single_instance.detect_existing_instance(config.DATA_DIR, config.HOST, config.PORT):
+        print("Magic Video Editor is already running -- not starting a second server.")
+        single_instance.focus_existing_instance()
+        return
+
     # Field bug fix (M2): mlx-whisper shells out to bare `ffmpeg`/`ffprobe`
     # from PATH internally, bypassing our ffmpeg_bin()/ffprobe_bin()
     # resolution entirely -- make sure PATH already points at the right
@@ -258,6 +275,9 @@ def main():
     # *before* uvicorn's own graceful shutdown runs, and chain to uvicorn's
     # handle_exit so its shutdown still happens (never swallowed).
     atexit.register(ffmpeg_utils.terminate_all)
+    # Same shutdown path releases the single-instance lock acquired above,
+    # so a killed/crashed server never leaves a phantom "already running".
+    atexit.register(single_instance.release_singleton)
 
     cfg = uvicorn.Config(app, host=config.HOST, port=config.PORT, log_level="warning")
     server = uvicorn.Server(cfg)
@@ -270,6 +290,7 @@ def main():
 
         def _handle_exit(sig, _frame=None):
             ffmpeg_utils.terminate_all()
+            single_instance.release_singleton()
             server.handle_exit(sig, _frame)
 
         for sig in (signal.SIGTERM, signal.SIGINT):

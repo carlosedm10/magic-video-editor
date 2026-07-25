@@ -238,35 +238,85 @@ def _compute_topic(log, sentences: list[dict]) -> str:
         return ""
 
 
-def _context_check_clip(
-    log, clip_sentences: list[dict], already_cut: set[str], topic: str, project: dict
-) -> set[str]:
-    """Second per-clip pass ("does this sentence belong in a video about
-    <topic>?"): for each sentence not already cut by the restart/blooper
-    pass, ask the context_check agent. Cut only clear meta/out-of-context
-    asides; conservative on content. Fail-open per sentence."""
+def _context_check_chunk(
+    log, chunk: list[dict], project: dict, topic: str
+) -> list[dict]:
+    """Ask the context_check agent which sentences in this chunk are
+    meta-asides / out-of-context for the given topic, batched (one call for
+    up to CONTEXT_CHECK_CHUNK_SIZE sentences instead of one call per
+    sentence), same numbered/flat pattern as `_transcript_cleanup_chunk`.
+    Each flagged sentence carries a confidence (1-5) so the caller can gate
+    auto-cut vs. suggestion. Fail-open: on any error, log and return no
+    flags for this chunk only."""
     from ..agents.agents import get_agent
 
-    cut: set[str] = set()
-    agent = get_agent("context_check")
-    for i, s in enumerate(clip_sentences):
-        if s["id"] in already_cut:
-            continue
-        prev_text = clip_sentences[i - 1]["text"] if i > 0 else ""
-        next_text = clip_sentences[i + 1]["text"] if i + 1 < len(clip_sentences) else ""
-        prompt = (
-            f'Video topic: "{topic}"\n\n'
-            f'Context before: "{prev_text}"\n'
-            f'SENTENCE: "{speaker_prefix(project, s)}{s["text"]}"\n'
-            f'Context after: "{next_text}"'
-        )
-        try:
-            result = agent.run_sync(prompt).output
-            if not result.in_context:
-                cut.add(s["id"])
-        except Exception as exc:
-            log(f"context_check failed for a sentence, skipping: {exc}")
-    return cut
+    numbered = "\n".join(
+        f'{i + 1}: "{speaker_prefix(project, s)}{s["text"]}"' for i, s in enumerate(chunk)
+    )
+    prompt = f'Video topic: "{topic}"\n\nNumbered sentences from one clip, in order:\n{numbered}'
+    try:
+        result = get_agent("context_check").run_sync(prompt).output
+        flags: list[dict] = []
+        for f in result.out_of_context:
+            idx = f.id - 1
+            if 0 <= idx < len(chunk):
+                flags.append(
+                    {"id": chunk[idx]["id"], "confidence": f.confidence, "reason": f.reason}
+                )
+        return flags
+    except Exception as exc:
+        log(f"context_check chunk failed, skipping: {exc}")
+        return []
+
+
+def _context_check_clip(
+    log, clip_sentences: list[dict], topic: str, project: dict
+) -> tuple[set[str], list[dict]]:
+    """Chunk one clip's sentences (<=CONTEXT_CHECK_CHUNK_SIZE, small overlap)
+    and batch the "does this sentence belong in a video about <topic>?"
+    judgement, exactly like `_transcript_cleanup` / `_take_sequencer_clip`
+    chunk their passes -- this cuts context_check's per-run LLM call count
+    from O(sentences) to O(sentences / CONTEXT_CHECK_CHUNK_SIZE), which was
+    the root cause of takes never finishing on constrained hardware.
+
+    Confidence-gated ("suggest, don't delete"): flags at or above
+    CONTEXT_CHECK_AUTOCUT_CONFIDENCE auto-cut; flags at or above
+    CONTEXT_CHECK_SUGGEST_CONFIDENCE (but below autocut) become an open
+    suggestion instead of a silent cut, matching how `_cross_clip_dedup`
+    already splits dedup_judge's confidence. A sentence flagged twice by
+    overlapping chunks is only counted once (first verdict wins)."""
+    if not clip_sentences:
+        return set(), []
+    autocut: set[str] = set()
+    suggestions: list[dict] = []
+    seen: set[str] = set()
+    step = config.CONTEXT_CHECK_CHUNK_SIZE - config.CONTEXT_CHECK_CHUNK_OVERLAP
+    i = 0
+    n = len(clip_sentences)
+    while i < n:
+        chunk = clip_sentences[i : i + config.CONTEXT_CHECK_CHUNK_SIZE]
+        for flag in _context_check_chunk(log, chunk, project, topic):
+            sid = flag["id"]
+            if sid in seen:
+                continue
+            seen.add(sid)
+            if flag["confidence"] >= config.CONTEXT_CHECK_AUTOCUT_CONFIDENCE:
+                autocut.add(sid)
+            elif flag["confidence"] >= config.CONTEXT_CHECK_SUGGEST_CONFIDENCE:
+                suggestions.append(
+                    {
+                        "id": uuid.uuid4().hex[:8],
+                        "kind": "off_topic",
+                        "sentence_ids": [sid],
+                        "message": (flag["reason"] or "possibly out of context")[:300],
+                        "proposed_action": "cut",
+                        "status": "open",
+                    }
+                )
+        if i + config.CONTEXT_CHECK_CHUNK_SIZE >= n:
+            break
+        i += step
+    return autocut, suggestions
 
 
 def _neighbor_context(clip_sentences: list[dict], idx: int) -> str:
@@ -275,6 +325,29 @@ def _neighbor_context(clip_sentences: list[dict], idx: int) -> str:
     if idx + 1 < len(clip_sentences):
         return clip_sentences[idx + 1]["text"]
     return ""
+
+
+def _rare_keyword_buckets(kept: list[dict], norm: dict[str, str]) -> dict[str, set[str]]:
+    """Bucket sentences by their RARE keywords (words at most
+    CROSS_DEDUP_KEYWORD_MAX_DF sentences long enough to matter use
+    project-wide) so `_cross_clip_dedup` only fuzzy-compares pairs that
+    plausibly discuss the same specific thing, instead of every kept-sentence
+    pair -- on a long recording, O(kept^2) token_set_ratio calls explodes
+    into hundreds of thousands of comparisons. Never implemented in the v4
+    write-up; this is that pre-filter."""
+    word_ids: dict[str, set[str]] = {}
+    for s in kept:
+        for w in set(norm[s["id"]].split()):
+            if len(w) < config.CROSS_DEDUP_KEYWORD_MIN_LEN:
+                continue
+            word_ids.setdefault(w, set()).add(s["id"])
+    rare_words = {w for w, ids in word_ids.items() if len(ids) <= config.CROSS_DEDUP_KEYWORD_MAX_DF}
+    buckets: dict[str, set[str]] = {}
+    for s in kept:
+        for w in set(norm[s["id"]].split()):
+            if w in rare_words:
+                buckets.setdefault(w, set()).add(s["id"])
+    return buckets
 
 
 def _cross_clip_dedup(
@@ -300,22 +373,35 @@ def _cross_clip_dedup(
 
     kept = [s for s in sentences if s["kept"]]
     norm = {s["id"]: _norm(s["text"]) for s in kept}
+    eligible = [s for s in kept if len(norm[s["id"]].split()) >= config.DUP_MIN_WORDS]
+    by_id = {s["id"]: s for s in eligible}
+
+    # Pre-filter (perf fix): bucket by shared rare keywords BEFORE the fuzzy
+    # loop, so we only run token_set_ratio on pairs that plausibly discuss
+    # the same specific thing, not every kept-sentence pair.
+    buckets = _rare_keyword_buckets(eligible, norm)
+    candidate_ids: set[tuple[str, str]] = set()
+    for ids in buckets.values():
+        ids_list = list(ids)
+        for x in range(len(ids_list)):
+            for y in range(x + 1, len(ids_list)):
+                a_id, b_id = ids_list[x], ids_list[y]
+                if by_id[a_id]["clip_id"] == by_id[b_id]["clip_id"]:
+                    continue
+                candidate_ids.add((a_id, b_id) if a_id < b_id else (b_id, a_id))
 
     pairs: list[tuple[float, dict, dict]] = []
-    for i, a in enumerate(kept):
-        if len(norm[a["id"]].split()) < config.DUP_MIN_WORDS:
-            continue
-        for b in kept[i + 1 :]:
-            if a["clip_id"] == b["clip_id"]:
-                continue
-            if len(norm[b["id"]].split()) < config.DUP_MIN_WORDS:
-                continue
-            sim = fuzz.token_set_ratio(norm[a["id"]], norm[b["id"]])
-            if config.CROSS_DEDUP_MIN_SIM <= sim <= config.CROSS_DEDUP_MAX_SIM:
-                pairs.append((sim, a, b))
+    for a_id, b_id in candidate_ids:
+        a, b = by_id[a_id], by_id[b_id]
+        sim = fuzz.token_set_ratio(norm[a_id], norm[b_id])
+        if config.CROSS_DEDUP_MIN_SIM <= sim <= config.CROSS_DEDUP_MAX_SIM:
+            pairs.append((sim, a, b))
     pairs.sort(key=lambda p: -p[0])
     pairs = pairs[: config.CROSS_DEDUP_MAX_PAIRS]
-    log(f"{len(pairs)} cross-clip candidate pair(s) for dedup_judge")
+    log(
+        f"{len(candidate_ids)} rare-keyword candidate pair(s), "
+        f"{len(pairs)} cross-clip candidate pair(s) for dedup_judge"
+    )
 
     agent = get_agent("dedup_judge")
     autocut: set[str] = set()
@@ -407,6 +493,7 @@ def run(log, project: dict) -> None:
     cleaner_cut_ids: set[str] = set()
     sequencer_cut_ids: set[str] = set()
     context_cut_ids: set[str] = set()
+    context_suggestions: list[dict] = []
     if llm.available():
         log("Summarizing video topic...")
         topic = _compute_topic(log, sentences)
@@ -435,12 +522,27 @@ def run(log, project: dict) -> None:
 
         if topic:
             log("Running context pass (out-of-context asides)...")
+            # Hard cap (mirrors CROSS_DEDUP_MAX_PAIRS): a huge project can't
+            # explode context_check into an unbounded number of chunked
+            # calls either. Sentences beyond the cap are simply skipped by
+            # this pass (still eligible for cleaner/sequencer/dedup).
+            budget = config.CONTEXT_CHECK_MAX_SENTENCES
             for clip_sentences in by_clip.values():
-                context_cut_ids |= _context_check_clip(
-                    log, clip_sentences, cleaner_cut_ids, topic, project
-                )
+                if budget <= 0:
+                    log(
+                        "context pass: hit CONTEXT_CHECK_MAX_SENTENCES "
+                        f"({config.CONTEXT_CHECK_MAX_SENTENCES}), skipping remaining clips"
+                    )
+                    break
+                clip_slice = clip_sentences[:budget]
+                budget -= len(clip_slice)
+                cut_ids, sugg = _context_check_clip(log, clip_slice, topic, project)
+                context_cut_ids |= cut_ids
+                context_suggestions.extend(sugg)
             if context_cut_ids:
                 log(f"context pass flagged {len(context_cut_ids)} sentence(s)")
+            if context_suggestions:
+                log(f"context pass added {len(context_suggestions)} suggestion(s)")
     else:
         log("transcript cleaner skipped (ollama unavailable)")
     project["topic"] = topic
@@ -517,18 +619,19 @@ def run(log, project: dict) -> None:
 
     # Cross-clip semantic dedup with auto-cut (v4 section 1): runs AFTER
     # per-clip cleaning, on top of whatever is still kept.
-    new_suggestions: list[dict] = []
+    new_suggestions: list[dict] = list(context_suggestions)
     if llm.available():
         log("Running cross-clip duplicate check...")
-        dedup_autocut, new_suggestions = _cross_clip_dedup(log, sentences, topic, project)
+        dedup_autocut, dedup_suggestions = _cross_clip_dedup(log, sentences, topic, project)
+        new_suggestions.extend(dedup_suggestions)
         if dedup_autocut:
             for s in sentences:
                 if s["id"] in dedup_autocut and s["kept"]:
                     s["kept"] = False
                     s["reason"] = "duplicate content across clips (AI)"
             log(f"cross-clip dedup auto-cut {len(dedup_autocut)} sentence(s)")
-        if new_suggestions:
-            log(f"cross-clip dedup added {len(new_suggestions)} suggestion(s)")
+        if dedup_suggestions:
+            log(f"cross-clip dedup added {len(dedup_suggestions)} suggestion(s)")
     else:
         log("cross-clip dedup skipped (ollama unavailable)")
 

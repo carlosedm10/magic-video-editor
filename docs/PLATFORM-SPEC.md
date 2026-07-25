@@ -1112,3 +1112,142 @@ testing live against a real project:
   on that call graph. Covered by `scripts/test_reel_previews.py`'s
   `ReelPreviewBackfillE2ETest` (legacy-shaped reel gets backfilled exactly once; an
   already-fresh reel never enqueues, even on its very first GET).
+
+## vNext — hardware-aware default model + LLM preflight guard (2026-07-25)
+
+Root cause of two separate field reports ("Ollama never works on a fresh machine" and
+"the app hangs COMPLETELY every so often"): `settings.DEFAULT_MODEL` was a static
+`"qwen2.5:14b"` (~9GB, needs ~10-12GB RAM), seeded into `settings.json` on **every**
+first run regardless of hardware, with no check anywhere that the resolved model was
+installed or fit RAM before a pipeline stage actually invoked it. On a clean 8GB M2 that
+meant either a raw ollama error (model never pulled) or, worse, ollama loading a model
+that can't fit — the Mac swaps to death and the whole app freezes.
+
+- **Hardware-aware first-run default** (`magic_video_editor/settings.py`): `load()` now
+  seeds `default_model` from `api/ollama.py`'s `recommended_default_model()` — the same
+  RAM-tier table `/api/ollama/recommendation` already used — instead of the static
+  default, but ONLY when `settings.json` doesn't exist yet. An existing settings.json is
+  never touched; the static `"qwen2.5:14b"` remains the ultimate fallback if the
+  recommendation helper itself fails (e.g. psutil unavailable).
+- **Preflight guard** (`magic_video_editor/api/ollama.py`'s `preflight_check_models()`,
+  called from `api/pipeline.py`'s `_preflight_stage`): before an LLM-backed stage
+  (`takes`/`order`/`review`/`reels` — the only `STAGES` entries whose pipeline module
+  calls `get_agent()`) actually runs, its resolved model(s) are checked for reachability,
+  installation (`GET /api/tags`, 5s timeout so a hung ollama can't block the job), and
+  RAM fit (`_compatibility()`, not `"too_big"`). Runs from `_run_stage_kind` and
+  `_run_all_kind` — the ONE chokepoint both single-stage and run-all queue runners go
+  through — so the failure surfaces as a clear, actionable job/stage error (Spanish,
+  names a fitting alternative) instead of a raw ollama error or a silent hang. Non-LLM
+  stages (`ingest`/`sync`/`transcribe`/`render`) are skipped entirely.
+- **Settings > Models UI hint** (`ui/tabs/settings.js`): `GET /api/ollama/models` now
+  also returns each installed model's RAM `compatibility` (great/tight/too_big, same
+  table); the default-model and per-task `<select>` options show it inline, and a small
+  hint next to the Default model picker surfaces the hardware-recommended pick — so an
+  oversized model is visible before it's ever selected, not just at preflight time.
+- Covered by `scripts/test_ollama_preflight.py` (first-run default on 8GB vs 48GB,
+  existing settings.json left alone, preflight passes/fails for
+  installed-and-fits/too-big/not-installed/unreachable).
+- Deliberately out of scope: auto-pulling a model without user action (stays
+  user-initiated via the existing Settings pull flow), `ollama_manager.py`'s spawn
+  logic, packaging.
+
+---
+
+# vNext — Main audio track (music bed with auto-ducking)
+
+FCP/Premiere-style third track, the AUDIO analogue of the existing manual video
+overlay/PiP track (spec v5.9b): a single music bed the user drops onto the timeline,
+which mixes UNDER the clips' own (program) audio and automatically ducks under it.
+Chosen behavior (owner decision): **music bed with auto-ducking** — the imported
+audio's volume drops while there's voice/program audio and recovers in gaps — sourced
+by **importing audio files** (.mp3/.wav/.m4a) into the media bin. Strictly separate
+from the video overlay track; the two features don't interact.
+
+## Data contract
+- `project["audio_assets"]` = `[{id, path, filename, duration}]` — imported music
+  files, probed (ffprobe) for duration and copied/hardlinked into the project dir
+  exactly like camera clips (same macOS-TCC hardlink-import sidestep). **Deliberately
+  a separate list from `project["clips"]`**: `build_edl`/`ordering`/`takes` all filter
+  `role=="camera"` over `project["clips"]`, and an audio_assets entry is never
+  appended there at all — it structurally cannot leak into the AI pipeline. No
+  proxy/thumbs/transcribe (camera-clip-only concerns).
+- `project["audio_track"]` = `{asset_id, start_s, gain_db, ducking: true}` — the ONE
+  main-audio-track placement for MVP (single track, single item). `null` when none.
+  CRUD lives in `api/audio.py` (additive alongside the existing voice-enhance/EQ
+  endpoints there): `GET/POST/DELETE /api/projects/{pid}/audio-assets` (+`/upload` for
+  the browser-mode/drag&drop fallback), `GET/PUT/DELETE /api/projects/{pid}/audio-track`.
+
+## Import (media bin)
+`pipeline/ingest.py`'s `add_audio_assets`/`register_uploaded_audio_assets` (mirroring
+`add_clips`/`register_uploaded_clips`'s import-copy, but appending to
+`audio_assets`) accept `.mp3`/`.wav`/`.m4a` via: the native pywebview file picker (a
+dedicated "+ Music" button, `ui/editor/mediabin.js`), the "add by path…" power-user
+link (routed by extension alongside the existing clip-path box), and Finder
+drag&drop onto the bin (routed by extension in `_handleDrop`). Rendered as a
+visually distinct "Audio" section in the bin (music icon, garnet/`--accent2`
+accent), draggable with the private MIME type `application/x-mve-audio` (asset id
+payload) — parallel to clips' own `application/x-mve-clip`.
+
+## Timeline (audio lane)
+A third lane, BELOW the main video track (mirrors the overlay lane's pattern, which
+sits above it) — `ui/editor/timeline.js`'s `_ensureAudioTrack`/`renderAudioTrack`.
+Dropping an audio-bin asset onto it sets `project["audio_track"]` (`asset_id` +
+`start_s` from the drop x-position); the placed block shows the filename, a small
+gain (dB) number input, and a remove (✕) control that clears `audio_track`
+entirely. Deliberately NOT routed through `ui/editor/state.js`'s `Editor`/undo-history
+stack (a single small config object, no per-field undo requirement) — mutations PUT
+straight to `api/audio.py` then reload the project.
+
+## Render (`pipeline/render.py`'s `_apply_music_bed`, reused by `pipeline/reels.py`'s
+`render_reel`)
+Runs as a **follow-up ffmpeg pass** (`-c:v copy`, one audio filter graph — no video
+re-encode) placed AFTER audio-enhance in both `_build` (final render + preview
+render) and `render_reel`: ducking should key off the FINAL, already-enhanced
+program audio, not a pre-enhance version of it. Skipped entirely (documented
+no-op) when there's no `audio_track`, the referenced asset is missing, the program
+has no audio stream, or `start_s` is already past the program's end. Reel
+*previews* skip it (like they already skip audio-enhance) — it doesn't affect a
+reel's composition hash.
+
+Filtergraph (one `ffmpeg` invocation, inputs: `0` = the assembled program video,
+`1` = the music file with `-stream_loop -1`):
+```
+[1:a]atrim=0:{program_duration-start_s},asetpts=PTS-STARTPTS,
+     adelay={start_s*1000}|{start_s*1000},volume={gain_db}dB[mus]
+[mus][0:a]sidechaincompress=threshold=T:ratio=R:attack=A:release=Rl[ducked]   # ducking=true only
+[0:a][ducked]amix=inputs=2:duration=first:normalize=0[amix]                   # or [0:a][mus]amix=... when ducking=false
+[amix]alimiter=limit=L[aout]
+```
+- The music is looped (`-stream_loop -1`) and `atrim`+`adelay`ed to land exactly at
+  `[start_s, program_duration)` regardless of the source file's own (often shorter)
+  duration — no dependency on the music file being as long as the cut.
+- `sidechaincompress` takes the music as its signal and the PROGRAM audio as the
+  sidechain key — the standard "duck A under B" wiring, not the other way around.
+- `amix`'s `duration=first` pads the (delayed, hence shorter) music stream with
+  silence to match the program's length — no manual `apad` needed.
+- `amix normalize=0` keeps the program at full level (the usual `normalize=1` halves
+  loudness per extra input, wrong for a bed mix); `alimiter` guards against clipping
+  from the sum instead.
+- Named constants in `config.py`: `MUSIC_DUCK_THRESHOLD`, `MUSIC_DUCK_RATIO`,
+  `MUSIC_DUCK_ATTACK_MS`, `MUSIC_DUCK_RELEASE_MS`, `MUSIC_GAIN_DEFAULT_DB`,
+  `MUSIC_MIX_LIMIT`.
+- `_preview_manifest`'s staleness hash now includes `audio_track` alongside
+  edl/color/subtitles/audio_enhance.
+
+## Known limitation (documented, not a bug)
+**No live Draft-mode audio preview.** Mixing/ducking into the un-rendered virtual
+playback path would require touching `ui/editor/player.js` (owned by a different
+task/agent). The music is only actually heard on a real render (final export or
+"Render preview") for now — a `TODO` comment marks the exact spot in
+`ui/editor/timeline.js`. Draft playback continues to play only the program audio,
+unchanged from before this feature.
+
+Covered by `scripts/test_audio_track.py`: import via the API lands in
+`audio_assets` (never `clips`); audio-track CRUD; one real end-to-end final render
+with the track set, asserting the output has an audio stream and the music's own
+frequency band is measurably louder than a no-audio-track baseline (loudness
+comparison via ffprobe/`volumedetect`) even though the source file is shorter than
+the program (loop/trim path); ducking on/off toggles `sidechaincompress` in the
+built filtergraph; missing-asset/past-end `start_s` are safe no-ops; a structural
+guard that `pipeline/ordering.py` has no notion of `audio_assets`/`audio_track` at
+all.

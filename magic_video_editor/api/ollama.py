@@ -21,10 +21,17 @@ import psutil
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
-from .. import config
+from .. import config, ollama_manager
 from .. import jobs as jobs_module
 
 router = APIRouter(prefix="/api/ollama", tags=["ollama"])
+
+# Finding #10: a stalled `ollama pull` used to hang the job forever
+# (timeout=None) -- Install button stuck disabled, no error, no cancel.
+# Bounded connect/read/write timeout so a stall raises promptly instead;
+# read is the effective idle timeout since httpx re-arms it on every line
+# received, so a healthy (but slow) real pull is unaffected.
+_PULL_TIMEOUT = httpx.Timeout(connect=10.0, read=30.0, write=10.0, pool=10.0)
 
 _SEARCH_CACHE_TTL_S = 60 * 60
 _TAGS_CACHE_TTL_S = 24 * 60 * 60
@@ -324,7 +331,12 @@ def ollama_library_tags(name: str):
 
 @router.get("/models")
 def ollama_models():
-    """Installed models (proxy of Ollama's /api/tags)."""
+    """Installed models (proxy of Ollama's /api/tags), each tagged with this
+    machine's RAM compatibility (great/tight/too_big, same _compatibility()
+    used by /library and /recommendation) -- Settings > Models surfaces this
+    next to the default-model/per-task pickers so an oversized model is
+    visibly flagged before the user selects it (rather than only failing
+    later at pipeline preflight)."""
     try:
         res = httpx.get(f"{config.OLLAMA_URL}/api/tags", timeout=5)
         res.raise_for_status()
@@ -333,14 +345,17 @@ def ollama_models():
             503, f"Ollama isn't reachable at {config.OLLAMA_URL} ({e}). Is it running?"
         ) from e
 
+    ram_gb = psutil.virtual_memory().total / (1024**3)
     models = []
     for m in res.json().get("models", []):
         size_bytes = m.get("size") or 0
+        size_gb = round(size_bytes / (1024**3), 1)
         models.append(
             {
                 "name": m.get("name") or m.get("model") or "",
-                "size_gb": round(size_bytes / (1024**3), 1),
+                "size_gb": size_gb,
                 "family": (m.get("details") or {}).get("family", ""),
+                "compatibility": _compatibility(size_gb, ram_gb),
             }
         )
     models.sort(key=lambda m: m["name"])
@@ -451,6 +466,79 @@ def ollama_recommendation():
     }
 
 
+# --------------------------------------------------------------------------
+# Root-cause fix (2026-07-25): a static "qwen2.5:14b" default_model was being
+# seeded into settings.json on EVERY first run regardless of hardware -- on
+# an 8GB Mac that model either isn't installed (raw ollama error) or, worse,
+# gets loaded anyway and swaps the machine to death. `recommended_default_model()`
+# is the single place that answers "what model should THIS machine default
+# to", reusing the same RAM-tier table as /api/ollama/recommendation above
+# (magic_video_editor/settings.py imports this for its first-run seed instead
+# of duplicating the tier logic). `preflight_check_models()` is the runtime
+# guard: called from the queue chokepoint in api/pipeline.py before any
+# LLM-backed stage actually runs, so a bad model choice becomes one clear,
+# visible job error instead of a raw ollama error or a silent hang.
+# --------------------------------------------------------------------------
+
+
+def recommended_default_model() -> str:
+    """Hardware-aware first-run default (settings.py). Same tier table as
+    /api/ollama/recommendation; returns the "best" pick for this machine's
+    RAM. Falls back to the historical static "qwen2.5:14b" only if psutil
+    (or anything else here) blows up -- see settings.DEFAULT_MODEL."""
+    try:
+        ram_gb = psutil.virtual_memory().total / (1024**3)
+        tier = _pick_tier(ram_gb)
+        return tier["best"]["model"]
+    except Exception:
+        return "qwen2.5:14b"
+
+
+def preflight_check_models(model_names) -> None:
+    """Verify every name in `model_names` is (a) reachable -- ollama is up,
+    (b) actually INSTALLED (GET /api/tags, short timeout so a hung ollama
+    can't block the caller), and (c) fits this machine's RAM (not
+    "too_big" per _compatibility, using the model's REAL installed size).
+    Raises RuntimeError with a single clear, user-facing (Spanish) message
+    on the first failing model -- meant to be called from inside a queue
+    job (see api/pipeline.py's _preflight_stage) so the failure lands as a
+    visible job/stage error, never a raw stack trace or a silent hang."""
+    names = sorted({m for m in model_names if m})
+    if not names:
+        return
+
+    ram_gb = psutil.virtual_memory().total / (1024**3)
+    try:
+        res = httpx.get(f"{config.OLLAMA_URL}/api/tags", timeout=5)
+        res.raise_for_status()
+    except Exception as e:
+        raise RuntimeError(
+            f"No se pudo conectar con Ollama en {config.OLLAMA_URL} ({e}). "
+            "Comprueba que esté en marcha e inténtalo de nuevo."
+        ) from e
+
+    installed: dict[str, float] = {}
+    for m in res.json().get("models", []):
+        name = m.get("name") or m.get("model") or ""
+        if not name:
+            continue
+        installed[name] = (m.get("size") or 0) / (1024**3)
+
+    for name in names:
+        if name not in installed:
+            raise RuntimeError(
+                f"El modelo '{name}' no está instalado. Descárgalo en Ajustes → Modelos."
+            )
+        size_gb = installed[name]
+        if _compatibility(size_gb, ram_gb) == "too_big":
+            rec = recommended_default_model()
+            raise RuntimeError(
+                f"El modelo '{name}' necesita ~{size_gb:.0f}GB de RAM pero este Mac "
+                f"tiene {ram_gb:.0f}GB. Elige un modelo más pequeño en Ajustes → "
+                f"Modelos (recomendado para tu equipo: {rec})."
+            )
+
+
 class PullRequest(BaseModel):
     model: str
 
@@ -462,7 +550,7 @@ def _run_pull(log, model: str) -> None:
             "POST",
             f"{config.OLLAMA_URL}/api/pull",
             json={"name": model, "stream": True},
-            timeout=None,
+            timeout=_PULL_TIMEOUT,
         ) as res:
             res.raise_for_status()
             for line in res.iter_lines():
@@ -506,6 +594,19 @@ def ollama_pull(body: PullRequest):
     except jobs_module.JobBusyError as e:
         return {"job_id": e.job_id, "already_running": True}
     return {"job_id": job_id}
+
+
+@router.post("/retry")
+def ollama_retry():
+    """Finding #16 (c): ensure_ollama_async() only ever runs once per
+    process, so a transient startup failure (GitHub rate-limited, a
+    stalled self-provisioning download, a momentary network blip) left
+    `ollama_mode` stuck at "unreachable" for the rest of the session with
+    no way back. This re-arms it -- a UI "Retry" action on an
+    unreachable/errored Ollama state should call this, then poll
+    GET /api/health's ollama_mode the same way startup does."""
+    ollama_manager.retry_ensure_ollama()
+    return {"mode": ollama_manager.current_mode()}
 
 
 @router.delete("/models/{name}")

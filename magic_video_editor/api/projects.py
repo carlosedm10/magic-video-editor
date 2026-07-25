@@ -185,6 +185,21 @@ def project_update(pid: str, body: ProjectUpdate):
 
 @router.delete("/projects/{pid}")
 def project_delete(pid: str):
+    """Deleting a project whose queue has a RUNNING item used to be able to
+    kill the sole global queue worker thread forever (queue.py's
+    _worker_loop except-handler re-raising store.ProjectNotFound a second
+    time once the rmtree'd project.json vanished out from under its own
+    bookkeeping) -- every future job in every project would then spin
+    forever, since the one-shot _worker_started latch never respawned it.
+
+    Fixed at the root in queue.py (every worker-internal store.load is now
+    guarded, and _ensure_worker respawns a dead/missing worker), but we
+    additionally ask the running job to cancel and give it a bounded window
+    to actually stop touching this project first (queue.cancel_running_and_wait)
+    so a delete-while-running is clean -- ffmpeg children torn down
+    promptly, the item settles into a normal terminal status -- rather than
+    merely "didn't crash the app"."""
+    queue.cancel_running_and_wait(pid)
     store.delete_project(pid)
     return {"ok": True}
 
@@ -197,7 +212,7 @@ def clips_add(pid: str, body: AddClips):
 
 
 @router.post("/projects/{pid}/upload")
-async def clips_upload(
+def clips_upload(
     pid: str,
     files: list[UploadFile] = File(...),  # noqa: B008 (standard FastAPI upload idiom)
     camera_group: str | None = Form(None),  # noqa: B008
@@ -211,7 +226,22 @@ async def clips_upload(
     that folder's files when no explicit `camera_group` override is given.
     Registers clips exactly like add_clips (ingest.register_uploaded_clips)
     and enqueues the same follow-up work ingest's own stage does
-    (proxies/wav via stage:ingest, filmstrips/peaks via the thumbs kind)."""
+    (proxies/wav via stage:ingest, filmstrips/peaks via the thumbs kind).
+
+    Plain `def`, not `async def` (finding 2): this used to `await f.read()`
+    into a plain synchronous `out.write(chunk)` on every chunk, straight on
+    the event loop -- for a multi-GB import that froze the ENTIRE app (every
+    other request, every poll) for however long the copy took, since a
+    single-process asyncio event loop can't do anything else while a sync
+    call is running on it. FastAPI runs a plain `def` path operation in its
+    threadpool automatically (the same mechanism every other route in this
+    file already relies on being a plain `def`), so the fix is simply to
+    stop being `async` and read via UploadFile.file (the underlying
+    SpooledTemporaryFile) directly instead of the async
+    read()/close() wrappers, which just proxy to a threadpool themselves
+    once large enough to have rolled to disk (see starlette.datastructures.
+    UploadFile) -- functionally identical bytes on disk, same response
+    shape, just not blocking this thread's *particular* event loop turn."""
     project = store.load(pid)
     media_dir = store.project_dir(pid) / "media"
     media_dir.mkdir(parents=True, exist_ok=True)
@@ -221,11 +251,11 @@ async def clips_upload(
         raw_name = (f.filename or "upload").replace("\\", "/").lstrip("/")
         parts = [p for p in raw_name.split("/") if p and p != ".."]
         if not parts:
-            await f.close()
+            f.file.close()
             continue
         name = parts[-1]
         if Path(name).suffix.lower() not in ingest.MEDIA_EXTS:
-            await f.close()
+            f.file.close()
             continue
         folder_group = parts[0] if len(parts) > 1 else None
         group = camera_group or folder_group or "main"
@@ -238,9 +268,9 @@ async def clips_upload(
             n += 1
 
         with open(dest, "wb") as out:
-            while chunk := await f.read(_UPLOAD_CHUNK):
+            while chunk := f.file.read(_UPLOAD_CHUNK):
                 out.write(chunk)
-        await f.close()
+        f.file.close()
         saved.append((dest, group))
 
     added = ingest.register_uploaded_clips(project, saved)
@@ -277,6 +307,11 @@ def clip_remove(pid: str, cid: str):
     project = store.load(pid)
     project["clips"] = [c for c in project["clips"] if c["id"] != cid]
     project["sentences"] = [s for s in project.get("sentences", []) if s["clip_id"] != cid]
+    # The clip set just changed -- drop this clip out of clip_order, clear
+    # the cached edl, and un-done the order/render/reels stage badges so
+    # they get recomputed against the new (smaller) clip set instead of
+    # silently going stale (the live "62e6cae7" phantom-clip_order bug).
+    ordering.invalidate_after_clipset_change(project)
     store.save(project)
     return {"ok": True}
 

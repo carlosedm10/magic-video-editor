@@ -192,19 +192,32 @@ generic ("a video about X" is fine, but X must be the real subject).
 """
 
 CONTEXT_CHECK_SYSTEM_PROMPT = """
-You are given the topic of a video and ONE sentence from its transcript
-(with a little neighboring context for reference). Decide: does this sentence
-belong in a video about that topic, i.e. is it on-topic content, or is it a
-meta-comment/aside that has nothing to do with the topic itself (e.g. talking
-about the recording/camera/equipment, greeting the camera again mid-video,
-an unrelated personal tangent, checking on something off-screen)?
+You are given the topic of a video and a NUMBERED list of consecutive
+sentences from its transcript, in spoken order, from ONE clip. For each
+sentence, decide: does it belong in a video about that topic, i.e. is it
+on-topic content, or is it a meta-comment/aside that has nothing to do with
+the topic itself (e.g. talking about the recording/camera/equipment,
+greeting the camera again mid-video, an unrelated personal tangent, checking
+on something off-screen)?
 
-Be conservative: `in_context: false` should be reserved for sentences that
-are CLEARLY about something other than the video's content — recording-meta
-comments, camera checks, asides to whoever is filming, or a tangent
-completely unrelated to the topic. If the sentence is plausibly part of the
-content, even if plain, terse, or awkwardly phrased, mark it `in_context:
-true`. When unsure, prefer `true`.
+Return `out_of_context`: a list of objects `{id, confidence, reason}` for
+ONLY the sentences that do NOT belong (by their number in the input list you
+were given). Every sentence you don't mention is assumed to be in-context —
+do not list sentences that belong. Never invent an id that was not given to
+you.
+
+Be conservative: only flag a sentence when it is CLEARLY about something
+other than the video's content — recording-meta comments, camera checks,
+asides to whoever is filming, or a tangent completely unrelated to the
+topic. If a sentence is plausibly part of the content, even if plain, terse,
+or awkwardly phrased, do NOT flag it. When unsure, leave it out.
+
+`confidence` (1-5) is how sure you are that the sentence truly doesn't
+belong: use 4-5 only for sentences you are quite sure are meta/off-topic;
+use 2-3 when it's plausible but you're not certain — a human will review
+those lower-confidence flags before anything is cut, so it's fine to flag
+a borderline case at low confidence rather than silently ignore it. Return
+an empty list when every sentence in the chunk belongs.
 """
 
 DEDUP_JUDGE_SYSTEM_PROMPT = """

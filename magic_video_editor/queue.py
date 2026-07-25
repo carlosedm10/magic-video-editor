@@ -103,27 +103,83 @@ def list_queue(pid: str) -> list[dict]:
 
 def cancel_item(pid: str, item_id: str) -> bool:
     """pending -> removed outright. running -> cooperative cancel via the
-    underlying job (jobs.cancel sets cancel_requested + terminates ffmpeg
-    children; the runner notices on its next log()/progress() call and
-    _run_item marks the item cancelled/error once it returns). Returns False
-    if the item doesn't exist or is already finished."""
+    underlying job (jobs.cancel sets cancel_requested + terminates that
+    job's OWN ffmpeg children; the runner notices on its next log()/
+    progress() call and _run_item marks the item cancelled/error once it
+    returns). Returns False if the item doesn't exist or is already
+    finished.
+
+    Looks the item up (and, for pending, removes it) while holding
+    _state_lock, but drops the lock BEFORE calling jobs.cancel() -- that
+    call blocks for up to ~5s waiting for the job's ffmpeg children to
+    actually terminate (ffmpeg_utils.terminate_job), and _state_lock is a
+    GLOBAL lock shared by every project's queue reads/writes (enqueue/
+    list_queue/reorder/_mark_item/_run_item all take it); holding it
+    across that wait would stall the whole app's queue traffic just to
+    cancel one project's one item (finding 13)."""
+    job_id: str | None = None
     with _state_lock:
         project = store.load(pid)
         q = project.setdefault("queue", [])
-        for item in q:
-            if item["id"] != item_id:
-                continue
-            if item["status"] == "pending":
-                q.remove(item)
-                store.save(project, preserve_queue=False)
-                return True
-            if item["status"] == "running":
-                job_id = item.get("job_id")
-                if job_id:
-                    jobs.cancel(job_id)
-                return True
+        item = next((i for i in q if i["id"] == item_id), None)
+        if item is None:
             return False
-        return False
+        if item["status"] == "pending":
+            q.remove(item)
+            store.save(project, preserve_queue=False)
+            return True
+        if item["status"] != "running":
+            return False
+        job_id = item.get("job_id")
+    if job_id:
+        jobs.cancel(job_id)
+    return True
+
+
+def cancel_running_and_wait(pid: str, timeout: float = 10.0) -> None:
+    """Best-effort pre-delete hook (finding 1d): if `pid` currently has a
+    RUNNING queue item, request cooperative cancellation (jobs.cancel) and
+    poll (bounded, `timeout` seconds max, 100ms granularity -- never an
+    unbounded wait) until the worker has actually stopped touching it
+    (status flips away from "running") before the caller -- api/projects.py's
+    project_delete -- rmtree's the project directory out from under it.
+
+    Chosen over refusing the delete with a 409: the worker-internals guards
+    added alongside this (every store.load(pid) in queue.py's worker path
+    now survives store.ProjectNotFound / a vanished dir) already make an
+    in-flight rmtree SAFE -- the worker just no-ops its bookkeeping instead
+    of dying -- so this function only needs to make delete-while-running
+    CLEAN (the cancelled job settles into a normal terminal status, ffmpeg
+    children are torn down promptly) rather than merely non-fatal. A 409
+    would just push the "wait and retry" burden onto every caller (the
+    frontend) for a case this module can already resolve itself in at most
+    a few seconds; if the runner ignores cancellation and the timeout
+    elapses anyway, this still returns -- the delete proceeds, and the
+    self-healing guards above are exactly what makes that safe.
+
+    A no-op (returns immediately) if the project is already gone or has no
+    running item."""
+    try:
+        project = store.load(pid)
+    except store.ProjectNotFound:
+        return
+    q = project.get("queue", [])
+    running_item = next((i for i in q if i["status"] == "running"), None)
+    if running_item is None:
+        return
+    job_id = running_item.get("job_id")
+    if job_id:
+        jobs.cancel(job_id)
+    deadline = time.time() + max(0.0, timeout)
+    while time.time() < deadline:
+        try:
+            project = store.load(pid)
+        except store.ProjectNotFound:
+            return
+        q = project.get("queue", [])
+        if not any(i["status"] == "running" for i in q):
+            return
+        time.sleep(0.1)
 
 
 def reorder(pid: str, ids: list[str]) -> list[dict]:
@@ -169,13 +225,30 @@ def _reconcile_stale_running() -> None:
                 store.save(project, preserve_queue=False)
 
 
+_worker_thread: threading.Thread | None = None
+
+
 def _ensure_worker() -> None:
-    global _worker_started
+    """Start the global worker thread if it has never run, OR respawn it if
+    it has died/gone missing since (thread is None or not is_alive()) --
+    relying solely on the _worker_started one-shot latch meant an unforeseen
+    death of the worker (e.g. an exception escaping _worker_loop entirely)
+    would never self-heal: every enqueue() afterwards would see
+    _worker_started already True and skip spawning a replacement, silently
+    wedging every project's queue forever. _reconcile_stale_running() still
+    only runs on the very first start of this process (a respawn is NOT a
+    process restart, so there's nothing stale to reconcile)."""
+    global _worker_started, _worker_thread
     with _worker_lock:
-        if not _worker_started:
+        if not _worker_started or _worker_thread is None or not _worker_thread.is_alive():
+            first_start = not _worker_started
             _worker_started = True
-            _reconcile_stale_running()
-            threading.Thread(target=_worker_loop, daemon=True, name="queue-worker").start()
+            if first_start:
+                _reconcile_stale_running()
+            _worker_thread = threading.Thread(
+                target=_worker_loop, daemon=True, name="queue-worker"
+            )
+            _worker_thread.start()
     _wake.set()
 
 
@@ -225,19 +298,45 @@ def _worker_loop() -> None:
         except Exception as e:
             # A bug in _run_item's own bookkeeping (not in the queued
             # runner -- that's already caught by jobs.run_sync) must not
-            # take the whole worker thread down.
-            _mark_item(pid, item_id, status="error", error=f"queue internal error: {e}")
+            # take the whole worker thread down. _mark_item is itself
+            # guarded against the project having been deleted out from
+            # under it (store.ProjectNotFound / a vanished dir), but this
+            # except-handler is ALSO wrapped so that NOTHING it does can
+            # escape and kill this daemon thread -- that exact escape (this
+            # handler's own store.load() raising ProjectNotFound a SECOND
+            # time, for a project deleted mid-job) used to kill the sole
+            # worker thread forever, wedging every future job in every
+            # project (finding 1). _ensure_worker() would also now respawn
+            # a dead worker, but this handler existing means it never has
+            # to.
+            try:
+                _mark_item(pid, item_id, status="error", error=f"queue internal error: {e}")
+            except Exception as mark_err:
+                print(
+                    f"[queue] worker bookkeeping failed for {pid}/{item_id} "
+                    f"(item left as-is): {mark_err}"
+                )
 
 
 def _run_item(pid: str, item_id: str) -> None:
     with _state_lock:
-        project = store.load(pid)
+        try:
+            project = store.load(pid)
+        except store.ProjectNotFound:
+            # Project was deleted between being picked by _next_item and
+            # actually starting here -- nothing to run, nothing to mark.
+            return
         q = project.get("queue", [])
         item = next((i for i in q if i["id"] == item_id), None)
         if item is None or item["status"] != "pending":
             return
         item["status"] = "running"
-        store.save(project, preserve_queue=False)
+        try:
+            store.save(project, preserve_queue=False)
+        except FileNotFoundError:
+            # Project dir vanished (deleted) between load() and save()
+            # above -- same "nothing to run" outcome as ProjectNotFound.
+            return
         kind = item["kind"]
         raw_payload = item["payload"]
 
@@ -300,7 +399,16 @@ def _mark_item(
     finished: bool = False,
 ) -> None:
     with _state_lock:
-        project = store.load(pid)
+        try:
+            project = store.load(pid)
+        except store.ProjectNotFound:
+            # Project was deleted while this item was running (or in the
+            # window between it finishing and this bookkeeping call) --
+            # nothing to persist. Critically must NOT raise: this is the
+            # exact call that, unguarded, escaped a SECOND time from inside
+            # _worker_loop's except-handler and killed the sole worker
+            # thread forever (finding 1's root cause).
+            return
         q = project.setdefault("queue", [])
         item = next((i for i in q if i["id"] == item_id), None)
         if item is None:
@@ -313,7 +421,13 @@ def _mark_item(
             item["error"] = error
         if job_id is not None:
             item["job_id"] = job_id
-        store.save(project, preserve_queue=False)
+        try:
+            store.save(project, preserve_queue=False)
+        except FileNotFoundError:
+            # Same "project vanished mid-flight" case, just caught at the
+            # save() step instead of load() -- still a no-op, still must
+            # not raise.
+            return
         if finished:
             # Runs while still holding _state_lock: _run_auto_enqueue_hooks ->
             # enqueue() re-enters this same RLock from this same thread, and

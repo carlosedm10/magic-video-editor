@@ -8,12 +8,22 @@ JS side), window size/position persistence, a native "quit anyway?" confirm
 while a render is running, and a best-effort dev-mode process rename so the
 menu bar doesn't read "python3"."""
 
+import atexit
 import os
 import socket
 import threading
 import time
 
-from . import config, ffmpeg_utils, ollama_manager, queue, settings, store, updater
+from . import (
+    config,
+    ffmpeg_utils,
+    ollama_manager,
+    queue,
+    settings,
+    single_instance,
+    store,
+    updater,
+)
 
 GITHUB_URL = "https://github.com/carlosedm10/magic-video-editor"
 
@@ -163,6 +173,7 @@ def _on_closing(window):
             return False
     _save_window_geometry(window)
     ffmpeg_utils.terminate_all()
+    single_instance.release_singleton()
     return True
 
 
@@ -276,6 +287,18 @@ def main():
     from .server import app as fastapi_app
 
     config.ensure_dirs()
+
+    # Bug fix: the app could be launched a second time while one instance
+    # was already running -- both would try to bind config.HOST/PORT and
+    # share config.DATA_DIR (port-bind errors, duplicate ollama spawns,
+    # project.json races). See single_instance.py for the detection
+    # strategy (flock lockfile, health-probe fallback for network volumes).
+    # Must run before anything binds the port or touches DATA_DIR.
+    if single_instance.detect_existing_instance(config.DATA_DIR, config.HOST, config.PORT):
+        print("Magic Video Editor is already running -- not opening a second window.")
+        single_instance.focus_existing_instance()
+        return
+    atexit.register(single_instance.release_singleton)
 
     # Field bug fix (M2): mlx-whisper shells out to bare `ffmpeg`/`ffprobe`
     # from PATH internally, bypassing our ffmpeg_bin()/ffprobe_bin()

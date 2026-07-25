@@ -563,10 +563,20 @@ async function _sfsSaveBrand() {
 
 /* ---------- Models (v5.11 restructure + v5.12 Whisper box) ---------- */
 
+// Root-cause fix (2026-07-25): a too-big model picked here used to only
+// fail later (raw ollama error, or a hang while the Mac swaps) once a
+// pipeline stage actually ran it. `<option>` text can't carry the colored
+// COMPAT_INFO dot, so the compatibility label is appended in plain text --
+// still enough to see "Too big for this Mac" before selecting it. `m.compatibility`
+// comes from GET /api/ollama/models (api/ollama.py, same _compatibility()
+// table as /library and /recommendation).
 function _sfsModelOptions(selected) {
-  const opts = _sfs.models.map((m) =>
-    `<option value="${esc(m.name)}" ${m.name === selected ? "selected" : ""}>
-      ${esc(m.name)} (${m.size_gb}GB)</option>`);
+  const opts = _sfs.models.map((m) => {
+    const compat = COMPAT_INFO[m.compatibility];
+    const compatText = compat ? ` — ${compat.label}` : "";
+    return `<option value="${esc(m.name)}" ${m.name === selected ? "selected" : ""}>
+      ${esc(m.name)} (${m.size_gb}GB)${esc(compatText)}</option>`;
+  });
   if (selected && !_sfs.models.some((m) => m.name === selected)) {
     opts.unshift(`<option value="${esc(selected)}" selected>${esc(selected)} (not pulled)</option>`);
   }
@@ -637,6 +647,7 @@ function _sfsRenderModels(host) {
         <div class="sfs-field-compact" style="grid-column:1 / -1">
           <label class="sfs-label-row"><span>Default model</span></label>
           <select class="sfs-select" id="s-default-model">${_sfsModelOptions(s.default_model)}</select>
+          <div class="sfs-hint" id="sfs-inline-reco">${_sfsInlineRecommendationHtml()}</div>
         </div>
         ${TASK_INFO.map(([key, label, desc]) => `
           <div class="sfs-field-compact">
@@ -696,6 +707,8 @@ function _sfsRenderModels(host) {
 
   $("#s-default-model").onchange = _sfsSaveModels;
   TASK_INFO.forEach(([key]) => { $(`#s-task-${key}`).onchange = _sfsSaveModels; });
+
+  if (_sfs.recommendation === null && !_sfs.recommendationError) _sfsLoadRecommendation();
 
   $("#sfs-browse-models").onclick = _sfsOpenModelModal;
   _sfsAttachDeleteHandlers();
@@ -882,6 +895,20 @@ function _sfsRecommendationHtml() {
     </div>`;
 }
 
+// Minimal inline hint next to the Default model picker (Models section,
+// not the Browse-models modal) -- just "recommended for your Mac: X", so
+// the user sees the hardware-appropriate pick without opening the modal.
+// Uses the same _sfs.recommendation as the modal's richer cards; shared
+// _sfsLoadRecommendation() keeps both in sync.
+function _sfsInlineRecommendationHtml() {
+  if (_sfs.recommendationError) return "";
+  if (!_sfs.recommendation) return "Checking your Mac's hardware…";
+  const r = _sfs.recommendation;
+  const rec = r.optimal || r.best_overall;
+  if (!rec) return "";
+  return `Recomendado para tu Mac (${esc(r.chip)}, ${r.ram_gb}GB): <strong>${esc(rec.model)}</strong>`;
+}
+
 async function _sfsLoadRecommendation() {
   try {
     _sfs.recommendation = await api("/ollama/recommendation");
@@ -892,6 +919,8 @@ async function _sfsLoadRecommendation() {
   }
   const box = $("#sfs-reco-block");
   if (box) box.innerHTML = _sfsRecommendationHtml();
+  const inline = $("#sfs-inline-reco");
+  if (inline) inline.innerHTML = _sfsInlineRecommendationHtml();
   _sfsAttachRecommendationHandlers();
   refreshIcons();
 }
