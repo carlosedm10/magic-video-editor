@@ -35,6 +35,11 @@ const Timeline = {
   _shortcutsOpen: false,
   _historyOpen: false,
   _zoomMin: 4,             // recomputed every render() from total duration + viewport (spec v5 addendum "Zoom")
+  _zoomAccumFactor: 1,     // wheel-zoom deltas accumulated between animation frames (see _queueZoomFrame)
+  _zoomRafScheduled: false,
+  _zoomAnchorXInScroll: 0,
+  _zoomAnchorClientXRel: 0,
+  _zoomSettleTimeout: null,
 
   mount() {
     this._injectStyles();
@@ -63,11 +68,8 @@ const Timeline = {
         e.preventDefault();
         const rect = scroll.getBoundingClientRect();
         const xInScroll = e.clientX - rect.left + scroll.scrollLeft;
-        const timeAtCursor = xInScroll / this.pxPerSec;
         const factor = e.deltaY < 0 ? 1.15 : 1 / 1.15;
-        this._setZoom(this.pxPerSec * factor);
-        const newX = timeAtCursor * this.pxPerSec;
-        scroll.scrollLeft = Math.max(0, newX - (e.clientX - rect.left));
+        this._queueZoomFrame(factor, xInScroll, e.clientX - rect.left);
       }, { passive: false });
     }
 
@@ -620,12 +622,109 @@ const Timeline = {
     this._setZoom(this._fitZoomValue());
   },
 
-  _setZoom(v) {
+  _setZoom(v, opts) {
     const min = this._zoomMin ?? this._fitZoomValue();
     this.pxPerSec = Math.max(min, Math.min(220, v));
     const zoom = document.getElementById("tl-zoom");
     if (zoom) zoom.value = String(Math.round(this.pxPerSec));
+    if (opts && opts.cheapOnly) this._reflowCheap();
+    else this.render();
+  },
+
+  /* ---------- wheel-zoom rAF coalescing (perf fix: trackpad zoom-out lag) ----------
+     A trackpad fires many `wheel` events per frame. Previously every single
+     event ran `_setZoom` -> `render()` synchronously, and `render()` fully
+     rebuilds `_renderTrack`'s innerHTML (every block/chip div, the filmstrip
+     background-position math, and a per-pixel canvas redraw for every
+     waveform) — zooming OUT makes this worse because more clips become
+     visible at once, so the rebuild cost grows exactly as the wheel events
+     get more frequent. Fix: coalesce all wheel deltas that land within one
+     animation frame into a single `pxPerSec` update + a single CHEAP reflow
+     (just repositioning/resizing the already-rendered elements via CSS left/
+     width — see _reflowCheap), and only pay for the EXPENSIVE full render
+     (which regenerates filmstrip/waveform art) once the gesture has settled.
+     The zoom slider, +/- keys and the Fit button still call `_setZoom`
+     directly (full render each time) since those aren't the laggy path and
+     leaving them alone avoids any regression risk. */
+  _queueZoomFrame(factor, xInScrollAtPointer, clientXRelRect) {
+    this._zoomAccumFactor *= factor;
+    this._zoomAnchorXInScroll = xInScrollAtPointer;
+    this._zoomAnchorClientXRel = clientXRelRect;
+    // Debounced expensive redraw: re-armed on every raw wheel event, so it
+    // only fires ~150ms after the gesture actually stops, never mid-gesture.
+    clearTimeout(this._zoomSettleTimeout);
+    this._zoomSettleTimeout = setTimeout(() => this._settleZoom(), 150);
+    if (this._zoomRafScheduled) return; // already coalescing this frame
+    this._zoomRafScheduled = true;
+    requestAnimationFrame(() => this._applyZoomFrame());
+  },
+
+  _applyZoomFrame() {
+    this._zoomRafScheduled = false;
+    const factor = this._zoomAccumFactor;
+    this._zoomAccumFactor = 1;
+    if (factor === 1) return;
+    const scroll = document.getElementById("timeline-scroll");
+    const oldPx = this.pxPerSec;
+    const timeAtCursor = this._zoomAnchorXInScroll / oldPx;
+    this._setZoom(oldPx * factor, { cheapOnly: true });
+    if (scroll) {
+      const newX = timeAtCursor * this.pxPerSec;
+      scroll.scrollLeft = Math.max(0, newX - this._zoomAnchorClientXRel);
+    }
+  },
+
+  // Fires ~150ms after the last wheel tick: one full render() to regenerate
+  // crisp filmstrip/waveform art at the settled pxPerSec. Thumbs themselves
+  // come from `_thumbCache` (network fetch happens once per clip_id, guarded
+  // by `entry.loading`/`_thumbsRetryQueued`), so this never re-fetches — it
+  // just redraws from data already in memory.
+  _settleZoom() {
+    this._zoomSettleTimeout = null;
     this.render();
+  },
+
+  /* Cheap per-frame zoom reflow: repositions/resizes the EXISTING block/chip
+     elements, ruler and playhead in place via CSS left/width using the new
+     pxPerSec, without touching filmstrip backgrounds or redrawing waveform
+     canvases (they just visually stretch/reposition with their parent block
+     until the debounced _settleZoom snaps them back to crisp art). Falls
+     back to a full render() if the track hasn't been painted yet (e.g. first
+     zoom before any render() has run). */
+  _reflowCheap() {
+    const segs = this._previewSegments || Editor.segments || [];
+    const px = this.pxPerSec;
+    const total = segs.reduce((acc, s) => acc + Math.max(0, s.end - s.start), 0);
+    const widthPx = Math.max(total * px, 40);
+
+    const content = document.getElementById("timeline-content");
+    if (content) content.style.width = `${widthPx}px`;
+    this._renderRuler(total, widthPx);
+
+    const track = document.getElementById("timeline-track");
+    if (!track || !segs.length) { this.render(); return; }
+    const blocks = track.querySelectorAll(".tl-block");
+    const chips = track.querySelectorAll(".tl-chip");
+    if (blocks.length !== segs.length || chips.length !== segs.length) { this.render(); return; }
+    let t = 0;
+    segs.forEach((s, i) => {
+      const dur = Math.max(0, s.end - s.start);
+      let leftPx = t * px;
+      const wpx = Math.max(dur * px, 3);
+      if (this._dragLeftAnchor && this._dragLeftAnchor.index === i) leftPx = this._dragLeftAnchor.anchorRightPx - wpx;
+      const block = blocks[i];
+      block.style.left = `${leftPx.toFixed(1)}px`;
+      block.style.width = `${wpx.toFixed(1)}px`;
+      chips[i].style.left = `${leftPx.toFixed(1)}px`;
+      const canvas = block.querySelector(".tl-wave");
+      if (canvas) canvas.style.width = `${wpx.toFixed(1)}px`; // stretch in place; redrawn crisp on settle
+      t += dur;
+    });
+
+    this.renderMarkers();
+    this.renderOverlays();
+    this.renderAudioTrack();
+    this.updatePlayhead(window.EditorUI.player?.currentEdlTime?.() ?? 0);
   },
 
   splitAtPlayhead() {
