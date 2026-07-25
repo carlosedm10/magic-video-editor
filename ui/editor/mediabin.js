@@ -84,11 +84,16 @@ window.EditorUI.mediabin = {
           </div>
           ${clips.map((c) => {
             const draggable = c.info?.duration > 0;
+            const discard = this._discardInfo(c, project);
+            const rowTitle = discard
+              ? discard.tooltip
+              : (draggable ? "Drag onto the timeline to append this clip" : "");
             return `
-            <div class="bin-clip row" data-clip="${c.id}" ${draggable ? 'draggable="true"' : ""}
-              title="${draggable ? "Drag onto the timeline to append this clip" : ""}">
+            <div class="bin-clip row${discard ? " bin-clip-discarded" : ""}" data-clip="${c.id}" ${draggable ? 'draggable="true"' : ""}
+              title="${esc(rowTitle)}">
               <span class="bin-clip-name grow" title="${esc(c.filename)}">${esc(c.filename)}</span>
               <span class="dim mono">${c.info ? fmtT(c.info.duration) : "…"}</span>
+              ${discard ? `<span class="pill discard-pill" title="${esc(discard.tooltip)}">${esc(discard.label)}</span>` : ""}
               ${this._proxyTag(c)}
               <button class="icon-btn" data-role="${c.id}"
                 title="${c.role === "camera" ? "Switch to audio-only" : "Switch to camera"}">
@@ -169,6 +174,44 @@ window.EditorUI.mediabin = {
   // queue item settles (ui/core.js) -- no new poller needed here.
   _proxyPending(c) {
     return !!(c && c.info && c.info.has_video && !("proxy" in c));
+  },
+
+  /* ---------- discarded-clip flag (owner roadmap #5) ----------
+     After a takes run, a camera clip whose sentences were ALL cut (nothing
+     of it survived — every s.kept===false for that clip_id) is flagged so
+     the user can spot it and delete it. Deliberately NOT topic-based: this
+     only looks at pipeline/takes.py's own kept/reason verdicts on THIS
+     clip's sentences — a clip that merely covers the same subject as
+     another clip is never touched, only one whose content was actually cut
+     as a repeat/blooper/dedup. Manually-excluded clips (reason set by the
+     user via api/projects.py's kept toggle -> "excluded manually") are
+     intentionally not auto-flagged as "blooper" since that was the user's
+     own choice, not the pipeline's. */
+  _discardInfo(clip, project) {
+    const sentences = project?.sentences || [];
+    if (!sentences.length) return null; // takes hasn't run yet -- never flag
+    const own = sentences.filter((s) => s.clip_id === clip.id);
+    if (!own.length) return null; // nothing to judge yet (e.g. audio-only clip)
+    if (own.some((s) => s.kept)) return null; // at least one kept sentence -> not discarded
+
+    const reasons = own.map((s) => (s.reason || "").toLowerCase());
+    const isManual = (r) => r.includes("manual"); // "excluded manually"
+    const isDup = (r) => r.includes("duplicad") || (r.includes("dedup")) ||
+      (r.includes("duplicate") && r.includes("across clips"));
+    const isBlooper = (r) => r.includes("blooper") || r.includes("repetici") ||
+      r.includes("repeated") || r.includes("out-of-context") ||
+      r.includes("restart") || r.includes("stuck take") || r.includes("fragment");
+
+    if (reasons.every(isManual)) return null; // user's own call, not a pipeline verdict
+
+    const autoReasons = reasons.filter((r) => !isManual(r));
+    const dupCount = autoReasons.filter(isDup).length;
+    const blooperCount = autoReasons.filter(isBlooper).length;
+    if (!dupCount && !blooperCount) return null; // no auto-cut reasons recognized -- don't guess
+
+    const label = dupCount > blooperCount ? "descartado — duplicado" : "descartado — blooper";
+    const tooltip = "Todo su contenido se cortó como repetición/blooper — revísalo y bórralo si quieres.";
+    return { label, tooltip };
   },
 
   /* ---------- main audio track: audio_assets section (spec vNext) ----------
@@ -553,6 +596,14 @@ window.EditorUI.mediabin = {
       #media-bin-audio { margin-bottom: 6px; }
       .bin-audio-clip { cursor: grab; }
       .bin-audio-clip > i[data-lucide="music"] { color: var(--accent2, #35c28f); flex-shrink: 0; }
+      /* Discarded-clip flag (owner roadmap #5): every sentence of this clip
+         was cut as a repeat/blooper/dedup -- dim the row + a small pill so
+         it reads as "review me, nothing of this survived the cut" without
+         hiding it or auto-deleting anything. */
+      .bin-clip-discarded { opacity: .55; }
+      .bin-clip-discarded .bin-clip-name { text-decoration: line-through; text-decoration-color: var(--border); }
+      .discard-pill { background: rgba(160, 24, 40, .18); color: var(--accent, #a01828);
+        border: 1px solid rgba(160, 24, 40, .35); white-space: nowrap; }
     `;
     document.head.appendChild(style);
   },

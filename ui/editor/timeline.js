@@ -374,6 +374,12 @@ const Timeline = {
     const track = document.createElement("div");
     track.id = "timeline-audio-track";
     track.className = "tl-audio-track"; // position/height come from the injected stylesheet above
+    // Hint (spec: reactivity audit — main audio track has no live Draft
+    // preview, see the TODO above): the lane itself is only 26px tall, no
+    // room for inline copy, so the "applied on export" note lives in the
+    // title tooltip — same minimal pattern as the enhance-voice hint in
+    // ui/panels/audio.js, just as a tooltip instead of a <div class="hint">.
+    track.title = "La música se aplica al renderizar/exportar (no suena en la previsualización Draft).";
     content.appendChild(track);
     mainTrack.style.bottom = "28px"; // was 0 (CSS) — reserve a 28px lane at the bottom for the main audio track
 
@@ -438,7 +444,7 @@ const Timeline = {
     if (!track) return;
     const audioTrack = state.project?.audio_track;
     if (!audioTrack) {
-      track.innerHTML = `<div class="tl-audio-empty">Main audio — arrastra un archivo de audio aquí</div>`;
+      track.innerHTML = `<div class="tl-audio-empty">Main audio — arrastra un archivo de audio aquí (se aplica al exportar, no en Draft)</div>`;
       return;
     }
     const px = this.pxPerSec;
@@ -453,7 +459,7 @@ const Timeline = {
 
     track.innerHTML = `<div class="aud-block" data-aud="1"
         style="left:${leftPx.toFixed(1)}px;width:${widthPx.toFixed(1)}px"
-        title="${esc(name)} (main audio track${audioTrack.ducking ? ", auto-ducked under program audio" : ""})">
+        title="${esc(name)} (main audio track${audioTrack.ducking ? ", auto-ducked under program audio" : ""}) — se aplica al renderizar/exportar, no suena en Draft">
         <span class="aud-label">${esc(name)}</span>
         <input class="aud-gain" type="number" step="0.5" value="${gain}" title="Gain (dB)">
         <span class="aud-remove" title="Remove the main audio track">✕</span>
