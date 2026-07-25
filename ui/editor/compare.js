@@ -138,8 +138,9 @@ const Compare = {
       this.divider.className = "compare-divider";
       const handle = document.createElement("div");
       handle.className = "compare-handle";
-      handle.textContent = "⇔";
+      handle.innerHTML = '<i data-lucide="move-horizontal"></i>';
       this.divider.appendChild(handle);
+      try { window.refreshIcons?.(); } catch (_e) { /* ignore */ }
 
       this.wrap.appendChild(this.overlayVideo);
       this.wrap.appendChild(labelLeft);

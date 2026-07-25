@@ -58,6 +58,34 @@ def set_main_group(project: dict, group: str) -> None:
         c["is_main"] = c.get("camera_group") == group
 
 
+def _new_clip_record(imported: Path, source: Path, group: str) -> dict:
+    """The one clip-dict shape, shared by add_clips (path-based import) and
+    register_uploaded_clips (bytes already streamed onto disk by the v5.3
+    upload endpoint) so both register clips identically."""
+    return {
+        "id": uuid.uuid4().hex[:8],
+        "path": str(imported),
+        "source_path": str(source),
+        "filename": imported.name,
+        "role": "audio" if imported.suffix.lower() in AUDIO_EXTS else "camera",
+        "camera_group": group,
+        "is_main": False,
+        "info": None,
+        "wav": None,
+        "transcript": None,
+        "language": None,
+    }
+
+
+def _finalize_main_group(project: dict, added: list[dict]) -> None:
+    """First batch of clips ever added to a project auto-picks a main camera
+    group (the first camera clip's group) if nothing is main yet."""
+    if added and not any(c["is_main"] for c in project["clips"]):
+        cams = [c for c in project["clips"] if c["role"] == "camera"]
+        if cams:
+            set_main_group(project, cams[0]["camera_group"])
+
+
 def add_clips(project: dict, paths: list[str], camera_group: str | None = None) -> list[dict]:
     """paths may be files or directories. A directory expands to its media
     files (sorted by name) and — unless `camera_group` is given — uses the
@@ -79,26 +107,31 @@ def add_clips(project: dict, paths: list[str], camera_group: str | None = None) 
             if not f.exists() or f.suffix.lower() not in MEDIA_EXTS or str(f) in existing:
                 continue
             imported = _import_into_project(f, project["id"])
-            clip = {
-                "id": uuid.uuid4().hex[:8],
-                "path": str(imported),
-                "source_path": str(f),
-                "filename": f.name,
-                "role": "audio" if f.suffix.lower() in AUDIO_EXTS else "camera",
-                "camera_group": group,
-                "is_main": False,
-                "info": None,
-                "wav": None,
-                "transcript": None,
-                "language": None,
-            }
+            clip = _new_clip_record(imported, f, group)
             project["clips"].append(clip)
             added.append(clip)
             existing.add(str(f))
-    if added and not any(c["is_main"] for c in project["clips"]):
-        cams = [c for c in project["clips"] if c["role"] == "camera"]
-        if cams:
-            set_main_group(project, cams[0]["camera_group"])
+    _finalize_main_group(project, added)
+    store.save(project)
+    return added
+
+
+def register_uploaded_clips(project: dict, saved: list[tuple[Path, str]]) -> list[dict]:
+    """Register files the v5.3 upload endpoint already streamed straight
+    onto disk inside <project>/media/ -- exactly the same clip-dict shape
+    and main-group defaulting as add_clips, minus the hardlink/copy step
+    (there's no separate source path to import from; the upload IS the
+    destination). `saved` is (dest_path_in_media_dir, camera_group) pairs."""
+    added = []
+    existing = {c["path"] for c in project["clips"]}
+    for dest, group in saved:
+        if dest.suffix.lower() not in MEDIA_EXTS or str(dest) in existing:
+            continue
+        clip = _new_clip_record(dest, dest, group)
+        project["clips"].append(clip)
+        added.append(clip)
+        existing.add(str(dest))
+    _finalize_main_group(project, added)
     store.save(project)
     return added
 

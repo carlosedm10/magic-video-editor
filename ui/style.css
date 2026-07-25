@@ -24,16 +24,32 @@ body { margin: 0; font: 14px/1.45 -apple-system, BlinkMacSystemFont, "SF Pro Tex
 .hint { font-size: 12px; color: var(--dim); margin: 4px 0 12px; }
 
 .btn { background: var(--panel2); color: var(--text); border: 1px solid var(--border);
-  border-radius: 10px; padding: 7px 12px; cursor: pointer; font-size: 13px; transition: border-color .15s ease, background .15s ease; }
+  border-radius: 10px; padding: 7px 12px; cursor: pointer; font-size: 13px; transition: border-color .15s ease, background .15s ease;
+  display: inline-flex; align-items: center; gap: 6px; }
 .btn:hover { border-color: var(--accent); }
 .btn.primary { background: var(--accent); border-color: var(--accent); font-weight: 600; }
 .btn.primary:hover { background: var(--accent-hover); border-color: var(--accent-hover); }
 .btn.small { padding: 3px 9px; font-size: 12px; }
 .btn.danger { color: var(--danger); }
 .icon-btn { background: none; border: 1px solid transparent; color: var(--dim); cursor: pointer;
-  font-size: 13px; padding: 3px 6px; border-radius: 8px; line-height: 1; }
+  font-size: 13px; padding: 3px 6px; border-radius: 8px; line-height: 1; display: inline-flex;
+  align-items: center; justify-content: center; }
 .icon-btn:hover { border-color: var(--border); color: var(--text); }
 .icon-btn.danger:hover { color: var(--danger); border-color: var(--danger); }
+
+/* ============================= Lucide icons (spec v5.5) =============================
+   Icons inherit currentColor (stroke) so they follow the garnet/dim palette
+   automatically. Sizes stay consistent: 16px for chrome (default, set by
+   core.js's window.refreshIcons attrs), 18px wherever the transport-controls
+   class below applies. `.lucide-spin` is the shared rotation utility for any
+   loader-2 use (activity chip, inline "generating…" affordances). */
+[data-lucide], svg.lucide { flex-shrink: 0; vertical-align: middle; }
+.player-controls svg.lucide, .re-transport svg.lucide { width: 18px; height: 18px; }
+@keyframes activity-spin { to { transform: rotate(360deg); } }
+.lucide-spin { animation: activity-spin .8s linear infinite; }
+@media (prefers-reduced-motion: reduce) {
+  .lucide-spin { animation: none; opacity: .6; }
+}
 
 .card { background: var(--panel); backdrop-filter: blur(16px); -webkit-backdrop-filter: blur(16px);
   border: 1px solid var(--border); border-radius: 14px; padding: 14px; margin-bottom: 10px;

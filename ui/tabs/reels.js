@@ -58,7 +58,7 @@ function renderReels() {
       <div class="dim">${r.duration}s · hook ${r.hook} · standalone ${r.self_contained} · payoff ${r.payoff}</div>
       ${hasDesc ? `
         <button class="btn small" data-desc-toggle="${r.id}" style="margin:6px 0 4px">
-          ${expanded ? "▾ Hide description" : "▸ Show description"}</button>
+          ${expanded ? '<i data-lucide="chevron-down"></i> Hide description' : '<i data-lucide="chevron-right"></i> Show description'}</button>
         <div class="dim" data-desc="${r.id}" style="white-space:pre-wrap;margin-bottom:6px" ${expanded ? "" : "hidden"}>${esc(r.description)}</div>
       ` : `<div class="dim" style="margin:6px 0">${esc((r.text || "").slice(0, 160))}…</div>`}
       ${(() => {
@@ -66,9 +66,9 @@ function renderReels() {
         return tags.length ? `<div class="chip-row">${tags.map((h) => `<span class="pill">${esc(h.startsWith("#") ? h : "#" + h)}</span>`).join("")}</div>` : "";
       })()}
       <div class="row" style="margin:8px 0">
-        <button class="btn small" data-copy="${r.id}">📋 Copy</button>
-        <button class="btn small" data-regen="${r.id}">↻ Regenerate copy</button>
-        <button class="btn small" data-edit="${r.id}">✎ Edit</button>
+        <button class="btn small" data-copy="${r.id}"><i data-lucide="copy"></i> Copy</button>
+        <button class="btn small" data-regen="${r.id}"><i data-lucide="refresh-cw"></i> Regenerate copy</button>
+        <button class="btn small" data-edit="${r.id}"><i data-lucide="pencil"></i> Edit</button>
       </div>
       ${r.path
         ? `<video controls preload="metadata" src="/api/projects/${p.id}/media/file?path=${encodeURIComponent(r.path)}"></video>`
@@ -87,9 +87,10 @@ function renderReels() {
     if (!r) return;
     const text = [r.title || "", "", r.description || "", "", _reelsHashtagText(r.hashtags)].join("\n");
     const ok = await _reelsCopyToClipboard(text);
-    const original = el.textContent;
-    el.textContent = ok ? "✓ Copied" : "Copy failed";
-    setTimeout(() => { el.textContent = original; }, 1500);
+    const original = el.innerHTML;
+    el.innerHTML = ok ? '<i data-lucide="check"></i> Copied' : "Copy failed";
+    refreshIcons();
+    setTimeout(() => { el.innerHTML = original; refreshIcons(); }, 1500);
   });
 
   document.querySelectorAll("[data-regen]").forEach((el) => el.onclick = async () => {
@@ -103,7 +104,8 @@ function renderReels() {
     } catch (e) {
       alert(`Regenerate failed: ${e.message}`);
       el.disabled = false;
-      el.textContent = "↻ Regenerate copy";
+      el.innerHTML = '<i data-lucide="refresh-cw"></i> Regenerate copy';
+      refreshIcons();
     }
   });
 
@@ -119,6 +121,7 @@ function renderReels() {
     await pollQueue();
     setTab("jobs");
   });
+  refreshIcons();
 }
 
 window.TABS.reels = renderReels;

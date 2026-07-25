@@ -96,9 +96,13 @@ const Timeline = {
     // fair game): ripple delete is worth calling out explicitly, and the
     // split shortcut hint is stale now that S means "toggle snapping".
     const delBtn = document.getElementById("tl-delete");
-    if (delBtn) { delBtn.textContent = "🗑 Ripple delete"; delBtn.title = "Ripple delete (Del) — closes the gap"; }
+    if (delBtn) {
+      delBtn.innerHTML = '<i data-lucide="trash-2"></i> Ripple delete';
+      delBtn.title = "Ripple delete (Del) — closes the gap";
+    }
     const splitBtn = document.getElementById("tl-split");
     if (splitBtn) splitBtn.title = "Split at playhead (X)";
+    refreshIcons();
 
     document.addEventListener("keydown", (e) => this._onKeydown(e));
   },
@@ -178,7 +182,7 @@ const Timeline = {
       snapBtn.id = "tl-snap";
       snapBtn.className = "btn small tl-snap-btn active";
       snapBtn.title = "Snap to playhead/edges while trimming (S)";
-      snapBtn.textContent = "⟝ Snap";
+      snapBtn.innerHTML = '<i data-lucide="magnet"></i> Snap';
       snapBtn.onclick = () => this._toggleSnapping();
       toolbar.appendChild(snapBtn);
     }
@@ -187,7 +191,7 @@ const Timeline = {
       fitBtn.id = "tl-fit";
       fitBtn.className = "btn small";
       fitBtn.title = "Zoom to fit the whole timeline (~20% spare room)";
-      fitBtn.textContent = "⤢ Fit";
+      fitBtn.innerHTML = '<i data-lucide="maximize-2"></i> Fit';
       toolbar.appendChild(fitBtn); // onclick wired in mount() via bind()
     }
     if (toolbar && !document.getElementById("tl-history-btn")) {
@@ -198,7 +202,7 @@ const Timeline = {
       btn.id = "tl-history-btn";
       btn.className = "btn small";
       btn.title = "Edit history";
-      btn.textContent = "🕐";
+      btn.innerHTML = '<i data-lucide="history"></i>';
       btn.onclick = (e) => { e.stopPropagation(); this._toggleHistory(); };
       wrap.appendChild(btn);
       toolbar.appendChild(wrap);
@@ -421,6 +425,7 @@ const Timeline = {
     this.renderMarkers();
     this.updatePlayhead(window.EditorUI.player?.currentEdlTime?.() ?? 0);
     this.refreshRenderBar();
+    refreshIcons();
   },
 
   _renderRuler(total, widthPx) {

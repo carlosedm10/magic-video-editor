@@ -61,6 +61,127 @@ real content: only put a number in cut_ids if you are confident it matches
 one of the six cases above. When unsure whether something is content, do NOT
 cut it; leaving in a minor disfluency is far better than cutting real
 content. Never invent ids that were not in the input.
+
+IMPORTANT for case 2: a complete, grammatically finished sentence (it ends
+its thought, even if it happens to start with a filler word like "vale",
+"bueno", or "vale, pues") is essentially NEVER an abandoned take just because
+a later sentence covers similar ground or a restart happens right after it.
+Judge completeness, not the opening word: an abandoned take trails off,
+restarts mid-clause, or is cut short — a finished sentence that already said
+its own thing is real content and must stay, even next to a restart.
+
+WORKED EXAMPLES (Spanish, the most common real pattern — a halting fragment,
+then a self-encouragement/restart marker, then the clean retake):
+
+Example 1 — halting fragment then "venga ya" then clean retake:
+Input:
+1: "Vale, el primer paso para..."
+2: "El primer... a ver."
+3: "Venga ya, va."
+4: "El primer paso para plantear una rutina es saber cuál es tu objetivo."
+5: "Y a partir de ahí, todo lo demás encaja."
+Expected: cut_ids=[1, 2, 3], reason="halting fragment + restart marker before retake at #4"
+(sentences 1-2 are abandoned attempts at the same line #4 retakes cleanly;
+#3 "venga ya, va" is the self-encouragement marker right before the retake —
+cut it too; #4 and #5 are the real content, keep them).
+
+Example 2 — "ahora sí" / "vamos" marker pattern:
+Input:
+1: "Cuando entrenas piernas tienes que..."
+2: "Espera, otra vez."
+3: "Ahora sí, vamos."
+4: "Cuando entrenas piernas tienes que priorizar la sentadilla y el peso muerto."
+Expected: cut_ids=[1, 2, 3], reason="abandoned attempt + 'ahora sí'/'vamos' markers before #4"
+
+Example 3 — same line repeated three times, keep only the last:
+Input:
+1: "Hoy os voy a hablar de cómo mejorar la dieta."
+2: "Hoy os voy a hablar de cómo mejorar la dieta, perdón."
+3: "Hoy os voy a hablar de cómo mejorar vuestra dieta paso a paso."
+4: "Lo primero que tenéis que saber es..."
+Expected: cut_ids=[1, 2], reason="same line repeated 3x, kept only the last (best) take at #3"
+(#1 and #2 are earlier attempts at the exact same opening line; #3 is the
+final version and reads best — keep it; #4 is new content, keep it).
+
+Example 4 — mistake-reaction aside mid-flow, no full restart:
+Input:
+1: "El segundo ejercicio es el press de banca."
+2: "Ay, se me ha ido, un segundo."
+3: "El segundo ejercicio es el press de banca, que trabaja el pectoral."
+Expected: cut_ids=[1, 2], reason="mistake-reaction aside + the attempt it interrupts, retaken at #3"
+"""
+
+TAKE_SEQUENCER_SYSTEM_PROMPT = """
+You look for STUCK TAKE RUNS in a sliding window of consecutive sentences
+from ONE clip, already in spoken order, with each sentence's start/end time
+and the GAP (in seconds) before it. Recordings are in Spanish or English (or
+mixed).
+
+A "stuck take run" is a contiguous block of sentences where the speaker is
+retrying the SAME line over and over — halting, restarting, or repeating —
+and it is immediately followed, still inside the window, by the clean take
+that was actually intended to survive. You target two patterns:
+
+(a) A run of one or more failed/halting attempts at the same line (cut off,
+    restarted, incomplete, stumbling) that ENDS in a self-encouragement or
+    restart marker — e.g. "venga ya", "va", "ahora sí", "ahora sí que sí",
+    "vamos", "ya está", "perfecto, sigo", "otra vez", "a ver, va" — and is
+    immediately followed by the clean retake of that same line. Cut the
+    WHOLE run, INCLUDING the marker sentence, as one run from the first
+    failed attempt to the marker (inclusive). Keep the clean retake that
+    follows — it is NOT part of the run. The run must start at the first
+    sentence that is actually halting/incomplete/restarted — a complete,
+    grammatically finished sentence right before it (it ends its own
+    thought, even if the topic overlaps or it happens to start with a
+    filler word like "vale"/"bueno") is real content, NOT the start of the
+    run, even when a restart happens immediately after it.
+
+(b) The exact same line said multiple times in a row (near-identical
+    content, possibly worded a little differently each time) with NO marker
+    at all — just repetition. Cut every attempt EXCEPT the best/last one:
+    the run to cut spans from the first repetition through the second-to-
+    last attempt (the last, best attempt is kept and is NOT part of the run).
+
+Short gaps between sentences (a beat of silence while the speaker resets) are
+a supporting signal for a stuck run, but judge primarily on MEANING — the
+same intended line said again, however differently worded — not on the gap
+or on string similarity.
+
+Return `cut_runs`: a list of at most 4 objects `{start_id, end_id, reason}`,
+each a CONTIGUOUS inclusive range of the sentence numbers you were given
+(start_id <= end_id; a single bad sentence is start_id == end_id). Only emit
+a run when you are confident it matches pattern (a) or (b) above AND the
+clean/better retake is visible in this same window. Never invent sentence
+numbers that were not given to you. Return an empty list when nothing in
+this window qualifies — stay conservative outside these two patterns; do NOT
+flag ordinary content, minor disfluencies, or a single complete sentence.
+
+WORKED EXAMPLES (Spanish):
+
+Example 1 — halting fragments then "venga ya" / "ahora sí" then clean retake:
+Input (id, gap_before_s, text):
+12 (0.0s): "Vale, para empezar la rutina lo primero es..."
+13 (0.4s): "El primer... a ver, espera."
+14 (0.3s): "Venga ya, ahora sí."
+15 (0.5s): "Para empezar la rutina, lo primero es fijar tu objetivo real."
+16 (1.1s): "Y desde ahí construimos todo lo demás."
+Expected: cut_runs=[{start_id: 12, end_id: 14, reason: "halting + 'venga ya' marker before #15"}]
+
+Example 2 — repeated attempts ending in "vamos", clean retake follows:
+Input:
+20 (0.0s): "Cuando hagas sentadilla tienes que..."
+21 (0.6s): "Otra vez, joder."
+22 (0.3s): "Vale, vamos."
+23 (0.4s): "Cuando hagas sentadilla tienes que bajar controlando la cadera y la rodilla."
+Expected: cut_runs=[{start_id: 20, end_id: 22, reason: "attempt + 'vamos' marker before #23"}]
+
+Example 3 — same line repeated three times, no marker, keep only the last:
+Input:
+30 (0.0s): "Hoy os voy a explicar cómo mejorar la dieta."
+31 (0.5s): "Hoy os voy a explicar cómo mejorar vuestra dieta, perdón."
+32 (0.4s): "Hoy os voy a explicar cómo mejorar vuestra dieta paso a paso."
+33 (1.0s): "Lo primero es entender cuántas calorías necesitáis."
+Expected: cut_runs=[{start_id: 30, end_id: 31, reason: "same opening line repeated 3x, kept #32"}]
 """
 
 VIDEO_TOPIC_SYSTEM_PROMPT = """

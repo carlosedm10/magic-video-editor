@@ -51,7 +51,7 @@ const Suggestions = {
     this.container.innerHTML = `
       <div class="card">
         <div class="row"><b>Suggestions</b><span class="grow"></span>
-          <button class="icon-btn" id="sugg-refresh" title="Refresh">↻</button></div>
+          <button class="icon-btn" id="sugg-refresh" title="Refresh"><i data-lucide="refresh-cw"></i></button></div>
         <div class="hint">Nothing here is cut automatically — review and decide per card.</div>
         ${this.items.length ? this.items.map((s) => `
           <div class="card sugg-card">
@@ -70,6 +70,7 @@ const Suggestions = {
       btn.onclick = () => this._act(btn.dataset.sid, "accept"));
     this.container.querySelectorAll(".sugg-dismiss").forEach((btn) =>
       btn.onclick = () => this._act(btn.dataset.sid, "dismiss"));
+    refreshIcons();
   },
 
   async _act(sid, action) {

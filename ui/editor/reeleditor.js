@@ -244,7 +244,7 @@
       div.hidden = true;
       div.innerHTML = `
         <div class="re-topbar row">
-          <button id="re-back" class="btn small" title="Esc">← Back to project</button>
+          <button id="re-back" class="btn small" title="Esc"><i data-lucide="arrow-left"></i> Back to project</button>
           <div class="re-heading">
             <b id="re-heading-title">Reel</b>
             <span id="re-heading-sub" class="dim"></span>
@@ -264,7 +264,7 @@
               </div>
             </div>
             <div class="re-transport row">
-              <button id="re-playpause" class="btn small" title="Space">▶</button>
+              <button id="re-playpause" class="btn small" title="Space"><i data-lucide="play"></i></button>
               <span id="re-time" class="dim mono">0:00 / 0:00</span>
             </div>
           </section>
@@ -304,6 +304,7 @@
         </div>`;
       content.appendChild(div);
       this._wireOnce();
+      refreshIcons();
     },
 
     _wireOnce() {
@@ -532,14 +533,14 @@
       this.playing = true;
       v.play().catch(() => {});
       const btn = document.getElementById("re-playpause");
-      if (btn) btn.textContent = "⏸";
+      if (btn) { btn.innerHTML = '<i data-lucide="pause"></i>'; refreshIcons(); }
     },
     pause() {
       this.playing = false;
       const v = document.getElementById("re-video");
       v?.pause();
       const btn = document.getElementById("re-playpause");
-      if (btn) btn.textContent = "▶";
+      if (btn) { btn.innerHTML = '<i data-lucide="play"></i>'; refreshIcons(); }
     },
     togglePlay() { this.playing ? this.pause() : this.play(); },
 
@@ -716,8 +717,8 @@
               : '<span class="dim">No hashtags yet.</span>';
           })()}</div>
           <div class="row" style="margin-top:6px">
-            <button class="btn small" id="re-copy-btn">📋 Copy</button>
-            <button class="btn small" id="re-regen-btn">↻ Regenerate copy</button>
+            <button class="btn small" id="re-copy-btn"><i data-lucide="copy"></i> Copy</button>
+            <button class="btn small" id="re-regen-btn"><i data-lucide="refresh-cw"></i> Regenerate copy</button>
           </div>
           <div class="re-readonly-row" style="margin-top:12px">
             <span>In <b>${start.toFixed(2)}s</b></span>
@@ -739,8 +740,9 @@
       if (copyBtn) copyBtn.onclick = async () => {
         const text = [reel.title, "", reel.description, "", _hashtagText(reel.hashtags)].join("\n");
         const ok = await _copyToClipboard(text);
-        copyBtn.textContent = ok ? "✓ Copied" : "Copy failed";
-        setTimeout(() => { copyBtn.textContent = "📋 Copy"; }, 1500);
+        copyBtn.innerHTML = ok ? '<i data-lucide="check"></i> Copied' : "Copy failed";
+        refreshIcons();
+        setTimeout(() => { copyBtn.innerHTML = '<i data-lucide="copy"></i> Copy'; refreshIcons(); }, 1500);
       };
       const regenBtn = el.querySelector("#re-regen-btn");
       if (regenBtn) regenBtn.onclick = async () => {
@@ -753,9 +755,11 @@
         } catch (e) {
           alert(`Regenerate failed: ${e.message}`);
           regenBtn.disabled = false;
-          regenBtn.textContent = "↻ Regenerate copy";
+          regenBtn.innerHTML = '<i data-lucide="refresh-cw"></i> Regenerate copy';
+          refreshIcons();
         }
       };
+      refreshIcons();
     },
 
     /* ---- Subs tab: style overrides (partial over project defaults) + cue list ---- */
@@ -900,7 +904,7 @@
         <div class="card">
           <b>Export</b>
           <div class="row">
-            <button class="btn primary small" id="re-render-btn" ${busy ? "disabled" : ""}>${busy ? "Rendering…" : "▶ Render"}</button>
+            <button class="btn primary small" id="re-render-btn" ${busy ? "disabled" : ""}>${busy ? "Rendering…" : '<i data-lucide="play"></i> Render'}</button>
             <span class="dim">${esc(statusText)}</span>
           </div>
           ${last?.status === "error" ? `<div class="dim" style="color:var(--danger);margin-top:6px">${esc(last.error || "Render failed")}</div>` : ""}
@@ -908,7 +912,7 @@
             <div style="margin-top:10px">
               <video controls preload="metadata" src="/api/projects/${this.pid}/media/file?path=${encodeURIComponent(reel.path)}"></video>
               <div class="row" style="margin-top:6px">
-                <button class="btn small" id="re-open-folder">📂 Open in Finder</button>
+                <button class="btn small" id="re-open-folder"><i data-lucide="folder-open"></i> Open in Finder</button>
               </div>
             </div>` : '<div class="hint" style="margin-top:8px">No render yet — click Render to produce the 9:16 file.</div>'}
         </div>`;
@@ -931,6 +935,7 @@
         try { await api("/open-folder", { method: "POST", body: { path: dir } }); }
         catch (e) { alert(`Couldn't open folder: ${e.message}`); }
       };
+      refreshIcons();
     },
 
     /* ---------- 1s tick while open: export status + auto-close if the

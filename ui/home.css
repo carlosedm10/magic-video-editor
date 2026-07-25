@@ -1,0 +1,110 @@
+/* ============================= Projects Home (spec v5.2) =============================
+   Landing view shown when no project is open. Loaded by the integrator
+   (index.html) alongside ui/home.js; only relies on CSS custom properties
+   already defined in ui/style.css (--bg, --panel, --panel2, --border,
+   --text, --dim, --accent, --accent-hover, --accent2, --danger, --warn) —
+   no new vars introduced here. */
+
+.home-view { position: absolute; inset: 0; overflow-y: auto; }
+.home-inner { max-width: 1180px; margin: 0 auto; padding: 40px 32px 64px; }
+
+.home-head { margin-bottom: 22px; }
+.home-title { font-size: 26px; font-weight: 800; letter-spacing: -.01em; }
+.home-sub { margin-top: 4px; font-size: 13px; }
+
+.home-filters { margin-bottom: 22px; flex-wrap: wrap; }
+.home-filter { background: var(--panel2); border: 1px solid var(--border); }
+.home-filter.active { background: var(--accent); color: var(--text); }
+
+.home-empty { padding: 40px 0; text-align: center; }
+
+.home-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+  gap: 18px;
+}
+
+/* ---- shared card shell ---- */
+
+.home-card {
+  background: var(--panel);
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  overflow: hidden;
+  box-shadow: 0 6px 24px rgba(0,0,0,.3);
+  cursor: pointer;
+  transition: border-color .15s ease, transform .15s ease, box-shadow .15s ease;
+  display: flex;
+  flex-direction: column;
+}
+.home-card:not(.home-new):hover {
+  border-color: var(--accent);
+  transform: translateY(-2px);
+  box-shadow: 0 10px 32px rgba(0,0,0,.4);
+}
+
+/* ---- poster ---- */
+
+.home-poster {
+  position: relative;
+  aspect-ratio: 16 / 9;
+  background: radial-gradient(120% 140% at 20% 15%, rgba(160,24,40,.35), transparent 60%),
+              linear-gradient(160deg, #0a1020, #05070d 70%);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+}
+.home-poster.has-poster { background-color: #05070d; }
+.home-poster-empty { color: var(--dim); opacity: .6; }
+.home-level {
+  position: absolute; top: 8px; right: 8px;
+  background: rgba(10,16,29,.75);
+  backdrop-filter: blur(6px);
+}
+.home-level.level-todo { color: var(--dim); }
+.home-level.level-progress { color: var(--warn); border-color: var(--warn); }
+.home-level.level-done { color: var(--accent2); border-color: var(--accent2); }
+
+/* ---- body ---- */
+
+.home-card-body { padding: 12px 14px 14px; display: flex; flex-direction: column; gap: 8px; flex: 1; }
+.home-name-row { min-height: 20px; }
+.home-name {
+  font-size: 14px; font-weight: 700; display: block;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.home-name-input {
+  width: 100%; font-size: 14px; font-weight: 700; padding: 3px 6px;
+}
+.home-meta { font-size: 11px; gap: 12px; flex-wrap: wrap; }
+.home-meta span { display: inline-flex; align-items: center; gap: 4px; }
+
+.home-card-footer { margin-top: auto; }
+.home-status {
+  font-size: 11px; padding: 4px 8px; border-radius: 999px;
+  background: var(--panel2); border: 1px solid var(--border); color: var(--text);
+}
+.home-delete { flex-shrink: 0; }
+
+/* ---- new-project card ---- */
+
+.home-new {
+  border-style: dashed;
+  border-color: var(--border);
+  background: var(--panel2);
+  min-height: 100%;
+  align-items: center;
+  justify-content: center;
+}
+.home-new:hover { border-color: var(--accent); background: var(--panel); }
+.home-new-inner { text-align: center; padding: 30px 14px; color: var(--dim); }
+.home-new-icon { color: var(--accent-hover); margin-bottom: 6px; display: flex; justify-content: center; }
+.home-new-label { font-size: 13px; font-weight: 600; color: var(--text); }
+
+@media (max-width: 700px) {
+  .home-inner { padding: 28px 18px 48px; }
+  .home-grid { grid-template-columns: repeat(auto-fill, minmax(160px, 1fr)); gap: 12px; }
+}

@@ -23,6 +23,7 @@ DEFAULTS: dict = {
     "task_models": {
         "take_judge": None,
         "transcript_cleaner": None,
+        "take_sequencer": None,
         "clip_order": None,
         "reel_scorer": None,
         "reviewer": None,

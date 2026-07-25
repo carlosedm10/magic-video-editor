@@ -567,3 +567,224 @@ design for "the browser" as the primary surface. Consequences, binding for all a
   quirks.
 - Dock: app icon (v6), and while rendering set the dock badge/progress when pywebview
   exposes it (best-effort via pyobjc; skip quietly if brittle).
+
+## v5.6 — AI take-quality v3 (owner: still missing repeated bad takes + stuck-run muletillas)
+The highest-value task. Three levers, all mandatory:
+1. **Few-shot prompts**: transcript_cleaner and the new take_sequencer prompts MUST include
+   2-3 worked Spanish examples showing input sentences -> expected cuts (including the
+   exact patterns the owner reports: halting fragments, then "venga ya"/"ahora sí"/
+   "vamos"/"va"/"ya está"/"perfecto, sigo", then the clean retake).
+2. **New take_sequencer pass** (runs in takes AFTER the per-sentence cleaner, BEFORE
+   fuzzy dedup): sliding windows of ~12 consecutive sentences per clip (2-sentence
+   overlap) WITH timestamps and inter-sentence gaps. Flat-ish output {cut_runs:
+   [{start_id, end_id, reason}]} targeting: (a) runs of consecutive failed attempts at
+   the same line (halting, restarted, incomplete) that end in a self-encouragement
+   marker and are followed by the good take — cut the WHOLE run including the marker,
+   keep the final take; (b) the same-line-repeated-many-times pattern even without a
+   marker (keep the best/last). Conservative outside those patterns.
+3. **Model power for analysis tasks**: pull qwen2.5:32b (fits 48GB) and set task_models
+   overrides for transcript_cleaner, take_sequencer, dedup_judge to it (settings-level,
+   user-changeable); everything else stays on the default 14b for speed.
+4. **Eval harness** (decides prompt-vs-model with data): scripts/eval_takes.py — a small
+   labeled fixture built from the REAL c7642fc7755e transcripts (copy sentences into the
+   fixture; hand-label expected cut ids for the known bloopers/stuck runs), runs the
+   cleaner+sequencer against any model, prints precision/recall per category. Run it for
+   14b vs 32b and report both in the final report. Future prompt changes must keep the
+   eval green.
+
+## v5.7 — Professional color pipeline + LUT import (owner request; researched)
+Replace the ad-hoc 4-slider color config with the industry-standard control set and
+STANDARD algorithms (our bundled ffmpeg has every needed filter — verified: exposure,
+colortemperature, colorbalance, colorlevels, eq, curves, unsharp, vibrance, lut3d,
+haldclut). Do NOT invent math; map 1:1 to these filters.
+
+**Controls (Lightroom/Premiere "Basic" panel set) and their ffmpeg mapping, applied in
+the standard correction order:**
+1. Exposure (EV, -3..+3) -> `exposure=exposure=EV`
+2. White balance: Temperature (-1..1 mapped to ~3500K..8500K) -> `colortemperature`;
+   Tint (green<->magenta, -1..1) -> `colorbalance` magenta/green axis (mid tones)
+3. Tone: Black point / White point (0..0.5 input levels) -> `colorlevels=rimin/gimin/
+   bimin` and `rimax/...`; Brightness + Contrast -> `eq`
+4. Presence: Saturation -> `eq=saturation`; Vibrance (smart saturation protecting skin)
+   -> `vibrance`
+5. Sharpness (0..1) -> `unsharp=5:5:amount` (classic unsharp mask; amount 0..1.5)
+6. LOOK (last): imported LUT (see below) with an Intensity slider — implement blend
+   with the original via split+lut3d+blend all_opacity, the standard "LUT strength"
+   trick.
+
+**LUT import — the interchange format the owner asked about**: `.cube` (Adobe/IRIDAS 3D
+LUT) is THE cross-app standard (Premiere, Final Cut, Resolve, Lightroom exports, and the
+entire free/paid LUT marketplace share it). Support: import .cube (and .3dl via lut3d,
+.png haldclut) — file picker + drag&drop into the Color tab; store LUTs in
+~/CutRoom/luts/ (settings-level library, reusable across projects); per-project selected
+LUT + intensity persisted in project["color"]["lut"]. Preview via the existing
+preview-frame endpoint (must accept the new params) and the CSS-approximation divider
+keeps approximating only the basic controls (LUT preview requires the server frame —
+show a note in the compare overlay when a LUT is active).
+
+**Presets** stay (B&W/Sepia/Cinematic/Vintage) but become parameter presets over the new
+controls (+optional built-in LUTs later). Migration: old {preset, brightness, contrast,
+saturation, temperature} configs map into the new schema on read (defaults for new
+fields). The Color inspector tab groups controls like Lightroom: WB / Tone / Presence /
+Detail / Look, each slider with numeric value + double-click-to-reset.
+
+## v5.8 — Reel playhead, multi-segment viral reels, speaker diarization (owner requests)
+
+### a) Reel Editor playhead (bug/UX)
+The reel mini-timeline lacks a playhead: add a vertical time cursor over the filmstrip
+tracking playback position in real time (+ current-time label), click/drag on the strip
+seeks, and the in/out handles show their timecodes while dragging. Same garnet playhead
+styling as the main timeline.
+
+### b) Multi-segment viral reels ("the podcast case")
+A reel is no longer one continuous window — it becomes a LIST of segments (same shape as
+the EDL) with per-junction transitions:
+- Data: reel["segments"] = [{clip_id, start, end}], reel["transitions"] (junction list,
+  default crossfade 0.4s). Single-window reels migrate to a 1-segment list on read.
+- **Viral composer**: after the existing single-window scoring, a composer agent pass
+  looks for PAIRS of high-scoring, semantically-connected windows separated in time
+  (same idea continued later, setup+payoff, question+answer) — flat task
+  {combine: bool, why, order: "ab"|"ba"} over candidate pairs pre-filtered by embedding/
+  keyword overlap among the top ~15 windows (cap ~10 agent calls). Combined candidates
+  get a bonus and enter the ranking as multi-segment reels (marked "compuesto" in the
+  UI card).
+- Render: reuse the main-cut segment renderer (cut each segment with the reel crop/subs,
+  then crossfade junctions like the main render does).
+- Reel Editor: the mini-timeline shows all segments of the reel side by side (each with
+  its own in/out handles), junction transition chips, and "add segment" (pick any moment
+  from the source clip strip).
+
+### c) Speaker diarization for subtitles (two voices / podcast)
+Detect and label speakers, fully local:
+- Pipeline: new optional pass in transcribe stage — voice embeddings per transcript
+  segment via **resemblyzer** (MIT, pip, d-vector embeddings; no gated models) over the
+  analysis wav, then agglomerative/spectral clustering with auto speaker-count estimate
+  (2-4 cap; merge below similarity threshold). Store segment["speaker"] = "S1"/"S2"...
+  and project["speakers"] = [{id, label (editable), color}].
+- **The user declares the speaker count** (owner refinement): a project-level field
+  "Locutores" (1 / 2 / 3 / 4 / auto) asked in the project setup UI (media bin header or
+  first-run of the pipeline; default 1). When N>1 the clustering runs with K=N fixed —
+  a KNOWN speaker count makes diarization far more reliable than estimating it. "auto"
+  falls back to the variance heuristic + estimated K. N=1 skips the pass entirely.
+- Subtitles: per-speaker styling — color per speaker (assignable in the Subs tab, with
+  editable names shown as "Name:" prefix optional toggle); the .ass generator emits one
+  style per speaker; the live overlay tints accordingly.
+- Takes/reviewer prompts receive speaker labels so cross-speaker "repetition" (host
+  echoing guest) is NOT treated as a duplicate take.
+
+## v5.9 — Resizable layout + manual overlay track (owner requests)
+
+### a) Resizable panels
+Draggable splitters between every main region (media bin | player | inspector, and
+player area | timeline): thin grab handles on the grid gaps (cursor col-resize/
+row-resize), live resize of the CSS grid template, double-click a splitter to reset to
+default, min sizes so nothing collapses accidentally. Sizes persist per user in
+localStorage and restore on launch. The reel editor reuses the same mechanism where it
+has panes.
+
+### b) Manual overlay track (video over video)
+A second timeline track ABOVE the main one for overlays/PiP — STRICTLY MANUAL: the AI
+pipeline must never create or modify overlay items (enforce in code: only the overlay
+API endpoints touch them).
+- Data: project["overlays"] = [{id, clip_id, t_start (timeline seconds), duration,
+  clip_in (source offset), x, y, scale (0..1 fractions of frame), opacity (0..1)}].
+  v1 constraints: no audio from overlays (main audio wins), overlay must lie within the
+  final cut's duration.
+- Timeline: overlay items drawn on the upper track (thinner blocks, draggable
+  horizontally, trim handles); created by dragging a clip from the media bin onto the
+  overlay track.
+- Player (draft mode): overlay rendered as an absolutely-positioned muted <video>
+  synced to the EDL clock; on the player, the selected overlay gets a draggable/
+  resizable bounding box (move = x/y, corners = scale) like every editor's PiP.
+- Render: main cut renders exactly as today; then ONE final ffmpeg pass applies all
+  overlays over the concatenated file (per overlay: trim source window, scale, overlay
+  x/y with enable='between(t,start,end)', opacity via format+colorchannelmixer alpha or
+  blend) — single filter_complex chain, respects the semaphore.
+- Preview render includes overlays (same final pass at preview quality).
+
+## v5.10 — Settings > General redesign (owner: "no queda nada claro")
+Replace the current export-folder card with a clear, app-like design:
+- Row layout: folder icon + label "Export location" + the folder shown as a FRIENDLY
+  path ("~/Movies/Magic Video Editor", home abbreviated, never a raw truncated input) +
+  a "Change…" button (native picker; auto-SAVES immediately on choose — no Save button
+  anywhere in this card) + a subtle "Reveal in Finder" icon button.
+- Below, a live STRUCTURE PREVIEW rendered from real data so the behavior is
+  self-explanatory: "Your exports:  Magic Video Editor / <current project name> /
+  <latest reel or project title>.mp4" styled as a breadcrumb with folder icons.
+- Clicking the path text switches it to an editable input (Enter saves, Esc cancels) —
+  the power-user path entry, hidden by default. NO mention of "browser mode" anywhere
+  (app-first principle).
+- Section subtitle fixes: "General" keeps a neutral description; each card carries its
+  own title + one-line description. Apply the same no-Save-button, auto-persist pattern
+  to the rest of Settings (Brand textarea already autosaves on blur — keep; Performance
+  selects save on change with a brief "Saved ✓" toast).
+
+## v5.11 — Settings > Models redesign (owner: too long, model discovery must be encapsulated)
+The Models section currently sprawls vertically. Restructure:
+1. **"Your models" (compact, what stays on the page)**: a tight two-column grid of the
+   assignments — Default model + the per-task selects (short labels + the one-line dim
+   description on hover/tooltip instead of always-visible paragraphs); below it,
+   "Installed" as a compact horizontal chip list (name + size, x to delete) instead of
+   stacked cards. Target: the whole thing fits one screen without scrolling.
+2. **"Browse models" becomes a MODAL** (encapsulated, opened from a single prominent
+   button next to Installed): the model browser dialog (~720px, own scroll) contains the
+   hardware recommendation block (Tu Mac + Best overall / Optimal picks), the search
+   field, and the curated/popular results with tag chips + compatibility badges +
+   Install progress. Closing the modal never loses an in-flight pull (it continues as a
+   queue/activity item, visible in the Activity chip).
+3. Pull progress ALSO surfaces in the Activity chip/popover so the modal doesn't need
+   to stay open.
+
+## v5.12 — Fold Transcription into Models (owner request)
+Remove the separate "Transcription" settings section. Inside Models, add a visually
+DISTINCT box "Transcription — Whisper" (separated from the Ollama area, subtle divider +
+its own icon) containing:
+- A dropdown of common mlx-community Whisper repos instead of the raw text input:
+  whisper-large-v3-turbo (Recomendado — mejor equilibrio velocidad/precisión),
+  whisper-large-v3 (máxima precisión, más lento), whisper-medium, whisper-small
+  (rápido, menos preciso) — plus an "Custom repo…" option revealing the free-text input.
+  Auto-save on change (no Save button).
+- A two-line explainer in the box (Spanish-friendly tone, since UI copy is English keep
+  it in English): "Speech-to-text uses Whisper — the open-source standard for
+  transcription — not an Ollama LLM. It produces the word-level timestamps every edit
+  decision depends on, and runs on the Apple GPU via MLX. The Ollama models above only
+  reason over the resulting text."
+
+## v5.13 — Full rename: CutRoom -> Magic Video Editor (owner request; RUNS FIRST AND SOLO in the next wave)
+Rename everything, including code:
+- Python package `cutroom` -> `magic_video_editor` (faithful snake_case); console scripts
+  `cutroom`/`cutroom-server` -> `mve` / `mve-server` (Makefile app/server targets updated;
+  README too). All imports, Makefile smoke list, launch.json args, docs references.
+- **Data directory moves to the macOS-correct location** (app-first): ~/CutRoom ->
+  `~/Library/Application Support/Magic Video Editor` (projects/, settings.json, luts/).
+  AUTO-MIGRATION on startup: if the old dir exists and the new one doesn't, move it
+  (os.rename same-volume) and log; never lose projects. The About panel then shows the
+  new path.
+- Env vars CUTROOM_* -> MVE_* (old names still honored as fallback, warned once).
+- User-facing strings: no "CutRoom" left anywhere (grep gate in verification). Repo name
+  stays magic-video-editor.
+- Update .claude/launch.json (repo) and the workspace launch config that runs
+  uv --project ... cutroom-server -> mve-server.
+Verification: make lint && make smoke, boot, create+open a project, and confirm a
+pre-existing ~/CutRoom gets migrated (test with a fixture dir set via env override).
+
+## v5.14 — BUG: playback dies after editing colors (owner report; diagnosed)
+Symptom: edit color sliders -> the player stops playing and never recovers.
+Likely root causes (verify all three, fix at the root):
+1. player.js AUTO-SWITCHES Draft<->Preview based on manifest freshness. A color edit
+   triggers the debounced preview_render auto-enqueue; when it completes, the player can
+   flip to Preview mode mid-playback — and if it flips while preview.mp4 is being
+   REWRITTEN in place by the render job, the <video> loads a truncated file and stalls
+   forever (readyState 0/2, no error).
+2. preview_render writes preview.mp4 IN PLACE — must write preview.tmp.mp4 and
+   atomically os.replace() at the end (also update the manifest only after the rename).
+3. The preview <video> src needs cache-busting (?v=<manifest-hash>) so a previously
+   half-loaded/stale file is never reused.
+Fix policy: NEVER auto-switch modes during active playback or within a user's editing
+session gesture — auto-select mode only on project open and at segment boundaries when
+paused; when a fresh preview becomes available show a subtle "Preview ready" affordance
+on the mode toggle instead of switching. Manual toggle always wins. Also ensure the
+color panel's live CSS-approximation path never pauses/detaches the draft videos (audit
+compare.js interactions with #player-stage).
+Regression test for the integrator: with a project playing in Draft, change a color
+slider, wait for the auto preview render to complete, and assert playback never stopped.

@@ -35,6 +35,22 @@ const api = async (path, opts = {}) => {
 };
 const esc = (s) => (s || "").replace(/[&<>"]/g, (c) =>
   ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+
+/* ---------- Lucide icons (spec v5.5) ----------
+   ui/vendor/lucide.min.js is loaded before this file (see index.html) and
+   exposes window.lucide. This is the ONE shared helper every render path in
+   the app calls right after injecting HTML containing <i data-lucide="…">
+   tags, so freshly-added icons actually get swapped for the inline SVGs.
+   Guarded: never throw if lucide didn't load for some reason (e.g. a build
+   that drops the vendor file) — the app must keep working, just with bare
+   (invisible, no layout break) <i> tags instead of icons. */
+window.refreshIcons = () => {
+  try {
+    window.lucide?.createIcons({ attrs: { width: 16, height: 16, "stroke-width": 1.75 } });
+  } catch (e) {
+    console.error("refreshIcons failed", e);
+  }
+};
 const fmtT = (t) => {
   t = Math.max(0, t || 0);
   return `${Math.floor(t / 60)}:${String(Math.floor(t % 60)).padStart(2, "0")}`;
@@ -84,11 +100,59 @@ async function selectProject(pid) {
   state.runAllJob = null;
   state.queue = [];
   await refreshProject();
-  $("#empty-state").hidden = true;
+  hideHome();
   $("#project-view").hidden = false;
   updateTopbarForProject();
   loadProjects();
   ensureQueuePolling();
+}
+
+/* ---------- routing: Projects Home vs. the editor (spec v5.2 + PRINCIPLE)
+   window.HomeView is owned by a sibling agent building ui/home.js in
+   parallel and exposes {mount(container), unmount()}; every touch point
+   here is guarded so this file never throws regardless of load order or
+   whether that build has landed yet. ---------- */
+
+function showHome() {
+  $("#project-view").hidden = true;
+  const el = $("#home-view");
+  el.hidden = false;
+  if (typeof window.HomeView !== "undefined" && window.HomeView?.mount) {
+    try { window.HomeView.mount(el); }
+    catch (e) { console.error("HomeView failed to mount", e); }
+  } else if (!el.dataset.fallback) {
+    el.dataset.fallback = "1";
+    el.innerHTML = `<div class="empty"><div class="empty-inner">
+      <div class="empty-brand">✦ Magic Video Editor</div>
+      <div class="dim">Create or select a project to start.</div>
+    </div></div>`;
+  }
+}
+
+function hideHome() {
+  const el = $("#home-view");
+  if (typeof window.HomeView !== "undefined" && window.HomeView?.unmount) {
+    try { window.HomeView.unmount(); }
+    catch (e) { console.error("HomeView failed to unmount", e); }
+  }
+  el.hidden = true;
+}
+
+function goHome() {
+  state.pid = null;
+  state.project = null;
+  state.tab = null;
+  state.queue = [];
+  state.runAllJob = null;
+  state.runAllItem = null;
+  closeDrawer();
+  closeSettings();
+  closeExportDialog();
+  closeActivityPopover();
+  document.title = "Magic Video Editor";
+  updateTopbarForProject();
+  showHome();
+  loadProjects();
 }
 
 async function refreshProject() {
@@ -109,6 +173,7 @@ async function refreshProject() {
     console.error("EditorUI failed to render — the rest of the app keeps working", e);
   }
   if (state.tab) renderTab();
+  refreshIcons();
 }
 
 function updateTopbarForProject() {
@@ -116,9 +181,12 @@ function updateTopbarForProject() {
   const runBtn = $("#run-all-btn");
   const rail = $("#icon-rail");
   const stageBar = $("#stage-bar");
+  const exportBtn = $("#export-btn");
   if (runBtn) runBtn.hidden = !has && !state.runAllJob;
   if (rail) rail.style.visibility = has ? "visible" : "hidden";
   if (stageBar) stageBar.style.visibility = has ? "visible" : "hidden";
+  if (exportBtn) exportBtn.hidden = !has;
+  if (!has) updateActivityChip();
 }
 
 /* ---------- stage bar + run pipeline ---------- */
@@ -144,7 +212,7 @@ async function runStage(stage) {
   try {
     await api(`/projects/${state.pid}/queue`, { method: "POST", body: { kind: `stage:${stage}` } });
     await pollQueue();
-    setTab("jobs");
+    openActivityPopover();
   } catch (e) {
     alert(e.message);
   }
@@ -180,9 +248,12 @@ function renderRunAllPanel() {
     // styling) and calls the cancel endpoint instead of starting a second
     // run. This button (and the panel below) lives OUTSIDE the editor grid
     // so it persists no matter which view/drawer is open (spec v3 bug fix).
-    btn.textContent = running ? "■ Stop" : "✦ Run pipeline";
+    btn.innerHTML = running
+      ? '<i data-lucide="square"></i> Stop'
+      : '<i data-lucide="sparkles"></i> Run pipeline';
     btn.onclick = running ? stopRunAll : runAll;
     btn.hidden = !state.pid;
+    refreshIcons();
   }
   if (!panel) return;
   if (!running) {
@@ -232,10 +303,10 @@ async function pollQueue() {
     try { state.jobs[state.runAllItem.job_id] = await api(`/jobs/${state.runAllItem.job_id}`); }
     catch (_e) { /* job may have just been cancelled/gc'd -- ignore */ }
   }
-  updateQueueBadge();
+  updateActivityChip();
   renderStageBar();
   renderRunAllPanel();
-  if (state.tab === "jobs") renderTab();
+  if (window.ActivityPopover?.isOpen()) window.ActivityPopover.render();
   if (state.project && (!state.runAllItem || state.runAllItem.status !== "running")) {
     // A run-all (or any stage) that just finished may have changed
     // stages/reels/etc -- pick that up without waiting for a manual action.
@@ -246,14 +317,28 @@ async function pollQueue() {
   }
 }
 
-function updateQueueBadge() {
-  const badge = $("#queue-badge");
-  if (!badge) return;
-  const pending = state.queue.filter((i) => i.status === "pending").length;
-  const running = state.queue.filter((i) => i.status === "running").length;
-  badge.hidden = !state.pid;
-  $("#queue-badge-count").textContent = pending + running;
-  badge.classList.toggle("active", running > 0);
+/* ---------- Activity chip (spec v5.4 §2) ----------
+   Ambient replacement for the old Queue badge: invisible while idle, shows
+   a spinner + the running item's label + its % while any queue item is
+   running/pending. Click opens the Background Tasks popover implemented in
+   ui/tabs/jobs.js (window.ActivityPopover). */
+
+function updateActivityChip() {
+  const chip = $("#activity-chip");
+  if (!chip) return;
+  if (!state.pid) { chip.hidden = true; return; }
+  const running = state.queue.find((i) => i.status === "running");
+  const pendingCount = state.queue.filter((i) => i.status === "pending").length;
+  const busy = !!running || pendingCount > 0;
+  chip.hidden = !busy;
+  if (!busy) return;
+  const label = running
+    ? (typeof queueKindLabel === "function" ? queueKindLabel(running.kind) : running.kind)
+    : `${pendingCount} queued`;
+  const job = running?.job_id ? state.jobs[running.job_id] : null;
+  const pct = running ? Math.round(((job?.progress ?? running.progress) || 0) * 100) : null;
+  $("#activity-chip-label").textContent = label;
+  $("#activity-chip-pct").textContent = pct === null ? "" : `${pct}%`;
 }
 
 function watchJob(jid) {
@@ -262,7 +347,7 @@ function watchJob(jid) {
   const poll = async () => {
     const job = await api(`/jobs/${jid}`);
     state.jobs[jid] = job;
-    if (state.tab === "jobs") renderTab();
+    if (window.ActivityPopover?.isOpen()) window.ActivityPopover.render();
     renderStageBar();
     renderRunAllPanel();
     if (job.status === "running") setTimeout(poll, 1200);
@@ -271,9 +356,70 @@ function watchJob(jid) {
   poll();
 }
 
-/* ---------- secondary-view drawer (Takes / Reels / Settings / Activity) ---------- */
+/* ---------- Export dialog (spec v5.4 §1) ----------
+   Small modal replacing the render buttons that used to live in the Queue
+   view: pick Final video / All reels / a specific reel, see the export
+   destination (settings.export_dir, click opens it in Finder), one primary
+   CTA enqueues the corresponding queue item(s) and closes. */
+
+async function openExportDialog() {
+  if (!state.pid) return;
+  const reels = state.project?.reels || [];
+  const sel = $("#export-reel-select");
+  sel.innerHTML = reels.length
+    ? reels.map((r) => `<option value="${r.id}">${esc(r.title || `Reel #${r.rank}`)}</option>`).join("")
+    : `<option value="">No reels yet</option>`;
+  $(`input[name="export-what"][value="final"]`).checked = true;
+  try {
+    const settings = await api("/settings");
+    state.settings = settings;
+    $("#export-dest-path").textContent = settings.export_dir;
+  } catch (_e) {
+    $("#export-dest-path").textContent = state.settings?.export_dir || "";
+  }
+  $("#export-overlay").hidden = false;
+  refreshIcons();
+}
+
+function closeExportDialog() {
+  const el = $("#export-overlay");
+  if (el) el.hidden = true;
+}
+
+async function runExport() {
+  const what = document.querySelector('input[name="export-what"]:checked')?.value || "final";
+  try {
+    if (what === "final") {
+      await api(`/projects/${state.pid}/queue`, { method: "POST", body: { kind: "final_render" } });
+    } else if (what === "reels") {
+      const reels = state.project?.reels || [];
+      if (!reels.length) { alert("No reels to export yet."); return; }
+      for (const r of reels) {
+        await api(`/projects/${state.pid}/queue`,
+          { method: "POST", body: { kind: `reel_render:${r.id}`, payload: { reel_id: r.id } } });
+      }
+    } else {
+      const rid = $("#export-reel-select").value;
+      if (!rid) { alert("No reel selected."); return; }
+      await api(`/projects/${state.pid}/queue`,
+        { method: "POST", body: { kind: `reel_render:${rid}`, payload: { reel_id: rid } } });
+    }
+    await pollQueue();
+    closeExportDialog();
+  } catch (e) {
+    alert(e.message);
+  }
+}
+
+/* ---------- secondary-view drawer (Takes / Reels / Settings) ---------- */
 
 function setTab(tab) {
+  // Back-compat: ui/tabs/reels.js (not owned by this task) still calls
+  // setTab("jobs") after enqueuing a reel render, from before the Queue
+  // drawer tab was replaced by the Activity chip/popover (spec v5.4). There
+  // is no "jobs" drawer pane anymore -- redirect to the popover instead of
+  // opening an empty drawer.
+  if (tab === "jobs") { window.ActivityPopover?.open(); return; }
   state.tab = tab;
   $("#drawer-overlay").hidden = false;
   document.querySelectorAll("[data-tab]").forEach((el) =>
@@ -317,14 +463,18 @@ function renderTab() {
     const el = $(`#tab-${state.tab}`);
     if (el) el.innerHTML = '<div class="dim">This view failed to render — see console.</div>';
   }
+  refreshIcons();
 }
 
-/* ---------- keyboard: Esc closes the drawer (editor shortcuts live in
-   ui/editor/timeline.js, which owns the timeline/player) ---------- */
+/* ---------- keyboard: Esc closes whichever overlay is open, innermost
+   first (editor shortcuts live in ui/editor/timeline.js, which owns the
+   timeline/player) ---------- */
 
 document.addEventListener("keydown", (e) => {
   if (e.key !== "Escape") return;
-  if (!$("#settings-overlay").hidden) closeSettings();
+  if (!$("#export-overlay").hidden) closeExportDialog();
+  else if (window.ActivityPopover?.isOpen()) window.ActivityPopover.close();
+  else if (!$("#settings-overlay").hidden) closeSettings();
   else if (state.tab) closeDrawer();
 });
 
@@ -338,7 +488,21 @@ async function boot() {
   });
   $("#settings-gear").onclick = openSettings;
   $("#settings-close").onclick = closeSettings;
-  $("#queue-badge").onclick = () => setTab("jobs");
+  $("#home-btn").onclick = goHome;
+
+  $("#export-btn").onclick = openExportDialog;
+  $("#export-close").onclick = closeExportDialog;
+  $("#export-cta").onclick = runExport;
+  $("#export-overlay").addEventListener("click", (e) => {
+    if (e.target.id === "export-overlay") closeExportDialog();
+  });
+  $("#export-dest").onclick = async () => {
+    const path = state.settings?.export_dir || $("#export-dest-path").textContent;
+    if (!path) return;
+    try { await api("/open-folder", { method: "POST", body: { path } }); }
+    catch (e) { alert(e.message); }
+  };
+  $("#activity-chip").onclick = () => window.ActivityPopover?.toggle();
 
   $("#new-project").onclick = async () => {
     const name = prompt("Project name:");
@@ -366,5 +530,7 @@ async function boot() {
   updateTopbarForProject();
   const list = await loadProjects();
   if (list.length === 1) await selectProject(list[0].id);
+  else showHome();
+  refreshIcons();
 }
 boot();

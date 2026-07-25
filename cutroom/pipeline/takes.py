@@ -151,6 +151,67 @@ def _transcript_cleanup(log, clip_sentences: list[dict]) -> set[str]:
     return cut_ids
 
 
+SEQUENCER_WINDOW_SIZE = 12
+SEQUENCER_WINDOW_OVERLAP = 2
+
+
+def _take_sequencer_window(
+    log, clip_sentences: list[dict], window: list[dict], start_idx: int
+) -> set[str]:
+    """Ask the take_sequencer agent for stuck-take runs inside this window.
+    Sentences are numbered 1..len(window) with their timestamp and the gap
+    (seconds of silence) before them, computed against the FULL per-clip
+    sequence so the gap is meaningful even at a window boundary. Fail-open:
+    on any error, log and return an empty set for this window only."""
+    from ..agents.agents import get_agent
+
+    lines = []
+    for i, s in enumerate(window):
+        global_idx = start_idx + i
+        gap = 0.0
+        if global_idx > 0:
+            gap = max(0.0, s["start"] - clip_sentences[global_idx - 1]["end"])
+        lines.append(f'{i + 1} ({gap:.1f}s): "{s["text"]}"')
+    numbered = "\n".join(lines)
+    try:
+        result = get_agent("take_sequencer").run_sync(
+            "Sliding window of consecutive sentences from one clip "
+            f"(id, gap before, text):\n{numbered}"
+        ).output
+        cut: set[str] = set()
+        for run in result.cut_runs:
+            a, b = run.start_id, run.end_id
+            if a > b:
+                a, b = b, a
+            for n in range(a, b + 1):
+                idx = n - 1
+                if 0 <= idx < len(window):
+                    cut.add(window[idx]["id"])
+        return cut
+    except Exception as exc:
+        log(f"take_sequencer window failed, skipping: {exc}")
+        return set()
+
+
+def _take_sequencer_clip(log, clip_sentences: list[dict]) -> set[str]:
+    """Slide a ~12-sentence, 2-sentence-overlap window over one clip's
+    sentences and union the stuck-take-run cut ids the take_sequencer agent
+    flags across all windows."""
+    if not clip_sentences:
+        return set()
+    cut_ids: set[str] = set()
+    step = SEQUENCER_WINDOW_SIZE - SEQUENCER_WINDOW_OVERLAP
+    i = 0
+    n = len(clip_sentences)
+    while i < n:
+        window = clip_sentences[i : i + SEQUENCER_WINDOW_SIZE]
+        cut_ids |= _take_sequencer_window(log, clip_sentences, window, i)
+        if i + SEQUENCER_WINDOW_SIZE >= n:
+            break
+        i += step
+    return cut_ids
+
+
 def _compute_topic(log, sentences: list[dict]) -> str:
     """Cheap agent call over the (truncated) full transcript: one-line video
     topic, used to judge out-of-context asides and cross-clip duplicates.
@@ -334,6 +395,7 @@ def run(log, project: dict) -> None:
     # when ollama is down.
     topic = ""
     cleaner_cut_ids: set[str] = set()
+    sequencer_cut_ids: set[str] = set()
     context_cut_ids: set[str] = set()
     if llm.available():
         log("Summarizing video topic...")
@@ -349,6 +411,17 @@ def run(log, project: dict) -> None:
             cleaner_cut_ids |= _transcript_cleanup(log, clip_sentences)
         if cleaner_cut_ids:
             log(f"transcript cleaner flagged {len(cleaner_cut_ids)} sentence(s)")
+
+        # v5.6 take_sequencer: sliding-window pass over stuck take RUNS
+        # (halting/repeated attempts ending in a self-encouragement marker,
+        # or the same line repeated many times) that the per-sentence
+        # cleaner above can miss because no single sentence looks wrong in
+        # isolation. Runs AFTER the cleaner, BEFORE fuzzy dedup clustering.
+        log("Running take sequencer (stuck take runs)...")
+        for clip_sentences in by_clip.values():
+            sequencer_cut_ids |= _take_sequencer_clip(log, clip_sentences)
+        if sequencer_cut_ids:
+            log(f"take sequencer flagged {len(sequencer_cut_ids)} sentence(s)")
 
         if topic:
             log("Running context pass (out-of-context asides)...")
@@ -411,12 +484,15 @@ def run(log, project: dict) -> None:
                 )
 
     # Apply the transcript-cleaner verdicts (restart markers / abandoned
-    # takes / bloopers, then out-of-context asides) — after scoring/dedup so
-    # nothing re-flips them.
+    # takes / bloopers, then stuck take runs, then out-of-context asides) —
+    # after scoring/dedup so nothing re-flips them.
     for s in sentences:
         if s["id"] in cleaner_cut_ids:
             s["kept"] = False
             s["reason"] = "restart/abandoned take (AI)"
+        elif s["id"] in sequencer_cut_ids:
+            s["kept"] = False
+            s["reason"] = "stuck take run (AI)"
         elif s["id"] in context_cut_ids:
             s["kept"] = False
             s["reason"] = "out-of-context aside (AI)"

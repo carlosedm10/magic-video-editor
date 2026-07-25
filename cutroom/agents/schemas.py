@@ -24,6 +24,32 @@ class TranscriptCleanup(BaseModel):
     reason: str = Field(default="", description="One-line rationale for the cuts")
 
 
+class CutRun(BaseModel):
+    """One contiguous run of sentence ids to cut as a single stuck/repeated
+    take (v5.6 take_sequencer). Flat object, held in a short list -- NOT a
+    deeply nested/batch schema, small models handle a short list of flat
+    objects fine."""
+
+    start_id: int = Field(..., description="First sentence number (inclusive) of the run to cut")
+    end_id: int = Field(..., description="Last sentence number (inclusive) of the run to cut")
+    reason: str = Field(default="", description="One-line rationale for this run")
+
+
+class TakeSequencer(BaseModel):
+    """Sliding-window verdict over ~12 consecutive sentences: contiguous runs
+    of failed/halting attempts at the same line (optionally ending in a
+    self-encouragement marker like 'venga ya' / 'ahora sí') that are
+    superseded by a later clean take in the SAME window, or the same line
+    repeated many times without a marker. At most ~4 runs per window."""
+
+    cut_runs: list[CutRun] = Field(
+        default_factory=list,
+        max_length=4,
+        description="Contiguous sentence-id runs to cut as stuck/repeated takes. "
+        "Empty list if nothing in this window qualifies.",
+    )
+
+
 class VideoTopic(BaseModel):
     """One-line topic summary of a video's transcript, used to judge whether a
     sentence is an out-of-context aside. Flat and cheap on purpose — a small

@@ -1,0 +1,94 @@
+/* Export flow + Activity chip/popover (spec v5.4). Owned by the EXPORTUX
+   agent alongside core.js/index.html/tabs/jobs.js. Reuses the CSS
+   variables defined in ui/style.css's :root (--bg, --panel, --border,
+   --accent, --warn, --danger, --text, --dim, etc.) so it stays in the
+   garnet/navy brand without redefining tokens. */
+
+/* ---------- top-bar home icon ---------- */
+
+.topbar-icon { font-size: 15px; flex-shrink: 0; }
+
+/* ---------- Export button + dialog ---------- */
+
+.export-btn { flex-shrink: 0; white-space: nowrap; }
+
+.export-overlay {
+  position: fixed; inset: 0; z-index: 60;
+  background: rgba(2, 3, 7, .55);
+  display: flex; align-items: center; justify-content: center;
+}
+.export-dialog {
+  width: min(380px, 92vw);
+  margin: 0;
+}
+.export-head { margin-bottom: 6px; }
+.export-body { display: flex; flex-direction: column; gap: 2px; margin: 8px 0 12px; }
+.export-radio-row {
+  display: flex; align-items: center; gap: 8px;
+  padding: 8px 6px; border-radius: 10px; cursor: pointer; font-size: 13px;
+}
+.export-radio-row:hover { background: var(--panel2); }
+.export-radio-row input[type=radio] { accent-color: var(--accent); flex-shrink: 0; }
+.export-radio-reel { flex-wrap: wrap; }
+.export-reel-select { margin-left: auto; max-width: 190px; }
+.export-radio-row:has(input:not(:checked)) .export-reel-select { opacity: .5; }
+
+.export-dest {
+  display: flex; align-items: center; gap: 8px; width: 100%;
+  background: var(--panel2); border: 1px solid var(--border); border-radius: 10px;
+  padding: 8px 10px; cursor: pointer; color: var(--text); text-align: left;
+  font: inherit; margin-bottom: 12px;
+}
+.export-dest:hover { border-color: var(--accent); }
+.export-dest-path {
+  font-size: 11.5px; color: var(--dim); overflow: hidden; text-overflow: ellipsis;
+  white-space: nowrap; flex: 1;
+}
+.export-foot { margin-top: 2px; }
+
+/* ---------- Activity chip (ambient, hidden while idle) ---------- */
+
+.activity-chip {
+  display: flex; align-items: center; gap: 6px; flex-shrink: 0; white-space: nowrap;
+  background: var(--panel2); border: 1px solid var(--warn); color: var(--warn);
+  border-radius: 999px; padding: 5px 12px; font-size: 12px; cursor: pointer;
+}
+.activity-chip:hover { border-color: var(--accent-hover); }
+/* spec v5.5: a real loader-2 Lucide icon (see index.html) sized down to the
+   chip's compact scale and spun via the shared `activity-spin` keyframes
+   (defined once in ui/style.css, reused here). */
+.activity-spinner { width: 13px; height: 13px; animation: activity-spin .7s linear infinite; }
+@media (prefers-reduced-motion: reduce) {
+  .activity-spinner { animation: none; opacity: .6; }
+}
+.activity-chip-label { max-width: 160px; overflow: hidden; text-overflow: ellipsis; }
+.activity-chip-pct { font-variant-numeric: tabular-nums; font-weight: 700; }
+
+/* ---------- Background Tasks popover ---------- */
+
+.activity-popover {
+  position: fixed; top: 62px; right: 16px; z-index: 55;
+  width: 380px; max-width: calc(100vw - 32px);
+  background: var(--panel); backdrop-filter: blur(20px); -webkit-backdrop-filter: blur(20px);
+  border: 1px solid var(--border); border-radius: 14px;
+  box-shadow: 0 12px 40px rgba(0, 0, 0, .4);
+  max-height: min(70vh, 640px); overflow-y: auto;
+}
+.activity-popover-inner { padding: 12px; display: flex; flex-direction: column; gap: 12px; }
+.activity-heading { font-size: 12px; text-transform: uppercase; letter-spacing: .03em; color: var(--dim); }
+.activity-section { display: flex; flex-direction: column; gap: 6px; }
+
+.activity-row {
+  padding: 8px 6px; border-radius: 10px; border-bottom: 1px solid var(--border);
+}
+.activity-row:last-child { border-bottom: none; }
+.activity-row-pending:hover { background: var(--panel2); }
+.activity-row-pending.dragging { opacity: .5; }
+
+.activity-details-toggle { margin-top: 4px; }
+.activity-log {
+  max-height: 160px; overflow-y: auto; margin-top: 6px;
+}
+
+/* Last-3-finished rows read subtler than running/pending. */
+.activity-section:last-child .activity-row { opacity: .75; }

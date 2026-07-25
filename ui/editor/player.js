@@ -132,8 +132,11 @@ const Player = {
   _updateModeButton() {
     const btn = document.getElementById("pp-mode-toggle");
     if (!btn) return;
-    btn.textContent = this.mode === "preview" ? "🎬 Preview" : "◎ Draft";
+    btn.innerHTML = this.mode === "preview"
+      ? '<i data-lucide="clapperboard"></i> Preview'
+      : '<i data-lucide="pencil"></i> Draft';
     btn.classList.toggle("active", this.mode === "preview");
+    refreshIcons();
   },
 
   /* ---------- mode switching (spec v4 §3) ---------- */
@@ -308,14 +311,14 @@ const Player = {
       this._active().play().catch(() => {});
     }
     const btn = document.getElementById("pp-playpause");
-    if (btn) btn.textContent = "⏸";
+    if (btn) { btn.innerHTML = '<i data-lucide="pause"></i>'; refreshIcons(); }
   },
   pause() {
     this.playing = false;
     if (this.mode === "preview") this._previewVideo?.pause();
     else this._active()?.pause();
     const btn = document.getElementById("pp-playpause");
-    if (btn) btn.textContent = "▶";
+    if (btn) { btn.innerHTML = '<i data-lucide="play"></i>'; refreshIcons(); }
   },
   togglePlay() { this.playing ? this.pause() : this.play(); },
 

@@ -55,7 +55,11 @@ const _sfs = {
   libResults: null,
   libLive: null,
   libRamGb: null,
+  libCurated: false,
   libError: null,
+  recommendation: null,
+  recommendationError: null,
+  lazyTags: {}, // model name -> {loading, tags, live, error}
   pullJobs: {}, // model -> job dict (while installing)
   polling: new Set(),
 };
@@ -123,6 +127,16 @@ function _injectStyleOnce() {
       padding:9px 0; border-top:1px solid var(--border);
     }
     .sfs-installed-row:first-child { border-top:none; }
+    .sfs-reco-row { display:flex; gap:14px; margin-top:12px; }
+    .sfs-reco-card {
+      flex:1 1 0; border:1px solid var(--border); border-radius:12px; padding:16px;
+      display:flex; flex-direction:column; gap:8px; background:var(--panel2);
+    }
+    .sfs-reco-kicker { font-size:11.5px; font-weight:700; letter-spacing:0.04em; text-transform:uppercase; color:var(--dim); }
+    .sfs-reco-model { font-weight:700; font-size:15px; }
+    .sfs-reco-why { font-size:12.5px; color:var(--dim); line-height:1.5; flex:1 1 auto; }
+    .sfs-reco-meta { font-size:12px; color:var(--dim); }
+    .sfs-section-heading { font-size:13px; font-weight:600; margin:4px 0 2px; color:var(--dim); }
     .sfs-progress { height:6px; border-radius:4px; background:var(--panel2); overflow:hidden; margin-top:4px; }
     .sfs-progress-fill { height:100%; background:var(--accent2); transition:width .2s; }
     .sfs-about-row { display:flex; justify-content:space-between; gap:16px; padding:8px 0; border-top:1px solid var(--border); font-size:13.5px; }
@@ -385,7 +399,8 @@ function _sfsRenderModels(host) {
       <div class="sfs-label">Get more models</div>
       <div class="sfs-guide">Models run 100% locally via Ollama — nothing leaves this Mac.
         Search below, check the fit for your machine's RAM, and install.</div>
-      <div class="sfs-row" style="margin-top:10px">
+      <div id="sfs-reco-block" style="margin-top:14px">${_sfsRecommendationHtml()}</div>
+      <div class="sfs-row" style="margin-top:16px">
         <input type="text" class="sfs-input" id="sfs-lib-search" placeholder="Search models… (e.g. qwen, llama, gemma)"
           value="${esc(_sfs.libQuery)}" />
         <button class="sfs-btn" id="sfs-lib-search-btn">Search</button>
@@ -426,7 +441,74 @@ function _sfsRenderModels(host) {
   if (_sfs.libResults !== null) _sfsRenderLibraryResults();
   else _sfsSearchLibrary("");
 
+  if (_sfs.recommendation !== null || _sfs.recommendationError) _sfsAttachRecommendationHandlers();
+  else _sfsLoadRecommendation();
+
   _sfsAttachDeleteHandlers();
+}
+
+/* ---------- Recommendation block ---------- */
+
+function _sfsIsInstalled(modelRef) {
+  return _sfs.models.some((m) => m.name === modelRef);
+}
+
+function _sfsRecoCardHtml(kicker, pick) {
+  if (!pick) return "";
+  const modelRef = pick.model;
+  const installed = _sfsIsInstalled(modelRef);
+  const job = _sfs.pullJobs[modelRef];
+  const installing = job && job.status === "running";
+  const pct = job ? Math.round((job.progress || 0) * 100) : 0;
+  return `
+    <div class="sfs-reco-card">
+      <div class="sfs-reco-kicker">${esc(kicker)}</div>
+      <div class="sfs-reco-model">${esc(modelRef)}</div>
+      <div class="sfs-reco-meta">${pick.size_gb != null ? pick.size_gb + "GB" : ""}</div>
+      <div class="sfs-reco-why">${esc(pick.why || "")}</div>
+      <button class="sfs-btn ${installed ? "" : "primary"}" style="align-self:flex-start"
+        data-pull-model="${esc(modelRef)}" ${installed || installing ? "disabled" : ""}>
+        ${installed ? "Installed ✓" : (installing ? `${pct}%` : "Install")}
+      </button>
+      ${installing ? `<div class="sfs-progress"><div class="sfs-progress-fill" style="width:${pct}%"></div></div>` : ""}
+    </div>`;
+}
+
+function _sfsRecommendationHtml() {
+  if (_sfs.recommendationError) return "";
+  if (!_sfs.recommendation) return `<div class="sfs-hint">Checking your Mac's hardware…</div>`;
+  const r = _sfs.recommendation;
+  return `
+    <div class="sfs-guide" style="margin:0 0 2px">Tu Mac: <strong>${esc(r.chip)}</strong>, ${r.ram_gb}GB</div>
+    <div class="sfs-reco-row">
+      ${_sfsRecoCardHtml("Best overall", r.best_overall)}
+      ${_sfsRecoCardHtml("Optimal para este Mac", r.optimal)}
+    </div>`;
+}
+
+async function _sfsLoadRecommendation() {
+  try {
+    _sfs.recommendation = await api("/ollama/recommendation");
+    _sfs.recommendationError = null;
+  } catch (e) {
+    _sfs.recommendation = null;
+    _sfs.recommendationError = e.message;
+  }
+  const box = $("#sfs-reco-block");
+  if (box) box.innerHTML = _sfsRecommendationHtml();
+  _sfsAttachRecommendationHandlers();
+}
+
+function _sfsAttachRecommendationHandlers() {
+  const box = $("#sfs-reco-block");
+  if (!box) return;
+  box.querySelectorAll("[data-pull-model]").forEach((btn) => {
+    btn.onclick = () => _sfsPullModel(btn.dataset.pullModel, () => {
+      const b = $("#sfs-reco-block");
+      if (b) b.innerHTML = _sfsRecommendationHtml();
+      _sfsAttachRecommendationHandlers();
+    });
+  });
 }
 
 function _sfsInstalledListHtml() {
@@ -448,6 +530,7 @@ async function _sfsSearchLibrary(q) {
     _sfs.libResults = res.models;
     _sfs.libLive = res.live;
     _sfs.libRamGb = res.ram_gb;
+    _sfs.libCurated = !!res.curated;
     _sfs.libError = null;
   } catch (e) {
     _sfs.libResults = [];
@@ -466,18 +549,25 @@ function _sfsRenderLibraryResults() {
   const notice = _sfs.libLive === false
     ? `<div class="sfs-hint" style="color:var(--warn)">Showing the offline curated catalog (couldn't reach ollama.com).</div>`
     : "";
+  const heading = (_sfs.libCurated && !_sfs.libQuery)
+    ? `<div class="sfs-section-heading">Populares</div>` : "";
   if (!_sfs.libResults.length) {
-    box.innerHTML = notice + `<div class="sfs-hint">No matches.</div>`;
+    box.innerHTML = notice + heading + `<div class="sfs-hint">No matches.</div>`;
     return;
   }
-  box.innerHTML = notice + _sfs.libResults.map((m) => `
+  box.innerHTML = notice + heading + _sfs.libResults.map((m) => {
+    const lazy = _sfs.lazyTags[m.name];
+    const tags = (lazy && lazy.tags) ? lazy.tags : m.tags;
+    const showLoadAffordance = (!tags || !tags.length) && !(lazy && lazy.loading);
+    return `
     <div class="sfs-lib-card">
       <div class="sfs-lib-name">${esc(m.name)}</div>
       ${m.description ? `<div class="sfs-lib-desc">${esc(m.description)}</div>` : ""}
       <div class="sfs-tag-row">
-        ${m.tags.map((t) => {
+        ${(tags || []).map((t) => {
           const compat = COMPAT_INFO[t.compatibility];
           const modelRef = `${m.name}:${t.tag}`;
+          const installed = _sfsIsInstalled(modelRef);
           const job = _sfs.pullJobs[modelRef];
           const installing = job && job.status === "running";
           const pct = job ? Math.round((job.progress || 0) * 100) : 0;
@@ -489,31 +579,51 @@ function _sfsRenderLibraryResults() {
                 <span class="sfs-chip-dot" style="background:${compat.color}"></span>
                 <span style="color:${compat.color}">${compat.label}</span></span>` : ""}
               <button class="sfs-btn" style="padding:4px 10px;font-size:12px" data-pull-model="${esc(modelRef)}"
-                ${installing ? "disabled" : ""}>${installing ? `${pct}%` : (job && job.status === "done" ? "Installed" : "Install")}</button>
+                ${installed || installing ? "disabled" : ""}>${installed ? "Installed ✓" : (installing ? `${pct}%` : "Install")}</button>
             </div>
             ${installing ? `<div class="sfs-progress"><div class="sfs-progress-fill" style="width:${pct}%"></div></div>` : ""}
           </div>`;
         }).join("")}
+        ${lazy && lazy.loading ? `<div class="sfs-hint">Loading sizes…</div>` : ""}
+        ${lazy && lazy.error ? `<div class="sfs-hint" style="color:var(--warn)">Couldn't load sizes: ${esc(lazy.error)}</div>` : ""}
+        ${showLoadAffordance ? `<button class="sfs-btn" style="padding:4px 10px;font-size:12px" data-load-tags="${esc(m.name)}">Load sizes</button>` : ""}
       </div>
-    </div>`).join("");
+    </div>`;
+  }).join("");
 
   box.querySelectorAll("[data-pull-model]").forEach((btn) => {
     btn.onclick = () => _sfsPullModel(btn.dataset.pullModel);
   });
+  box.querySelectorAll("[data-load-tags]").forEach((btn) => {
+    btn.onclick = () => _sfsLoadTags(btn.dataset.loadTags);
+  });
 }
 
-async function _sfsPullModel(modelRef) {
+async function _sfsLoadTags(name) {
+  _sfs.lazyTags[name] = { loading: true };
+  _sfsRenderLibraryResults();
+  try {
+    const res = await api(`/ollama/library/${encodeURIComponent(name)}/tags`);
+    _sfs.lazyTags[name] = { loading: false, tags: res.tags };
+  } catch (e) {
+    _sfs.lazyTags[name] = { loading: false, error: e.message };
+  }
+  _sfsRenderLibraryResults();
+}
+
+async function _sfsPullModel(modelRef, onProgress) {
   try {
     const { job_id } = await api("/ollama/pull", { method: "POST", body: { model: modelRef } });
     _sfs.pullJobs[modelRef] = { status: "running", progress: 0 };
     _sfsRenderLibraryResults();
-    _sfsWatchPullJob(job_id, modelRef);
+    if (onProgress) onProgress();
+    _sfsWatchPullJob(job_id, modelRef, onProgress);
   } catch (e) {
     alert(`Couldn't start install: ${e.message}`);
   }
 }
 
-function _sfsWatchPullJob(jobId, modelRef) {
+function _sfsWatchPullJob(jobId, modelRef, onProgress) {
   if (_sfs.polling.has(jobId)) return;
   _sfs.polling.add(jobId);
   const poll = async () => {
@@ -525,7 +635,10 @@ function _sfsWatchPullJob(jobId, modelRef) {
       return;
     }
     _sfs.pullJobs[modelRef] = job;
-    if (_sfs.section === "models") _sfsRenderLibraryResults();
+    if (_sfs.section === "models") {
+      _sfsRenderLibraryResults();
+      if (onProgress) onProgress();
+    }
     if (job.status === "running") {
       setTimeout(poll, 1200);
     } else {
@@ -541,6 +654,7 @@ function _sfsWatchPullJob(jobId, modelRef) {
         if (list) list.innerHTML = _sfsInstalledListHtml();
         _sfsAttachDeleteHandlers();
         _sfsRenderLibraryResults();
+        if (onProgress) onProgress();
       }
       if (job.status === "error") alert(`Install failed: ${job.error || "unknown error"}`);
     }

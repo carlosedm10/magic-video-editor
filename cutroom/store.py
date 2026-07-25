@@ -34,6 +34,7 @@ def new_project(name: str) -> dict:
         "renders": [],
         "reels": [],
         "stages": {},  # stage name -> {"status": "done"|"error", "at": ts, "detail": str}
+        "workflow_status": "todo",  # manual, user-set: todo|in_progress|done|uploaded
     }
     _pdir(project["id"]).mkdir(parents=True, exist_ok=True)
     (_pdir(project["id"]) / "work").mkdir(exist_ok=True)
@@ -84,6 +85,20 @@ def load(project_id: str) -> dict:
     return json.loads(_pfile(project_id).read_text())
 
 
+def processing_level(project: dict) -> str:
+    """AUTOMATIC status derived from stages/queue (v5.2): "finalizado" once
+    the render stage is done, "en_proceso" once any stage has completed or
+    the project's queue has a pending/running item, else "por_empezar"."""
+    stages = project.get("stages", {})
+    if stages.get("render", {}).get("status") == "done":
+        return "finalizado"
+    any_done = any(s.get("status") == "done" for s in stages.values())
+    queue_busy = any(i.get("status") in ("pending", "running") for i in project.get("queue", []))
+    if any_done or queue_busy:
+        return "en_proceso"
+    return "por_empezar"
+
+
 def list_projects() -> list[dict]:
     config.ensure_dirs()
     out = []
@@ -98,6 +113,8 @@ def list_projects() -> list[dict]:
                     "created_at": p["created_at"],
                     "clips": len(p["clips"]),
                     "stages": p.get("stages", {}),
+                    "workflow_status": p.get("workflow_status", "todo"),
+                    "processing_level": processing_level(p),
                 }
             )
     return out

@@ -28,12 +28,12 @@
 window.EditorUI = window.EditorUI || {};
 
 const INSP_TABS = [
-  ["video", "🎬", "Video"],
-  ["color", "🎨", "Color"],
-  ["audio", "🔊", "Audio"],
-  ["subs", "💬", "Subs"],
-  ["fx", "✨", "FX"],
-  ["ideas", "💡", "Ideas"],
+  ["video", "video", "Video"],
+  ["color", "palette", "Color"],
+  ["audio", "volume-2", "Audio"],
+  ["subs", "captions", "Subs"],
+  ["fx", "wand-2", "FX"],
+  ["ideas", "lightbulb", "Ideas"],
 ];
 
 function _ensureInspectorStyles() {
@@ -105,6 +105,7 @@ const Inspector = {
     } catch (e) {
       console.error("Suggestions panel failed to mount", e);
     }
+    refreshIcons();
   },
 
   _buildShell() {
@@ -114,7 +115,7 @@ const Inspector = {
       <nav class="insp-tabs" id="insp-tabs">
         ${INSP_TABS.map(([key, icon, label]) => `
           <button class="insp-tab" data-insp-tab="${key}" title="${label}">
-            <span class="insp-tab-icon">${icon}</span><span>${label}</span>
+            <span class="insp-tab-icon"><i data-lucide="${icon}"></i></span><span>${label}</span>
           </button>`).join("")}
       </nav>
       <div class="insp-tabpanels" id="insp-tabpanels">

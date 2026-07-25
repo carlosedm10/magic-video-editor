@@ -22,6 +22,7 @@ from .prompts import (
     REEL_SCORER_SYSTEM_PROMPT,
     REVIEWER_SYSTEM_PROMPT,
     TAKE_JUDGE_SYSTEM_PROMPT,
+    TAKE_SEQUENCER_SYSTEM_PROMPT,
     TRANSCRIPT_CLEANER_SYSTEM_PROMPT,
     VIDEO_TOPIC_SYSTEM_PROMPT,
 )
@@ -33,6 +34,7 @@ from .schemas import (
     ReelScore,
     ReviewFindings,
     TakePick,
+    TakeSequencer,
     TranscriptCleanup,
     VideoTopic,
 )
@@ -53,6 +55,10 @@ AGENT_SPECS: dict[str, dict] = {
     "transcript_cleaner": {
         "prompt": TRANSCRIPT_CLEANER_SYSTEM_PROMPT,
         "output_type": TranscriptCleanup,
+    },
+    "take_sequencer": {
+        "prompt": TAKE_SEQUENCER_SYSTEM_PROMPT,
+        "output_type": TakeSequencer,
     },
     "reviewer": {"prompt": REVIEWER_SYSTEM_PROMPT, "output_type": ReviewFindings},
     "video_topic": {"prompt": VIDEO_TOPIC_SYSTEM_PROMPT, "output_type": VideoTopic},

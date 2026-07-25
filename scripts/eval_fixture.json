@@ -1,0 +1,71 @@
+{
+  "_comment": "Labeled fixture for scripts/eval_takes.py (v5.6 AI take-quality v3). Cases tagged 'source: real' copy sentence TEXT verbatim (read-only) from the real project c7642fc7755e, clip 3a3814cd (a fitness/gym-routine video), hand-labeled by inspecting project.json against the owner's two reported misses: repeated same-content takes kept, and stuck runs ending in a self-encouragement/restart marker kept. 'gap' is the real inter-sentence silence in seconds (start of this sentence minus end of the previous one), taken from project.json timestamps. 'expected_cut' lists the 1-based sentence numbers (within THIS case) that should be cut; every other number in the case is expected to be KEPT.",
+  "cases": [
+    {
+      "id": "repeated_no_marker_real_1",
+      "category": "repeated_no_marker",
+      "source": "real:c7642fc7755e:3a3814cd sentences #1-4 (ids 4815ab7b,d965f0f1,75f60e81,43d45ab2)",
+      "note": "d965f0f1 and 75f60e81 restate the same point ('lo mas importante...objetivo/punto de partida') worded differently, 1.8s apart, no restart marker -- currently BOTH kept in the real project. rapidfuzz token_sort_ratio between them is ~75, below the DUP_SIMILARITY=82 fuzzy-dedup threshold, so only semantic judgement catches this.",
+      "sentences": [
+        {"n": 1, "gap": 0.0, "text": "¿Cómo podemos empezar a plantear una rutina?"},
+        {"n": 2, "gap": 0.3, "text": "Lo más importante que tienes que saber es el objetivo que tú tienes que buscar y desde qué punto de partida empiezas."},
+        {"n": 3, "gap": 1.8, "text": "Lo más importante es saber qué objetivos tienes y cuál es tu punto de partida."},
+        {"n": 4, "gap": 0.8, "text": "Una vez sabiendo eso, lo primero que tienes que hacer es una evaluación de tu estado."}
+      ],
+      "expected_cut": [2]
+    },
+    {
+      "id": "stuck_run_marker_real_1",
+      "category": "stuck_run_marker",
+      "source": "real:c7642fc7755e:3a3814cd sentences #24-26 (ids 14f3eb45,dd2c65ac,b4dc2997)",
+      "note": "dd2c65ac is a halting attempt that trails off and ends in a self-correction marker ('perdon, repito') immediately followed by the clean retake in b4dc2997 -- currently KEPT in the real project (a miss). #1 (14f3eb45) is short unrelated lead-in context, expected kept.",
+      "sentences": [
+        {"n": 1, "gap": 0.2, "text": "Empieza con una máquina, siempre."},
+        {"n": 2, "gap": 0.0, "text": "Siempre empieza con una máquina, porque al principio, cuando vienes de no entrenar nunca, perdón, repito."},
+        {"n": 3, "gap": 0.6, "text": "Al principio, cuando vienes de no entrenar, es normal que tengas músculos que no sean los principales que tienen que atacar ese ejercicio, pero que realmente sean aquellos que..."}
+      ],
+      "expected_cut": [2]
+    },
+    {
+      "id": "mistake_reaction_regression_real_1",
+      "category": "mistake_reaction_regression",
+      "source": "real:c7642fc7755e:3a3814cd sentences #27-29 (ids def5cdc0,102a77ea,ac35322c)",
+      "note": "REGRESSION GUARD, not a miss: the existing transcript_cleaner already cuts these three short mistake-reaction/restart markers correctly in the real project. Kept in the fixture so future prompt changes must keep this green (per PLATFORM-SPEC v5.6 point 4).",
+      "sentences": [
+        {"n": 1, "gap": 0.6, "text": "Siempre empieza con una máquina, porque al principio, cuando vienes de no entrenar nunca, perdón, repito."},
+        {"n": 2, "gap": 0.6, "text": "Joder, nada."},
+        {"n": 3, "gap": 0.9, "text": "Repito."},
+        {"n": 4, "gap": 0.7, "text": "Vale."}
+      ],
+      "expected_cut": [2, 3, 4]
+    },
+    {
+      "id": "venga_ya_synthetic_1",
+      "category": "venga_ya_synthetic",
+      "source": "synthetic",
+      "note": "Synthetic case for the exact owner-reported pattern: halting fragment, then 'venga ya, va', then the clean retake.",
+      "sentences": [
+        {"n": 1, "gap": 0.0, "text": "Vale, hoy quiero hablaros de la alimentación post-entreno."},
+        {"n": 2, "gap": 0.4, "text": "La alimentación post... a ver, un momento."},
+        {"n": 3, "gap": 0.3, "text": "Venga ya, va."},
+        {"n": 4, "gap": 0.5, "text": "La alimentación post-entreno es clave para la recuperación muscular."},
+        {"n": 5, "gap": 1.0, "text": "Necesitas proteína e hidratos en las siguientes dos horas."}
+      ],
+      "expected_cut": [2, 3]
+    },
+    {
+      "id": "venga_ya_synthetic_2",
+      "category": "venga_ya_synthetic",
+      "source": "synthetic",
+      "note": "Synthetic case for the 'ahora sí que sí' variant of the same pattern.",
+      "sentences": [
+        {"n": 1, "gap": 0.0, "text": "Bien, el segundo punto es la hidratación durante el entrenamiento."},
+        {"n": 2, "gap": 0.6, "text": "Otra vez, joder, empiezo mal."},
+        {"n": 3, "gap": 0.3, "text": "Ahora sí que sí."},
+        {"n": 4, "gap": 0.4, "text": "El segundo punto es la hidratación durante el entrenamiento: bebe agua cada 15-20 minutos."},
+        {"n": 5, "gap": 1.0, "text": "Esto evita calambres y bajones de rendimiento."}
+      ],
+      "expected_cut": [2, 3]
+    }
+  ]
+}

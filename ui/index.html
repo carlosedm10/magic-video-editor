@@ -5,12 +5,15 @@
 <title>Magic Video Editor</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <link rel="stylesheet" href="/ui/style.css">
+<link rel="stylesheet" href="/ui/home.css">
+<link rel="stylesheet" href="/ui/exportux.css">
 </head>
 <body>
 <canvas id="fx"></canvas>
 <div id="app">
 
   <header id="topbar">
+    <button id="home-btn" class="icon-btn topbar-icon" title="Home"><i data-lucide="home"></i></button>
     <div class="brand">
       <span class="brand-mark">✦ Magic Video Editor</span>
       <span class="brand-sub">by carlosedm10</span>
@@ -22,38 +25,37 @@
       <button id="new-project" class="btn small">＋ New</button>
     </div>
     <div id="stage-bar" class="stage-bar"></div>
-    <button id="run-all-btn" class="btn primary run-all-btn" hidden>✦ Run pipeline</button>
-    <button id="queue-badge" class="btn small queue-badge" hidden title="Open Queue">🧵 Queue <span id="queue-badge-count">0</span></button>
+    <button id="run-all-btn" class="btn primary run-all-btn" hidden><i data-lucide="sparkles"></i> Run pipeline</button>
     <div class="rail" id="icon-rail">
-      <button class="rail-btn" data-tab="takes" title="Takes">🎬<span>Takes</span></button>
-      <button class="rail-btn" data-tab="reels" title="Reels">📱<span>Reels</span></button>
-      <button class="rail-btn" data-tab="jobs" title="Queue">🧵<span>Queue</span></button>
+      <button class="rail-btn" data-tab="takes" title="Takes"><i data-lucide="list-checks"></i><span>Takes</span></button>
+      <button class="rail-btn" data-tab="reels" title="Reels"><i data-lucide="clapperboard"></i><span>Reels</span></button>
     </div>
+    <button id="export-btn" class="btn primary small export-btn" hidden><i data-lucide="download"></i> Export</button>
+    <button id="activity-chip" class="activity-chip" hidden title="Background tasks">
+      <i data-lucide="loader-2" class="activity-spinner"></i>
+      <span id="activity-chip-label" class="activity-chip-label"></span>
+      <span id="activity-chip-pct" class="activity-chip-pct"></span>
+    </button>
   </header>
 
   <div id="run-all-panel" class="run-all-panel" hidden></div>
 
   <main id="content">
-    <div id="empty-state" class="empty">
-      <div class="empty-inner">
-        <div class="empty-brand">✦ Magic Video Editor</div>
-        <div class="dim">Create or select a project to start.</div>
-      </div>
-    </div>
+    <div id="home-view" class="home-view"></div>
 
     <div id="project-view" class="editor-grid" hidden>
       <aside id="media-bin">
         <div class="bin-head row">
           <b>Media</b>
           <span class="grow"></span>
-          <button class="btn small" id="add-files">＋ Files</button>
-          <button class="btn small" id="add-folder">＋ Folder</button>
+          <button class="btn small" id="add-files"><i data-lucide="file-plus"></i> Files</button>
+          <button class="btn small" id="add-folder"><i data-lucide="folder-plus"></i> Folder</button>
         </div>
         <input type="text" id="path-input" class="path-input"
           placeholder="…or paste absolute file/folder paths, comma separated, Enter">
         <div id="media-bin-list" class="bin-list"></div>
         <div class="bin-footer row">
-          <button class="icon-btn" id="settings-gear" title="Settings">⚙️</button>
+          <button class="icon-btn" id="settings-gear" title="Settings"><i data-lucide="settings"></i></button>
           <div id="health" class="health"></div>
         </div>
       </aside>
@@ -66,10 +68,10 @@
             pipeline, or build the timeline below.</div>
         </div>
         <div class="player-controls row">
-          <button id="pp-playpause" class="btn small" title="Space">▶</button>
+          <button id="pp-playpause" class="btn small" title="Space"><i data-lucide="play"></i></button>
           <span id="pp-time" class="dim mono">0:00 / 0:00</span>
           <span class="grow"></span>
-          <button id="pp-fullscreen" class="btn small" title="Fullscreen">⛶</button>
+          <button id="pp-fullscreen" class="btn small" title="Fullscreen"><i data-lucide="maximize"></i></button>
         </div>
       </section>
 
@@ -82,10 +84,10 @@
 
       <section id="timeline-pane">
         <div class="timeline-toolbar row">
-          <button id="tl-split" class="btn small" title="Split at playhead (S)">✂ Split</button>
-          <button id="tl-delete" class="btn small danger" title="Delete selected (Del)">🗑 Delete</button>
-          <button id="tl-undo" class="btn small" title="Undo (⌘Z)">↶</button>
-          <button id="tl-redo" class="btn small" title="Redo (⇧⌘Z)">↷</button>
+          <button id="tl-split" class="btn small" title="Split at playhead (S)"><i data-lucide="scissors"></i> Split</button>
+          <button id="tl-delete" class="btn small danger" title="Delete selected (Del)"><i data-lucide="trash-2"></i> Delete</button>
+          <button id="tl-undo" class="btn small" title="Undo (⌘Z)"><i data-lucide="undo-2"></i></button>
+          <button id="tl-redo" class="btn small" title="Redo (⇧⌘Z)"><i data-lucide="redo-2"></i></button>
           <span class="grow"></span>
           <span id="tl-save-state" class="dim"></span>
           <button id="tl-save" class="btn small">Save</button>
@@ -111,25 +113,69 @@
         <nav class="drawer-tabs">
           <button data-tab="takes" class="tab">Takes</button>
           <button data-tab="reels" class="tab">Reels</button>
-          <button data-tab="jobs" class="tab">Queue</button>
         </nav>
         <span class="grow"></span>
-        <button class="btn small" id="drawer-close">✕ Close</button>
+        <button class="btn small" id="drawer-close"><i data-lucide="x"></i> Close</button>
       </div>
       <div class="drawer-body">
         <section id="tab-takes" class="tabpane"></section>
         <section id="tab-reels" class="tabpane" hidden></section>
-        <section id="tab-jobs" class="tabpane" hidden></section>
       </div>
     </div>
   </div>
 
   <div id="settings-overlay" class="settings-overlay" hidden>
-    <button class="btn small settings-close" id="settings-close" title="Close (Esc)">✕ Close</button>
+    <button class="btn small settings-close" id="settings-close" title="Close (Esc)"><i data-lucide="x"></i> Close</button>
     <div id="tab-settings" class="settings-page"></div>
   </div>
 
+  <!-- Export dialog (spec v5.4 §1): small modal, radio Final video / All
+       reels / a specific reel, destination line (click opens the export
+       folder via /api/open-folder), single primary CTA that enqueues and
+       closes. Replaces the render buttons that used to live in the Queue
+       view. -->
+  <div id="export-overlay" class="export-overlay" hidden>
+    <div class="export-dialog card">
+      <div class="row export-head">
+        <b>Export</b>
+        <span class="grow"></span>
+        <button class="icon-btn" id="export-close" title="Close (Esc)"><i data-lucide="x"></i></button>
+      </div>
+      <div class="export-body">
+        <label class="export-radio-row">
+          <input type="radio" name="export-what" value="final" checked>
+          <span>Final video</span>
+        </label>
+        <label class="export-radio-row">
+          <input type="radio" name="export-what" value="reels">
+          <span>All reels</span>
+        </label>
+        <label class="export-radio-row export-radio-reel">
+          <input type="radio" name="export-what" value="reel">
+          <span>Specific reel</span>
+          <select id="export-reel-select" class="export-reel-select"></select>
+        </label>
+      </div>
+      <button class="export-dest row" id="export-dest" title="Open in Finder">
+        <span class="dim">Destination</span>
+        <span id="export-dest-path" class="mono export-dest-path"></span>
+      </button>
+      <div class="row export-foot">
+        <span class="grow"></span>
+        <button class="btn primary" id="export-cta"><i data-lucide="download"></i> Export</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Background Tasks popover (spec v5.4 §2-3): anchored under the
+       Activity chip. ui/tabs/jobs.js renders its contents. -->
+  <div id="activity-popover" class="activity-popover" hidden></div>
+
 </div>
+<!-- Lucide (spec v5.5) — loaded FIRST: fully local UMD build, no CDN at
+     runtime. Exposes window.lucide; core.js wires window.refreshIcons on
+     top of it and every other module calls that after its own renders. -->
+<script src="/ui/vendor/lucide.min.js"></script>
 <script src="/ui/core.js"></script>
 <script src="/ui/tabs/takes.js"></script>
 <script src="/ui/tabs/reels.js"></script>
@@ -147,6 +193,11 @@
 <script src="/ui/editor/inspector.js"></script>
 <script src="/ui/editor/suggestions.js"></script>
 <script src="/ui/editor/reeleditor.js"></script>
+<!-- Projects Home view (spec v5.2), built in parallel by the PROJECTS-HOME
+     agent as window.HomeView = {mount(container), unmount()}. Routing glue
+     in core.js guards every call with `typeof window.HomeView !== "undefined"`
+     so load order / in-flight builds never throw. -->
+<script src="/ui/home.js"></script>
 <script src="/ui/fx.js"></script>
 </body>
 </html>
