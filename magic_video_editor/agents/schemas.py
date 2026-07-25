@@ -196,6 +196,28 @@ class ReelComposer(BaseModel):
     )
 
 
+class ReelDedup(BaseModel):
+    """Judges whether two REEL suggestions are essentially the SAME
+    underlying source moment repackaged twice (a true duplicate -- same
+    clip(s), an overlapping/near-identical source time window, and/or
+    near-identical transcript text) or merely cover a similar TOPIC with
+    DIFFERENT footage/wording (NOT a duplicate -- both should survive). Flat
+    schema, mirrors DedupJudge (takes.py's cross-clip dedup)."""
+
+    same_content: bool = Field(
+        ...,
+        description="True ONLY if both reels are the SAME moment/clip packaged twice -- "
+        "sharing a topic or discussing similar ideas is NOT enough on its own",
+    )
+    keep: Literal["a", "b"] = Field(
+        ...,
+        description="Which reel to keep when same_content is true -- prefer the higher "
+        "score, the longer duration, or the stronger hook",
+    )
+    confidence: int = Field(..., ge=1, le=5, description="Confidence in this judgement, 1-5")
+    reason: str = Field(default="", description="One-line rationale")
+
+
 class ReelScore(BaseModel):
     """Scores for one short-form candidate window. Kept flat and
     single-candidate on purpose: small local models fill this schema far more

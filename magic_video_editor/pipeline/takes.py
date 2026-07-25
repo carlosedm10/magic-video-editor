@@ -64,6 +64,60 @@ def _norm(text: str) -> str:
     return re.sub(r"\s+", " ", t).strip()
 
 
+def _normalize_exact(text: str) -> str:
+    """Normalize for the EXACT-repeat pre-pass only: lowercase, drop
+    punctuation entirely, collapse whitespace -- enough so "Bueno,
+    empezamos." and "bueno empezamos" match. Deliberately NOT `_norm` above:
+    `_norm` also strips filler words for the fuzzy/LLM passes, which would
+    make this an approximate match. Exact-repeat must stay exact-only —
+    forgive case/punctuation/whitespace, never forgive a different word."""
+    t = text.strip().lower()
+    t = re.sub(r"[^\w\sáéíóúüñàèìòùç]", "", t)
+    return re.sub(r"\s+", " ", t).strip()
+
+
+def _cut_exact_repeat_run(log, run: list[dict], key: str, cut_ids: set[str]) -> None:
+    keeper = run[-1]
+    for s in run[:-1]:
+        cut_ids.add(s["id"])
+    log(
+        f'exact repeat: "{key}" said {len(run)}x in a row in clip '
+        f'{keeper["clip_id"]} -- keeping the last take (id={keeper["id"]}), '
+        f"cutting {len(run) - 1} earlier one(s) as blooper(s)"
+    )
+
+
+def _exact_repeat_dedup_clip(log, clip_sentences: list[dict]) -> set[str]:
+    """Deterministic, LLM-free pre-pass (owner heuristic, 2026-07-25): "si se
+    ha dicho EXACTAMENTE lo mismo DOS VECES SEGUIDAS, quedate con la ULTIMA."
+    Walks one clip's sentences in time order (never crosses clip boundaries —
+    that's `_cross_clip_dedup`'s job). A run of STRICTLY CONSECUTIVE sentences
+    whose `_normalize_exact` text is identical is an unambiguous flub-then-
+    redo: keep only the last occurrence, cut every earlier one. Exact-only —
+    no fuzzy matching, and this intentionally does NOT reach past a single
+    adjacent gap (that's the near-duplicate fuzzy grouping further down in
+    `run()`), so a different sentence between two identical ones breaks the
+    run and both survive this pass untouched."""
+    cut_ids: set[str] = set()
+    if len(clip_sentences) < 2:
+        return cut_ids
+
+    run = [clip_sentences[0]]
+    run_key = _normalize_exact(clip_sentences[0]["text"])
+    for s in clip_sentences[1:]:
+        key = _normalize_exact(s["text"])
+        if key and key == run_key:
+            run.append(s)
+            continue
+        if len(run) > 1:
+            _cut_exact_repeat_run(log, run, run_key, cut_ids)
+        run = [s]
+        run_key = key
+    if len(run) > 1:
+        _cut_exact_repeat_run(log, run, run_key, cut_ids)
+    return cut_ids
+
+
 def _rms_stability(wav: np.ndarray, start: float, end: float) -> float:
     sr = config.ANALYSIS_SR
     seg = wav[int(start * sr) : int(end * sr)]
@@ -485,6 +539,24 @@ def run(log, project: dict) -> None:
             wavs[clip["id"]] = ffmpeg_utils.load_wav_mono(clip["wav"])
         log(f"{clip['filename']}: {len(sents)} sentences")
 
+    by_clip: dict[str, list[dict]] = {}
+    for s in sentences:
+        by_clip.setdefault(s["clip_id"], []).append(s)
+
+    # Deterministic, LLM-free pre-pass (owner heuristic): the same line said
+    # EXACTLY twice (or more) in a row within one clip is an unambiguous
+    # flub-then-redo -- keep only the LAST occurrence. Runs FIRST (before the
+    # topic/cleaner/sequencer LLM passes and the fuzzy dedup below) so those
+    # passes see fewer duplicates and never re-litigate a call this exact-
+    # match rule already made. Never crosses clip boundaries.
+    exact_repeat_cut_ids: set[str] = set()
+    if config.EXACT_REPEAT_DEDUP_ENABLED:
+        log("Checking for exact consecutive repeats (blooper -> redo)...")
+        for clip_sentences in by_clip.values():
+            exact_repeat_cut_ids |= _exact_repeat_dedup_clip(log, clip_sentences)
+        if exact_repeat_cut_ids:
+            log(f"exact-repeat pre-pass cut {len(exact_repeat_cut_ids)} sentence(s)")
+
     # LLM passes BEFORE fuzzy dedup: catch restart markers / abandoned takes /
     # bloopers retaken with different wording / meta-asides that
     # string-similarity dedup below can't see. Fail-open, skipped entirely
@@ -501,9 +573,6 @@ def run(log, project: dict) -> None:
             log(f"Topic: {topic}")
 
         log("Running transcript cleaner (restarts / abandoned takes / bloopers)...")
-        by_clip: dict[str, list[dict]] = {}
-        for s in sentences:
-            by_clip.setdefault(s["clip_id"], []).append(s)
         for clip_sentences in by_clip.values():
             cleaner_cut_ids |= _transcript_cleanup(log, clip_sentences, project)
         if cleaner_cut_ids:
@@ -548,16 +617,23 @@ def run(log, project: dict) -> None:
     project["topic"] = topic
 
     # Cluster near-duplicate sentences (repeated takes), greedy by similarity.
+    # Sentences already resolved by the exact-repeat pre-pass are excluded
+    # here -- that deterministic rule already picked a winner (the last take)
+    # and must not be re-litigated by this heuristic, score-based grouping.
     log("Detecting repeated takes...")
     norm = {s["id"]: _norm(s["text"]) for s in sentences}
     assigned: dict[str, str] = {}
     groups: list[list[dict]] = []
     for i, s in enumerate(sentences):
+        if s["id"] in exact_repeat_cut_ids:
+            continue
         if s["id"] in assigned or len(norm[s["id"]].split()) < config.DUP_MIN_WORDS:
             continue
         cluster = [s]
         assigned[s["id"]] = s["id"]
         for t in sentences[i + 1 :]:
+            if t["id"] in exact_repeat_cut_ids:
+                continue
             if t["id"] in assigned or len(norm[t["id"]].split()) < config.DUP_MIN_WORDS:
                 continue
             if fuzz.token_sort_ratio(norm[s["id"]], norm[t["id"]]) >= config.DUP_SIMILARITY:
@@ -597,10 +673,23 @@ def run(log, project: dict) -> None:
                     f"repeated take — kept better version (score {best['score']} vs {s['score']})"
                 )
 
+    # Enforce the exact-repeat pre-pass verdict (highest priority — it's a
+    # deterministic rule, not a heuristic score): every id it flagged must end
+    # up kept=False here regardless of what the score-based grouping above
+    # did (it already excluded these ids from clustering, but this is the
+    # single place that guarantees it — nothing after this point may flip an
+    # id back to kept=True).
+    for s in sentences:
+        if s["id"] in exact_repeat_cut_ids:
+            s["kept"] = False
+            s["reason"] = "repetición exacta — se conserva la última toma (blooper)"
+
     # Apply the transcript-cleaner verdicts (restart markers / abandoned
     # takes / bloopers, then stuck take runs, then out-of-context asides) —
     # after scoring/dedup so nothing re-flips them.
     for s in sentences:
+        if s["id"] in exact_repeat_cut_ids:
+            continue  # already resolved above; don't let AI passes overwrite the reason
         if s["id"] in cleaner_cut_ids:
             s["kept"] = False
             s["reason"] = "restart/abandoned take (AI)"

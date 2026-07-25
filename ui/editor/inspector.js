@@ -192,7 +192,8 @@ const Inspector = {
     const segs = Editor.segments;
     if (!segs || !segs.length) {
       el.innerHTML = `<div class="card"><b>Video</b>
-        <div class="hint">No segments yet — add clips and run the pipeline, or split/trim below.</div></div>`;
+        <div class="hint">No segments yet — drag a clip from the media bin onto the timeline below to
+        start a manual cut, or run the pipeline for an AI-assisted one.</div></div>`;
       return;
     }
     const i = Math.min(Editor.selected, segs.length - 1);

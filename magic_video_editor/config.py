@@ -142,6 +142,14 @@ SYNC_MIN_CORR = 0.55  # normalized correlation to consider two clips simultaneou
 DUP_SIMILARITY = 82  # rapidfuzz token_sort_ratio threshold (0-100)
 DUP_MIN_WORDS = 4
 
+# Exact consecutive-repeat pre-pass (owner heuristic, deterministic, no LLM,
+# 2026-07-25): "si se ha dicho EXACTAMENTE lo mismo DOS VECES SEGUIDAS,
+# quedate con la ULTIMA." Runs in takes.py BEFORE the fuzzy/LLM passes below
+# so they see fewer duplicates. Toggle only -- the normalization itself
+# (lowercase/whitespace/punctuation-insensitive, exact-only) lives in
+# takes.py:_normalize_exact and isn't config-driven.
+EXACT_REPEAT_DEDUP_ENABLED = True
+
 # Cross-clip semantic dedup (dedup_judge, v4)
 CROSS_DEDUP_MIN_SIM = 55  # rapidfuzz token_set_ratio floor to consider a candidate pair
 CROSS_DEDUP_MAX_SIM = 100
@@ -182,8 +190,36 @@ MERGE_GAP = 1.2  # merge adjacent kept sentences closer than this (same clip)
 # Reels
 REEL_MIN_S = 15.0
 REEL_MAX_S = 60.0
-REEL_SUGGESTIONS = 20
+REEL_SUGGESTIONS = 20  # CEILING on suggestions, not a target -- see REEL_DEDUP_* below
 REEL_W, REEL_H = 1080, 1920
+
+# Reel dedup analyst (vNext "distinct reels, not always REEL_SUGGESTIONS") --
+# mirrors the cross-clip dedup design above (CROSS_DEDUP_*/takes.py's
+# _cross_clip_dedup): a structural pre-filter finds candidate duplicate
+# PAIRS of scored reel windows -- ones that share a clip_id with an
+# OVERLAPPING/near-adjacent source window (reels.py's own `_overlap`, already
+# used by the top-N pick's mutual-overlap limit) and/or near-identical
+# transcript text (rapidfuzz token_set_ratio) -- and only those pairs are
+# sent to the reel_dedup LLM agent, which judges "same underlying source
+# moment" (duplicate -> collapse) vs. "same topic, different footage/words"
+# (NOT a duplicate -> keep both). Topical similarity alone must NEVER trigger
+# the pre-filter -- only shared source window and/or near-identical wording.
+REEL_DEDUP_MIN_WINDOW_OVERLAP = 0.25  # _overlap() ratio (same clip_id) to flag a candidate pair
+REEL_DEDUP_TEXT_SIM_CANDIDATE = 70  # rapidfuzz token_set_ratio floor to flag a candidate pair
+REEL_DEDUP_MAX_PAIRS = 30  # cap on candidate pairs sent to the LLM per suggest() run
+# Confidence gate ("bias toward keeping when uncertain" -- a false merge is
+# worse than a near-dup slipping through): only a high-confidence same-content
+# verdict auto-collapses a pair (drops the weaker reel); a borderline verdict
+# keeps both and just flags the weaker one. Same shape/naming as
+# CROSS_DEDUP_AUTOCUT_CONFIDENCE/SUGGEST_CONFIDENCE.
+REEL_DEDUP_COLLAPSE_CONFIDENCE = 4  # >= this + same_content -> auto-collapse (drop the loser)
+REEL_DEDUP_FLAG_CONFIDENCE = 2  # >= this (and < collapse) -> keep both, just flag
+# Buffer the pre-dedup candidate pool beyond the REEL_SUGGESTIONS ceiling so
+# the dedup pass has enough distinct-ish candidates to collapse from --
+# otherwise the ceiling would already have truncated away everything worth
+# deduping before reel_dedup ever ran. The ceiling itself is applied only
+# AFTER dedup collapses duplicates (see pipeline/reels.py:suggest).
+REEL_DEDUP_POOL_MULTIPLIER = 2
 
 # Main audio track / music bed (vNext "MUSIC BED WITH AUTO-DUCKING"):
 # project["audio_track"] mixes an imported audio_assets entry under the

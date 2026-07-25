@@ -226,7 +226,7 @@ function renderReels() {
       if (idx >= 0) p.reels[idx] = updated;
       renderReels();
     } catch (e) {
-      alert(`Regenerate failed: ${e.message}`);
+      showToast(`Regenerate failed: ${e.message}`);
       el.disabled = false;
       el.innerHTML = '<i data-lucide="refresh-cw"></i> Regenerate copy';
       refreshIcons();

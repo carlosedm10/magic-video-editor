@@ -76,6 +76,102 @@ function showToast(msg) {
   }, 3000);
 }
 
+/* ---------- non-blocking modal dialogs (replaces window.confirm/prompt) ----------
+   WKWebView/pywebview runs the whole GUI/JS thread synchronously; a native
+   confirm()/prompt() blocks that single thread (and prompt() in particular
+   can hang or return null unreliably), freezing the whole app until a forced
+   quit kills the process. These two helpers render an in-app overlay (same
+   .card look as #export-overlay/#settings-overlay) and resolve a Promise
+   instead, so callers just `await` them and everything else keeps running.
+   Self-contained (styles injected once, lazily) so no index.html changes are
+   needed -- same "chrome injection" pattern renderStageBar() uses above for
+   the pipeline chip/popover. */
+
+function _ensureModalStyles() {
+  if (document.getElementById("mve-modal-styles")) return;
+  const style = document.createElement("style");
+  style.id = "mve-modal-styles";
+  style.textContent = `
+    .mve-modal-overlay { position: fixed; inset: 0; z-index: 9998;
+      background: rgba(2, 3, 7, .55); display: flex; align-items: center; justify-content: center; }
+    .mve-modal-card { width: min(380px, 92vw); background: var(--panel, #1c1e26);
+      backdrop-filter: blur(16px); -webkit-backdrop-filter: blur(16px);
+      border: 1px solid var(--border, #333); border-radius: 14px; padding: 18px;
+      box-shadow: 0 8px 32px rgba(0,0,0,.4); color: var(--text, #fff); font-size: 13px; }
+    .mve-modal-message { white-space: pre-wrap; margin-bottom: 14px; line-height: 1.4; }
+    .mve-modal-input { width: 100%; box-sizing: border-box; background: var(--panel2, #262832);
+      border: 1px solid var(--border, #333); border-radius: 8px; color: var(--text, #fff);
+      padding: 8px 10px; font: inherit; margin-bottom: 14px; }
+    .mve-modal-input:focus { outline: none; border-color: var(--accent, #7c8cff); }
+    .mve-modal-actions { display: flex; justify-content: flex-end; gap: 8px; }
+  `;
+  document.head.appendChild(style);
+}
+
+// Shared plumbing: builds the overlay/card, wires Esc/backdrop-click to
+// `cancel`, focuses `focusEl`, and removes the overlay via the returned
+// cleanup() once the caller's button handlers call resolve/cancel.
+function _openModal({ bodyHtml, focusSelector }) {
+  _ensureModalStyles();
+  const overlay = document.createElement("div");
+  overlay.className = "mve-modal-overlay";
+  overlay.innerHTML = `<div class="mve-modal-card" role="dialog" aria-modal="true">${bodyHtml}</div>`;
+  document.body.appendChild(overlay);
+  const card = overlay.querySelector(".mve-modal-card");
+  const focusEl = focusSelector ? card.querySelector(focusSelector) : null;
+  (focusEl || card).focus?.();
+  if (focusEl && focusEl.select) focusEl.select();
+  return { overlay, card };
+}
+
+function confirmModal(message, { okLabel = "OK", cancelLabel = "Cancel", danger = false } = {}) {
+  return new Promise((resolve) => {
+    const { overlay, card } = _openModal({
+      bodyHtml: `
+        <div class="mve-modal-message">${esc(message)}</div>
+        <div class="mve-modal-actions">
+          <button class="btn" data-modal="cancel">${esc(cancelLabel)}</button>
+          <button class="btn ${danger ? "danger" : "primary"}" data-modal="ok">${esc(okLabel)}</button>
+        </div>`,
+      focusSelector: '[data-modal="ok"]',
+    });
+    const done = (result) => { overlay.remove(); document.removeEventListener("keydown", onKey); resolve(result); };
+    const onKey = (e) => {
+      if (e.key === "Escape") done(false);
+      else if (e.key === "Enter") done(true);
+    };
+    document.addEventListener("keydown", onKey);
+    overlay.addEventListener("mousedown", (e) => { if (e.target === overlay) done(false); });
+    card.querySelector('[data-modal="cancel"]').onclick = () => done(false);
+    card.querySelector('[data-modal="ok"]').onclick = () => done(true);
+  });
+}
+
+function promptModal(message, { defaultValue = "", placeholder = "", okLabel = "OK", cancelLabel = "Cancel" } = {}) {
+  return new Promise((resolve) => {
+    const { overlay, card } = _openModal({
+      bodyHtml: `
+        <div class="mve-modal-message">${esc(message)}</div>
+        <input class="mve-modal-input" data-modal="input" type="text" value="${esc(defaultValue)}" placeholder="${esc(placeholder)}">
+        <div class="mve-modal-actions">
+          <button class="btn" data-modal="cancel">${esc(cancelLabel)}</button>
+          <button class="btn primary" data-modal="ok">${esc(okLabel)}</button>
+        </div>`,
+      focusSelector: '[data-modal="input"]',
+    });
+    const input = card.querySelector('[data-modal="input"]');
+    const done = (result) => { overlay.remove(); document.removeEventListener("keydown", onKey); resolve(result); };
+    const onKey = (e) => {
+      if (e.key === "Escape") done(null);
+      else if (e.key === "Enter") done(input.value);
+    };
+    document.addEventListener("keydown", onKey);
+    overlay.addEventListener("mousedown", (e) => { if (e.target === overlay) done(null); });
+    card.querySelector('[data-modal="cancel"]').onclick = () => done(null);
+    card.querySelector('[data-modal="ok"]').onclick = () => done(input.value);
+  });
+}
+
 // Guards against handling the same project's disappearance twice (e.g. a
 // refreshProject() 404 and a pollQueue() 404 landing back to back).
 let _handlingProjectGone = false;
@@ -464,7 +560,7 @@ async function runStage(stage) {
     await pollQueue();
     openActivityPopover();
   } catch (e) {
-    alert(e.message);
+    showToast(e.message);
   }
 }
 
@@ -473,7 +569,7 @@ async function runAll() {
     await api(`/projects/${state.pid}/queue`, { method: "POST", body: { kind: "run-all" } });
     await pollQueue();
   } catch (e) {
-    alert(e.message);
+    showToast(e.message);
   }
 }
 
@@ -483,7 +579,7 @@ async function stopRunAll() {
   try {
     await api(`/projects/${state.pid}/queue/${item.id}`, { method: "DELETE" });
     await pollQueue();
-  } catch (e) { alert(e.message); }
+  } catch (e) { showToast(e.message); }
 }
 
 function renderRunAllPanel() {
@@ -679,21 +775,21 @@ async function runExport() {
       await api(`/projects/${state.pid}/queue`, { method: "POST", body: { kind: "final_render" } });
     } else if (what === "reels") {
       const reels = state.project?.reels || [];
-      if (!reels.length) { alert("No reels to export yet."); return; }
+      if (!reels.length) { showToast("No reels to export yet."); return; }
       for (const r of reels) {
         await api(`/projects/${state.pid}/queue`,
           { method: "POST", body: { kind: `reel_render:${r.id}`, payload: { reel_id: r.id } } });
       }
     } else {
       const rid = $("#export-reel-select").value;
-      if (!rid) { alert("No reel selected."); return; }
+      if (!rid) { showToast("No reel selected."); return; }
       await api(`/projects/${state.pid}/queue`,
         { method: "POST", body: { kind: `reel_render:${rid}`, payload: { reel_id: rid } } });
     }
     await pollQueue();
     closeExportDialog();
   } catch (e) {
-    alert(e.message);
+    showToast(e.message);
   }
 }
 
@@ -789,12 +885,12 @@ async function boot() {
     const path = state.settings?.export_dir || $("#export-dest-path").textContent;
     if (!path) return;
     try { await api("/open-folder", { method: "POST", body: { path } }); }
-    catch (e) { alert(e.message); }
+    catch (e) { showToast(e.message); }
   };
   $("#activity-chip").onclick = () => window.ActivityPopover?.toggle();
 
   $("#new-project").onclick = async () => {
-    const name = prompt("Project name:");
+    const name = await promptModal("Project name:");
     if (!name) return;
     const p = await api("/projects", { method: "POST", body: { name } });
     await selectProject(p.id);
@@ -876,10 +972,11 @@ function renderUpdateBanner() {
 }
 
 async function installUpdate() {
-  if (!confirm(
+  const ok = await confirmModal(
     `Se descargará e instalará Magic Video Editor ${_updateStatus.latest_version}. ` +
     "La app se cerrará y se reabrirá automáticamente. ¿Continuar?"
-  )) return;
+  );
+  if (!ok) return;
 
   const cta = $("#update-banner-cta");
   const progress = $("#update-banner-progress");
@@ -893,7 +990,7 @@ async function installUpdate() {
   } catch (e) {
     cta.disabled = false;
     progress.hidden = true;
-    alert(e.message); // e.g. dev-mode "git pull instead" -- see updater.py
+    showToast(e.message); // e.g. dev-mode "git pull instead" -- see updater.py
     return;
   }
 
@@ -906,7 +1003,7 @@ async function installUpdate() {
     else if (j.status === "error") {
       cta.disabled = false;
       progress.hidden = true;
-      alert(`Update failed: ${j.error}`);
+      showToast(`Update failed: ${j.error}`);
     }
     // status "done": the process is about to os._exit() itself and the
     // update helper relaunches a fresh instance -- nothing left to do here.

@@ -174,6 +174,8 @@ window.SubtitlesPanel = window.SubtitlesPanel || {
         try {
           const saved = await api(`/projects/${project.id}/subtitles`, { method: "PUT", body: this._cfg });
           this._cfg = saved;
+          if (state.project) state.project.subtitles = saved;
+          window.EditorUI?.player?.reloadSubtitles?.();
           setFeedback("Saved", false);
         } catch (e) {
           setFeedback(`Save failed: ${e.message}`, true);
@@ -287,6 +289,8 @@ window.SubtitlesPanel = window.SubtitlesPanel || {
     this._cfg.cue_overrides = { ...(this._cfg.cue_overrides || {}), [index]: text };
     try {
       this._cfg = await api(`/projects/${project.id}/subtitles`, { method: "PUT", body: this._cfg });
+      if (state.project) state.project.subtitles = this._cfg;
+      window.EditorUI?.player?.reloadSubtitles?.();
     } catch (e) {
       console.error("Failed to save subtitle cue override", e);
     }
@@ -302,6 +306,8 @@ window.SubtitlesPanel = window.SubtitlesPanel || {
     Object.assign(this._cfg, fields);
     try {
       this._cfg = await api(`/projects/${project.id}/subtitles`, { method: "PUT", body: this._cfg });
+      if (state.project) state.project.subtitles = this._cfg;
+      window.EditorUI?.player?.reloadSubtitles?.();
     } catch (e) {
       console.error("Failed to save subtitle style field", e);
     }

@@ -92,7 +92,7 @@ const Suggestions = {
       }
       await this.refresh();
     } catch (e) {
-      alert(e.message);
+      showToast(e.message);
     }
   },
 };

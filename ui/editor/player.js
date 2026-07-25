@@ -95,7 +95,49 @@
    snapping back to whichever of "bottom"/"center" it ends up closest to
    (spec: "snaps to bottom/center presets when close"), otherwise keeping the
    free offset in the NEW cfg.vpos field. While playing, the overlay is
-   fully non-interactive (pointer-events off) — untouched by any of this. */
+   fully non-interactive (pointer-events off) — untouched by any of this.
+
+   ---------- boundary-freeze fix: "playback freezes crossing clip/segment
+   boundaries" ----------
+   Root causes (all in this file):
+     1. `_loadSegment`/`_preloadNext`/`enterSourceMode` loaded a new clip src
+        and armed the seek+play via a single-property `video.onloadedmetadata
+        = doSeek`. That silently never fires (so `doSeek` — the only thing
+        that seeks and calls play() — never runs, and playback just sits
+        there) whenever metadata is already available by attach time, or the
+        browser only emits loadeddata/canplay for that load. Fixed by
+        `_whenSeekable(video, cb)`: fires immediately if already seekable
+        (readyState >= 1), otherwise listens for whichever of
+        loadedmetadata/loadeddata/canplay comes first and tears the rest
+        down — so the seek+play is guaranteed to run exactly once.
+     2. `_advance()`'s `canSwap` check could be falsely false for one frame
+        right at a junction (a <video> mid-seek transiently reports
+        readyState < 2 even with the right clip already loaded), forcing
+        the fragile full-reload path when the idle buffer was basically
+        fine. Fixed with `_advanceWithGrace`: when the idle buffer's
+        clip_id already matches, give it a short (~200ms, rAF-polled)
+        grace window before falling back to `_loadSegment`.
+     3. During the async fade/crossfade transition window, the still-active
+        video kept playing past its segment end, so `ontimeupdate` kept
+        re-firing `_advance()` on every frame, stacking duplicate
+        swap/reload decisions. Fixed with the `_advancing` re-entrancy
+        guard (set the instant a junction decision starts, cleared only
+        once it has actually landed via `_doAdvance`/`doSwap`/reload).
+     4. `<video>.play()`'s promise can reject (autoplay policy, "interrupted
+        by a new load request", …); the old code swallowed every rejection
+        with `.catch(() => {})`, leaving `this.playing` true with nothing
+        left to resume the element. Fixed with `_playWithRetry`: a bounded
+        (4 attempts, short backoff) retry, abandoned early if the user
+        paused in the meantime.
+     5. Belt-and-suspenders: `_checkStallWatchdog` (run every rAF tick from
+        `_startLoop`) detects the case none of the above anticipated —
+        `this.playing` true but the active video's currentTime frozen on
+        the same segment for >400ms — and self-heals via `_recoverStall`
+        (reload the current segment from its start and resume).
+   Transition swap paths (fade/crossfade/dissolve approximation) are
+   unchanged in shape, only hardened the same way (loader + retry). Segment/
+   EDL production is untouched. See this task's final report for the live
+   playback verification (Patrimonest RAW, 6 clips/14 segments). */
 
 window.EditorUI = window.EditorUI || {};
 
@@ -107,6 +149,31 @@ const Player = {
   _currentIndex: 0,
   _rafId: null,
   _rate: 1,
+
+  // ---- boundary-freeze hardening (see module docstring addendum below) ----
+  _advancing: false,   // re-entrancy guard: true from the moment _advance() starts
+                        // deciding a junction until the swap/reload actually lands,
+                        // so repeated ontimeupdate firings during a fade/grace delay
+                        // can't stack duplicate advances on top of each other.
+  _wdLastT: undefined,  // stall watchdog: last-seen currentTime of the active video
+  _wdIndex: undefined,  // stall watchdog: segment index that currentTime was sampled at
+  _wdSince: 0,          // stall watchdog: performance.now() when _wdLastT last changed
+
+  // ---- boundary-freeze hardening v2: intent-tracked play state ----
+  // `this.playing` is meant to always mirror "is the user's play/pause button
+  // in the pause state", but a handful of code paths (seekToEdlTime after a
+  // setMode()-triggered pause, an async swap that never got a chance to
+  // reconcile it) could historically leave it false while a swap/seek was
+  // still issuing a real play() underneath. Since `_checkStallWatchdog` only
+  // ever ran when `this.playing` was true, ANY such desync meant a truly
+  // stuck-after-boundary video would never be recovered — the watchdog guard
+  // gap. `_intendPlaying` is set/cleared at the exact same moments as a
+  // deliberate user play/pause action (play(), pause(), the reconciled
+  // seek/segments-changed/video-error paths) and is deliberately allowed to
+  // diverge from `this.playing` if something else desyncs it — the watchdog
+  // below checks BOTH, so an intended-playing session that silently dropped
+  // `this.playing` still gets recovered.
+  _intendPlaying: false,
 
   mode: "draft",         // "draft" | "preview"
   _cues: [],
@@ -199,12 +266,12 @@ const Player = {
     const v = this._sourceVideo;
     if (v) {
       v.style.visibility = "visible";
-      const start = () => { try { v.currentTime = 0; } catch (_e) { /* not ready */ } v.play().catch(() => {}); };
+      const start = () => { try { v.currentTime = 0; } catch (_e) { /* not ready */ } this._playWithRetry(v); };
       if (v.dataset.clipId === clipId) start();
       else {
         v.dataset.clipId = clipId;
         v.src = `/api/projects/${Editor.pid}/media/preview/${clipId}`;
-        v.onloadedmetadata = start;
+        this._whenSeekable(v, start);
       }
     }
     if (this._sourceChip) {
@@ -215,6 +282,7 @@ const Player = {
     document.getElementById("timeline-content")?.classList.add("tl-source-dim");
 
     this.playing = true;
+    this._intendPlaying = true;
     const btn = document.getElementById("pp-playpause");
     if (btn) { btn.innerHTML = '<i data-lucide="pause"></i>'; refreshIcons(); }
     this._updateSubtitleInteractivity();
@@ -227,6 +295,7 @@ const Player = {
     if (this._sourceChip) this._sourceChip.hidden = true;
     document.getElementById("timeline-content")?.classList.remove("tl-source-dim");
     this.playing = false;
+    this._intendPlaying = false;
 
     if (this.mode === "preview" && this._previewVideo) this._previewVideo.style.visibility = "visible";
     this._showEmpty(!Editor.segments?.length);
@@ -501,10 +570,7 @@ const Player = {
         const wasPlaying = this.playing;
         const i = Math.min(Editor.selected, Editor.segments.length - 1);
         this._loadSegment(i, Editor.segments[i].start, { andPlay: wasPlaying });
-        this.playing = wasPlaying;
-        const btn = document.getElementById("pp-playpause");
-        if (btn) { btn.innerHTML = `<i data-lucide="${wasPlaying ? "pause" : "play"}"></i>`; refreshIcons(); }
-        this._updateSubtitleInteractivity();
+        this._reconcilePlayState(wasPlaying);
       }
     }
     this.reloadSubtitles();
@@ -739,6 +805,45 @@ const Player = {
   _active() { return this.videos[this.activeIdx]; },
   _idle() { return this.videos[1 - this.activeIdx]; },
 
+  /* ---------- boundary-freeze fix, part 1: a reliable "seek once ready"
+     primitive ----------
+     The old code did `video.onloadedmetadata = doSeek` and nothing else.
+     That single-property handler silently never fires (so `doSeek` — which
+     is what actually calls seek + play() — never runs, and playback just
+     freezes) whenever: the metadata was already loaded by the time we
+     attach the handler (a `readyState >= 1` video does not re-fire
+     `loadedmetadata`), or the browser only surfaces `loadeddata`/`canplay`
+     for this particular load path. This helper covers both: if the video
+     is already seekable it runs `cb` immediately; otherwise it listens for
+     whichever of loadedmetadata/loadeddata/canplay fires first, and tears
+     down the others so nothing leaks or double-fires. */
+  _whenSeekable(video, cb) {
+    if (video.readyState >= 1) { cb(); return; }
+    const events = ["loadedmetadata", "loadeddata", "canplay"];
+    const handler = () => {
+      events.forEach((ev) => video.removeEventListener(ev, handler));
+      cb();
+    };
+    events.forEach((ev) => video.addEventListener(ev, handler, { once: true }));
+  },
+
+  /* ---------- boundary-freeze fix, part 2: bounded play() retry ----------
+     `<video>.play()` returns a promise that can reject (autoplay policy,
+     "interrupted by a new load request", etc.) — silently swallowing that
+     rejection (the old `.catch(() => {})` everywhere) leaves `this.playing`
+     true while the element itself is actually paused, with nothing left to
+     ever resume it. Retry a few times on a short backoff; give up quietly
+     if the user paused in the meantime (don't fight their intent). */
+  _playWithRetry(video, attempt = 0) {
+    if (!video) return;
+    const result = video.play();
+    if (!result || typeof result.catch !== "function") return;
+    result.catch((err) => {
+      if (attempt >= 4 || !this.playing) return;
+      setTimeout(() => this._playWithRetry(video, attempt + 1), 100 + attempt * 100);
+    });
+  },
+
   _loadSegment(index, atClipTime, { andPlay }) {
     const seg = Editor.segments?.[index];
     if (!seg) return;
@@ -748,14 +853,14 @@ const Player = {
     const doSeek = () => {
       try { video.currentTime = target; } catch (_e) { /* metadata not ready */ }
       video.playbackRate = this._rate;
-      if (andPlay) video.play().catch(() => {});
+      if (andPlay) this._playWithRetry(video);
     };
     if (video.dataset.clipId === seg.clip_id) {
       doSeek();
     } else {
       video.dataset.clipId = seg.clip_id;
       video.src = `/api/projects/${Editor.pid}/media/preview/${seg.clip_id}`;
-      video.onloadedmetadata = doSeek;
+      this._whenSeekable(video, doSeek);
     }
     this._preloadNext(index);
   },
@@ -775,7 +880,7 @@ const Player = {
     }
     idle.dataset.clipId = next.clip_id;
     idle.src = `/api/projects/${Editor.pid}/media/preview/${next.clip_id}`;
-    idle.onloadedmetadata = () => { try { idle.currentTime = next.start; } catch (_e) { /* ignore */ } };
+    this._whenSeekable(idle, () => { try { idle.currentTime = next.start; } catch (_e) { /* ignore */ } });
   },
 
   /* ---------- v_FIX §15: recover from a missing/corrupt clip file ----------
@@ -801,7 +906,6 @@ const Player = {
     try { showToast(`Couldn't play "${name}" — skipping to the next segment.`); } catch (_e) { /* toast is best-effort */ }
     const nextIndex = this._currentIndex + 1;
     const next = Editor.segments?.[nextIndex];
-    const btn = document.getElementById("pp-playpause");
     if (next) {
       // Keep the real play intent alive across the skip -- _loadSegment's
       // `andPlay` re-issues play() on the next clip if we were playing, so
@@ -809,31 +913,38 @@ const Player = {
       // whatever they happened to say when the error fired.
       Editor.select(nextIndex);
       this._loadSegment(nextIndex, next.start, { andPlay: wasPlaying });
-      this.playing = wasPlaying;
-      if (btn) { btn.innerHTML = `<i data-lucide="${wasPlaying ? "pause" : "play"}"></i>`; refreshIcons(); }
+      this._reconcilePlayState(wasPlaying);
     } else {
       // Last (or only) segment errored -- nothing to skip forward to; stop
       // cleanly and make sure the UI actually says "stopped" instead of
       // hanging forever under a stale "playing" button.
-      this.playing = false;
-      if (btn) { btn.innerHTML = '<i data-lucide="play"></i>'; refreshIcons(); }
+      this._reconcilePlayState(false);
     }
-    this._updateSubtitleInteractivity();
   },
 
   play() {
+    // Belt-and-suspenders (see `_intendPlaying` above): recorded up front so
+    // the watchdog can trust "the user wants to be playing" even if
+    // `this.playing` itself later gets out of sync somehow.
+    this._intendPlaying = true;
     if (this.sourceClipId) {
       // v7 §7.1: "Transport keys work on the source clip."
       this.playing = true;
-      this._sourceVideo?.play().catch(() => {});
+      this._playWithRetry(this._sourceVideo);
     } else if (this.mode === "preview") {
-      if (!this._previewVideo?.src) return;
+      if (!this._previewVideo?.src) { this._intendPlaying = false; return; }
       this.playing = true;
-      this._previewVideo.play().catch(() => {});
+      this._playWithRetry(this._previewVideo);
     } else {
-      if (!Editor.segments?.length || !this.videos) return;
+      if (!Editor.segments?.length || !this.videos) { this._intendPlaying = false; return; }
       this.playing = true;
-      this._active().play().catch(() => {});
+      // Boundary stall watchdog (see _startLoop): a fresh baseline every time
+      // we (re)start playback, so a long preceding pause never reads as an
+      // instant "stuck" the moment we resume.
+      this._wdLastT = undefined;
+      this._wdIndex = undefined;
+      this._wdSince = performance.now();
+      this._playWithRetry(this._active());
     }
     const btn = document.getElementById("pp-playpause");
     if (btn) { btn.innerHTML = '<i data-lucide="pause"></i>'; refreshIcons(); }
@@ -847,6 +958,7 @@ const Player = {
   // through the default auto=true path.
   pause({ auto = true } = {}) {
     this.playing = false;
+    this._intendPlaying = false;
     if (this.sourceClipId) this._sourceVideo?.pause();
     else if (this.mode === "preview") this._previewVideo?.pause();
     else this._active()?.pause();
@@ -891,19 +1003,42 @@ const Player = {
     else document.exitFullscreen?.().catch(() => {});
   },
 
+  // ---- boundary-freeze hardening v2: play-state reconciliation ----
+  // `setMode()` calls `this.pause({auto:false})` (forcing `this.playing`/
+  // `_intendPlaying` false) BEFORE calling seekToEdlTime(t, {andPlay:
+  // wasPlaying}) to resume on the new mode's element. seekToEdlTime used to
+  // only ever issue the underlying `_playWithRetry()` call without ever
+  // restoring `this.playing` — so after any mode switch made mid-playback,
+  // the video could be genuinely playing again while `this.playing` (and
+  // therefore the stall watchdog's guard, the play/pause button, and the
+  // subtitle-overlay interactivity toggle) all still said "paused". Any
+  // watchdog fallback keyed only on `this.playing` would then never engage
+  // for a real freeze that happened afterwards. Centralize the reconciliation
+  // here so every seek leaves `this.playing`/`_intendPlaying`/the button in
+  // the truthful state that matches what was actually just requested.
+  _reconcilePlayState(play) {
+    this.playing = play;
+    this._intendPlaying = play;
+    const btn = document.getElementById("pp-playpause");
+    if (btn) { btn.innerHTML = `<i data-lucide="${play ? "pause" : "play"}"></i>`; refreshIcons(); }
+    this._updateSubtitleInteractivity();
+  },
+
   seekToEdlTime(t, { andPlay } = {}) {
     const play = andPlay ?? this.playing;
     if (this.mode === "preview") {
       if (this._previewVideo) {
         try { this._previewVideo.currentTime = Math.max(0, t); } catch (_e) { /* not ready */ }
-        if (play) this._previewVideo.play().catch(() => {});
+        if (play) this._playWithRetry(this._previewVideo);
       }
+      this._reconcilePlayState(play);
       return;
     }
     const hit = Editor.segmentAtEdlTime(t);
     if (!hit) return;
     Editor.select(hit.index);
     this._loadSegment(hit.index, hit.local, { andPlay: play });
+    this._reconcilePlayState(play);
   },
 
   currentEdlTime() {
@@ -940,59 +1075,193 @@ const Player = {
      (see pipeline/render.py). Only "none" is a real hard cut. If the idle
      buffer isn't ready for a cross-fade, fall back to the quick to-black
      flash rather than a bare cut, so the user always SEES something happen
-     at the junction. */
-  _advance() {
-    const nextIndex = this._currentIndex + 1;
-    const next = Editor.segments?.[nextIndex];
-    if (!next) { this.pause(); return; }
-    const wasPlaying = this.playing;
-    const transition = next.transition || { type: "none", duration: 0.5 };
-    const idle = this._idle();
-    const canSwap = idle.dataset.clipId === next.clip_id && idle.readyState >= 2;
-    const hasTransition = transition.type && transition.type !== "none";
+     at the junction.
 
+     ---------- boundary-freeze fix, part 3: re-entrancy + readyState grace
+     ----------
+     Two extra hazards used to compound the freeze:
+     (a) During the FADE_MS/durMs async window (_quickFadeThenSwap's
+         setTimeout, or the tail of _crossfadeSwap), the video that is still
+         "active" keeps playing and its currentTime keeps climbing past
+         seg.end, so `ontimeupdate` -> `_onTimeUpdate` -> `_advance()` kept
+         firing AGAIN on every frame of that window, stacking duplicate
+         swap/reload decisions on top of each other. `_advancing` is now a
+         re-entrancy guard: set the instant a junction decision starts, only
+         cleared once that decision has actually landed (a real doSwap, a
+         committed crossfade, or a fallback reload) — any `_advance()` call
+         in between is a no-op.
+     (b) A <video> mid-seek transiently reports `readyState` below 2 even
+         though the idle buffer already has the right clip loaded — so
+         `canSwap` could be falsely false for exactly one frame right at a
+         junction, forcing the fragile full-reload path when a few more
+         milliseconds would have made the fast swap available. `_advance`
+         now gives that case (dataset.clipId already matches) a short grace
+         window (`_advanceWithGrace`, ~200ms via rAF polling) to clear
+         before falling back to `_loadSegment`. */
+  _advance() {
+    if (this._advancing) return; // (a) a decision for this junction is already in flight
+    this._advancing = true;
+    try {
+      const nextIndex = this._currentIndex + 1;
+      const next = Editor.segments?.[nextIndex];
+      if (!next) { this._advancing = false; this.pause(); return; }
+      const wasPlaying = this.playing;
+      const transition = next.transition || { type: "none", duration: 0.5 };
+      const idle = this._idle();
+      const idleMatches = idle.dataset.clipId === next.clip_id;
+      const canSwapNow = idleMatches && idle.readyState >= 2;
+      const hasTransition = transition.type && transition.type !== "none";
+
+      if (idleMatches && !canSwapNow) {
+        // (b) right clip, just transiently not "ready" — give it a beat.
+        this._advanceWithGrace(nextIndex, next, transition, hasTransition, wasPlaying);
+        return;
+      }
+      this._doAdvance(nextIndex, next, transition, hasTransition, canSwapNow, wasPlaying);
+    } catch (err) {
+      // Boundary-freeze hardening v2 (hypothesis 2): a synchronous throw
+      // anywhere in the decision above used to leave `_advancing` stuck
+      // `true` forever with no try/finally — every future `_advance()` call
+      // would then silently no-op on the reentrancy guard at the top of this
+      // function, which is a textbook permanent-stuck-at-a-boundary bug.
+      // Force the guard clear and let the stall watchdog's own recovery path
+      // (which is itself now bulletproofed, see `_recoverStall`) take it from
+      // here instead of leaving the junction wedged.
+      console.error("[player] _advance() failed, forcing recovery", err);
+      this._advancing = false;
+      this._recoverStall();
+    }
+  },
+
+  _advanceWithGrace(nextIndex, next, transition, hasTransition, wasPlaying) {
+    const GRACE_MS = 200;
+    const deadline = performance.now() + GRACE_MS;
+    const check = () => {
+      try {
+        // Boundary-freeze hardening v2 (hypothesis 5's real dead-end): the
+        // EDL can be edited (add/split/delete/reorder a segment) WHILE this
+        // ~200ms grace poll is in flight. `nextIndex`/`next` are captured
+        // from before the edit, so blindly committing to `_doAdvance` with
+        // them once segments have shifted would desync `_currentIndex` from
+        // the real (post-edit) array — and an out-of-range `_currentIndex`
+        // used to make `_onTimeUpdate`/`_recoverStall` no-op forever (see
+        // `_recoverStall`'s hardening below). Detect the mismatch and, instead
+        // of committing stale state, drop this in-flight decision and
+        // re-derive a fresh one from the CURRENT segments/`_currentIndex`.
+        const segs = Editor.segments;
+        if (!segs || nextIndex >= segs.length || segs[nextIndex]?.clip_id !== next.clip_id) {
+          this._advancing = false;
+          this._advance();
+          return;
+        }
+        const idle = this._idle();
+        if (idle.dataset.clipId !== next.clip_id) {
+          // Changed out from under us (shouldn't normally happen) — reload reliably.
+          this._doAdvance(nextIndex, next, transition, hasTransition, false, wasPlaying);
+          return;
+        }
+        if (idle.readyState >= 2) {
+          this._doAdvance(nextIndex, next, transition, hasTransition, true, wasPlaying);
+          return;
+        }
+        if (performance.now() >= deadline) {
+          this._doAdvance(nextIndex, next, transition, hasTransition, false, wasPlaying);
+          return;
+        }
+        requestAnimationFrame(check);
+      } catch (err) {
+        console.error("[player] grace-window check failed, forcing recovery", err);
+        this._advancing = false;
+        this._recoverStall();
+      }
+    };
+    requestAnimationFrame(check);
+  },
+
+  _doAdvance(nextIndex, next, transition, hasTransition, canSwap, wasPlaying) {
+    // Every branch below guarantees `_advancing` clears via try/finally, not
+    // just a plain assignment on the last line — so a throw partway through
+    // (e.g. a segment/clip lookup that no longer resolves) can never leave
+    // the re-entrancy guard stuck `true` forever (hypothesis 2).
     const doSwap = () => {
-      this._active().pause();
-      this._active().ontimeupdate = null;
-      this.activeIdx = 1 - this.activeIdx;
-      this._currentIndex = nextIndex;
-      const nowActive = this._active();
-      try { nowActive.currentTime = next.start; } catch (_e) { /* ignore */ }
-      nowActive.playbackRate = this._rate;
-      nowActive.ontimeupdate = () => this._onTimeUpdate();
-      if (wasPlaying) nowActive.play().catch(() => {});
-      this._preloadNext(nextIndex);
-      Editor.select(nextIndex);
+      try {
+        this._active().pause();
+        this._active().ontimeupdate = null;
+        this.activeIdx = 1 - this.activeIdx;
+        this._currentIndex = nextIndex;
+        const nowActive = this._active();
+        try { nowActive.currentTime = next.start; } catch (_e) { /* ignore */ }
+        nowActive.playbackRate = this._rate;
+        nowActive.ontimeupdate = () => this._onTimeUpdate();
+        if (wasPlaying) this._playWithRetry(nowActive);
+        this._preloadNext(nextIndex);
+        Editor.select(nextIndex);
+      } finally {
+        this._advancing = false; // junction decision has landed
+      }
     };
 
-    if (transition.type === "fade") {
-      this._quickFadeThenSwap(doSwap, canSwap, nextIndex, next, wasPlaying);
-    } else if (hasTransition && canSwap) {
-      // "crossfade" and every other named catalog type (circleopen, wipeleft,
-      // slideup, pixelize, ...) all get the same generic dissolve preview.
-      this._crossfadeSwap(next, transition.duration, wasPlaying, nextIndex);
-    } else if (hasTransition && !canSwap) {
-      // Idle buffer not ready for a cross-fade — still show a visible
-      // transition cue rather than silently hard-cutting.
-      this._quickFadeThenSwap(doSwap, canSwap, nextIndex, next, wasPlaying);
-    } else if (canSwap) {
-      doSwap();
-    } else {
-      this._loadSegment(nextIndex, next.start, { andPlay: wasPlaying });
-      Editor.select(nextIndex);
+    try {
+      if (transition.type === "fade") {
+        this._quickFadeThenSwap(doSwap, canSwap, nextIndex, next, wasPlaying);
+      } else if (hasTransition && canSwap) {
+        // "crossfade" and every other named catalog type (circleopen, wipeleft,
+        // slideup, pixelize, ...) all get the same generic dissolve preview.
+        try {
+          this._crossfadeSwap(next, transition.duration, wasPlaying, nextIndex);
+        } finally {
+          this._advancing = false; // the swap itself (ontimeupdate/activeIdx) is synchronous
+        }
+      } else if (hasTransition && !canSwap) {
+        // Idle buffer not ready for a cross-fade — still show a visible
+        // transition cue rather than silently hard-cutting.
+        this._quickFadeThenSwap(doSwap, canSwap, nextIndex, next, wasPlaying);
+      } else if (canSwap) {
+        doSwap();
+      } else {
+        try {
+          this._loadSegment(nextIndex, next.start, { andPlay: wasPlaying });
+          Editor.select(nextIndex);
+        } finally {
+          this._advancing = false;
+        }
+      }
+    } catch (err) {
+      console.error("[player] _doAdvance failed, forcing recovery", err);
+      this._advancing = false;
+      this._recoverStall();
     }
   },
 
   _quickFadeThenSwap(doSwap, canSwap, nextIndex, next, wasPlaying) {
     const overlay = this._fadeOverlay;
     const FADE_MS = 220;
-    if (!overlay) { canSwap ? doSwap() : this._loadSegment(nextIndex, next.start, { andPlay: wasPlaying }); return; }
+    const reload = () => {
+      try {
+        this._loadSegment(nextIndex, next.start, { andPlay: wasPlaying });
+        Editor.select(nextIndex);
+      } finally {
+        this._advancing = false;
+      }
+    };
+    if (!overlay) {
+      if (canSwap) doSwap();
+      else reload();
+      return;
+    }
     overlay.style.transition = `opacity ${FADE_MS}ms linear`;
     overlay.style.opacity = "1";
     setTimeout(() => {
-      if (canSwap) doSwap();
-      else { this._loadSegment(nextIndex, next.start, { andPlay: wasPlaying }); Editor.select(nextIndex); }
-      overlay.style.opacity = "0";
+      try {
+        if (canSwap) doSwap();
+        else reload();
+      } catch (err) {
+        console.error("[player] fade-swap timeout failed, forcing recovery", err);
+        this._advancing = false;
+        this._recoverStall();
+      } finally {
+        overlay.style.opacity = "0";
+      }
     }, FADE_MS);
   },
 
@@ -1004,7 +1273,7 @@ const Player = {
     incoming.playbackRate = this._rate;
     incoming.style.transition = `opacity ${durMs}ms linear`;
     outgoing.style.transition = `opacity ${durMs}ms linear`;
-    if (wasPlaying) incoming.play().catch(() => {});
+    if (wasPlaying) this._playWithRetry(incoming);
     incoming.classList.add("active");
     outgoing.classList.remove("active");
     this.activeIdx = 1 - this.activeIdx;
@@ -1014,9 +1283,12 @@ const Player = {
     Editor.select(nextIndex);
     this._preloadNext(nextIndex);
     setTimeout(() => {
-      outgoing.pause();
-      outgoing.style.transition = "";
-      incoming.style.transition = "";
+      try {
+        outgoing.pause();
+      } finally {
+        outgoing.style.transition = "";
+        incoming.style.transition = "";
+      }
     }, durMs);
   },
 
@@ -1031,6 +1303,74 @@ const Player = {
     el.textContent = `${fmtT(this.currentEdlTime())} / ${fmtT(Editor.totalDuration())}`;
   },
 
+  /* ---------- boundary-freeze fix, part 4: stall watchdog ----------
+     Belt-and-suspenders on top of the loader/re-entrancy/retry fixes above:
+     if `this.playing` is true (Draft, not Source mode) but the active
+     video's currentTime hasn't budged — AND we're still on the same
+     segment index — for longer than STALL_MS, something got wedged (a
+     loader edge case we didn't anticipate, a play() that silently never
+     resolved, etc.). Force a clean recovery: reload the current segment
+     from its start and resume, instead of leaving the user staring at a
+     frozen frame forever. Runs every rAF tick from _startLoop; cheap. */
+  _checkStallWatchdog() {
+    const STALL_MS = 400;
+    // Hypothesis-1 hardening: check `_intendPlaying` in addition to
+    // `this.playing`. If some future path (or one we haven't found yet)
+    // leaves `this.playing` false while the user still intended to be
+    // playing, the watchdog must still be able to see the freeze and recover
+    // — it must never depend SOLELY on `this.playing` bookkeeping being
+    // perfectly consistent.
+    if (!(this.playing || this._intendPlaying) || this.mode !== "draft" || this.sourceClipId || !this.videos) {
+      this._wdLastT = undefined;
+      return;
+    }
+    const video = this._active();
+    const t = video ? video.currentTime : 0;
+    if (this._wdLastT === undefined || t !== this._wdLastT || this._wdIndex !== this._currentIndex) {
+      this._wdLastT = t;
+      this._wdIndex = this._currentIndex;
+      this._wdSince = performance.now();
+      return;
+    }
+    if (performance.now() - this._wdSince > STALL_MS) {
+      this._recoverStall();
+      this._wdSince = performance.now(); // fresh grace window before we'd retrigger
+    }
+  },
+
+  // Hardened so this can NEVER silently no-op: the old `if (!seg) return;`
+  // meant that a `_currentIndex` desynced from the live `Editor.segments`
+  // array (e.g. a stale index from an in-flight grace-window decision racing
+  // a mid-playback EDL edit) turned every future watchdog tick into a dead
+  // no-op forever — the watchdog would keep firing every ~400ms, "recover",
+  // and do nothing, which is indistinguishable from permanently stuck. Now:
+  // clamp to the nearest valid segment and recover into THAT, or, if there
+  // are truly no segments left to play, come to a clean, truthfully-paused
+  // stop instead of leaving the UI/this.playing lying about still playing.
+  _recoverStall() {
+    console.warn("[player] boundary stall watchdog: forcing recovery at segment", this._currentIndex);
+    this._advancing = false; // whatever junction decision was stuck, abandon it
+    const segs = Editor.segments;
+    if (!segs || !segs.length) {
+      this._reconcilePlayState(false);
+      return;
+    }
+    const idx = Math.min(Math.max(this._currentIndex, 0), segs.length - 1);
+    this._currentIndex = idx;
+    const seg = segs[idx];
+    this._loadSegment(idx, seg.start, { andPlay: true });
+    // Defensive re-assert (hypothesis-3 hardening): _loadSegment reuses
+    // whichever element is currently "active" and never touches its
+    // ontimeupdate, which is correct because doSwap()/_crossfadeSwap() are
+    // the only paths that ever null it out and both always restore it on
+    // whatever becomes active — but this is the one place recovering from an
+    // truly-unanticipated wedge, so make doubly sure the active element can
+    // still report future boundaries.
+    const active = this._active();
+    if (active && !active.ontimeupdate) active.ontimeupdate = () => this._onTimeUpdate();
+    this._reconcilePlayState(true);
+  },
+
   _startLoop() {
     const tick = () => {
       try {
@@ -1041,7 +1381,20 @@ const Player = {
         if (!this.sourceClipId) {
           this._updateSubtitleOverlay();
           if (this.videos) window.EditorUI.timeline?.updatePlayhead(this.currentEdlTime());
+          // Boundary-freeze hardening v2 (hypothesis 3 belt-and-suspenders):
+          // by construction `doSwap()`/`_crossfadeSwap()` always restore
+          // `ontimeupdate` on whichever element becomes active, so this
+          // should never actually be needed — but re-asserting it here every
+          // tick is nearly free and guarantees the active element can never
+          // be left with a detached handler by some path we haven't
+          // anticipated, which would otherwise silently stop `_advance()`
+          // from ever being called again.
+          if (this.mode === "draft" && this.videos) {
+            const active = this._active();
+            if (active && !active.ontimeupdate) active.ontimeupdate = () => this._onTimeUpdate();
+          }
         }
+        this._checkStallWatchdog();
       } catch (_e) { /* never let the raf loop die */ }
       this._rafId = requestAnimationFrame(tick);
     };

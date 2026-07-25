@@ -1,6 +1,6 @@
 [project]
 name = "magic-video-editor"
-version = "0.8.0"
+version = "0.8.1"
 description = "Local-first AI video editor: whisper + ollama decide, ffmpeg cuts."
 requires-python = ">=3.11,<3.14"
 dependencies = [

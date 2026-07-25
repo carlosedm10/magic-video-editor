@@ -309,6 +309,26 @@ def main():
     # server.main running). See ffmpeg_utils.
     ffmpeg_utils.export_binaries_to_path()
 
+    # Field bug fix (auto-update first-relaunch ffprobe failure): after the
+    # app updates itself and relaunches (packaging/update_helper.sh), the
+    # FIRST launch of the newly swapped-in bundle could have ffprobe fail
+    # (a Gatekeeper first-launch assessment / App Translocation race on the
+    # just-moved bundle, and/or a cached path or PATH shim left pointing
+    # into the PREVIOUS bundle) -- a manual quit + reopen always fixed it,
+    # since by then the bundle/cache state had settled. This is the
+    # self-heal: a filesystem-only check (never spawns the vendored
+    # binary -- exists()+X_OK only) right after export_binaries_to_path(),
+    # and if it's unhappy, one automatic re-resolution pass so the FIRST
+    # post-update launch recovers on its own instead of needing a manual
+    # restart. No-op on a healthy normal launch and in dev (see
+    # ffmpeg_utils.ensure_binaries_healthy_at_startup()).
+    if not ffmpeg_utils.ensure_binaries_healthy_at_startup():
+        print(
+            "[app] WARNING: ffmpeg/ffprobe binaries still not healthy after startup "
+            "self-heal -- pipeline stages may fail until the app is fully quit and "
+            "reopened"
+        )
+
     # v6 packaging Option B (field bug fix): mirrors server.py's main(),
     # which app.py bypasses by driving uvicorn itself -- ensure_ollama() was
     # missing here entirely, so the packaged .app never spawned the bundled

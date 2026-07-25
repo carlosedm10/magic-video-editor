@@ -1,8 +1,17 @@
 /* Voice-enhancement + 8-band EQ panel.
 
    "Enhance voice" toggle (persisted via POST /api/projects/{pid}/audio-enhance)
-   plus an A/B preview row (two <audio> players loading a 10s original vs.
-   enhanced+EQ'd sample from POST /api/projects/{pid}/audio-preview), plus an
+   is neural (DeepFilterNet3) and can't run live like the 8-band EQ does —
+   it only ever audibly applies on a real render/export. The "Probar (desde
+   el cursor)" button next to it is the on-demand fix (spec v7.13 "audio
+   preview UX"): POST /api/projects/{pid}/audio-preview-at with the player's
+   current EDL cursor position (window.EditorUI.player.currentEdlTime())
+   generates a short (~8s) A/B sample of the current program audio through
+   the SAME enhance chain render.py uses, and a single <audio> element plus
+   an "Original ⇄ Mejorado" toggle lets the user compare without exporting.
+   Also still has the older clip-picker A/B preview row (two <audio> players
+   loading a 10s original vs. enhanced+EQ'd sample from
+   POST /api/projects/{pid}/audio-preview), plus an
    8-band EQ section: 8 vertical sliders (gains persisted via
    GET/PUT /api/projects/{pid}/audio-eq), a Reset button, and a couple of
    presets. EQ changes are debounce-saved to the backend (applied at
@@ -118,6 +127,19 @@ window.AudioPanel = window.AudioPanel || {
   _eqGains: null, // current 8 gains (live working copy, pre-save)
   _eqSaveTimer: null,
 
+  // ---------- on-demand "probar desde el cursor" enhance preview ----------
+  // "Enhance voice" is neural (DeepFilterNet3) and can't run live like the
+  // 8-band EQ does -- it only ever audibly applies on a real render/export.
+  // This is the on-demand fix: POST /api/projects/{pid}/audio-preview-at
+  // with the player's current EDL cursor position generates a short A/B
+  // sample (same enhance chain as render) so the user can hear it without
+  // exporting. _cursorPreview shape while idle: null. While loading:
+  // { loading: true, mode }. Once loaded:
+  // { loading: false, mode: "enhanced"|"original", start_s, duration_s,
+  //   original_url, enhanced_url, _autoplay }. On error:
+  // { loading: false, error }.
+  _cursorPreview: null,
+
   // ---------- live WebAudio EQ (draft playback) ----------
   _audioCtx: null,
   _wiredEls: null, // WeakSet<HTMLMediaElement>
@@ -212,6 +234,18 @@ window.AudioPanel = window.AudioPanel || {
     const enabled = !!project.audio_enhance;
     const clips = project.clips || [];
 
+    // Teardown: about to blow away container.innerHTML below, which would
+    // otherwise leave any currently-playing cursor-preview <audio> element
+    // orphaned/detached-but-still-playing in some browsers. Pause it first.
+    const prevCursorAudioEl = container.querySelector("#audio-cursor-preview-player");
+    if (prevCursorAudioEl) {
+      try {
+        prevCursorAudioEl.pause();
+      } catch (e) {
+        // ignore
+      }
+    }
+
     // Bug fix: _eqGains/_preview are a module-level singleton that used to
     // be seeded once ever (`if (!this._eqGains)`) and never revisited — the
     // SPA never reloads on project switch, so opening project B after A
@@ -222,6 +256,7 @@ window.AudioPanel = window.AudioPanel || {
       this._eqProjectId = project.id;
       this._eqGains = _audioEqNormalizeGains(project.audio_eq);
       this._preview = null;
+      this._cursorPreview = null;
     } else if (!this._eqGains) {
       this._eqGains = _audioEqNormalizeGains(project.audio_eq);
     }
@@ -237,6 +272,29 @@ window.AudioPanel = window.AudioPanel || {
     const clipOptions = clips
       .map((c) => `<option value="${c.id}">${esc(c.filename || c.path)}</option>`)
       .join("");
+
+    // ---------- cursor-position enhance preview markup ----------
+    const cp = this._cursorPreview;
+    let cursorStatusHtml = "";
+    let cursorPlayerHtml = "";
+    if (cp && cp.loading) {
+      cursorStatusHtml = `<span class="dim">Generando muestra…</span>`;
+    } else if (cp && cp.error) {
+      cursorStatusHtml = `<span class="dim" style="color:#c00">${esc(cp.error)}</span>`;
+    } else if (cp && cp.original_url && cp.enhanced_url) {
+      const autoplayThisRender = !!cp._autoplay;
+      cp._autoplay = false; // consume once — a later unrelated re-render must not replay it
+      const src = cp.mode === "original" ? cp.original_url : cp.enhanced_url;
+      const modeLabel = cp.mode === "original" ? "Original" : "Mejorado";
+      cursorPlayerHtml = `
+        <div class="row" style="margin-top:8px;gap:8px;align-items:center">
+          <button class="btn small" id="audio-cursor-ab-toggle">Original ⇄ Mejorado</button>
+          <span class="dim">Reproduciendo: ${modeLabel} · desde ${cp.start_s.toFixed(1)}s (${cp.duration_s.toFixed(1)}s)</span>
+        </div>
+        <div class="row" style="margin-top:6px">
+          <audio controls id="audio-cursor-preview-player" src="${src}" ${autoplayThisRender ? "autoplay" : ""}></audio>
+        </div>`;
+    }
 
     const preview = this._preview;
     const previewRow =
@@ -274,7 +332,15 @@ window.AudioPanel = window.AudioPanel || {
           </label>
           <span class="dim">Neural voice enhancement, loudness normalize (-16 LUFS)</span>
         </div>
-        <div class="hint">Applied to the final render and reels when enabled.</div>
+        <div class="hint">
+          El realce solo se aplica al render/exportación final — no se oye en Draft.
+          Usa "Probar (desde el cursor)" para escucharlo en el editor sin exportar.
+        </div>
+        <div class="row" style="margin-top:8px;gap:8px;align-items:center">
+          <button class="btn small" id="audio-cursor-preview-btn">Probar (desde el cursor)</button>
+          ${cursorStatusHtml}
+        </div>
+        ${cursorPlayerHtml}
         <div class="row" style="margin-top:12px">
           <select id="audio-preview-clip" ${clips.length ? "" : "disabled"}>
             ${clips.length ? clipOptions : '<option value="">No clips yet</option>'}
@@ -312,8 +378,47 @@ window.AudioPanel = window.AudioPanel || {
           });
           await refresh();
         } catch (e) {
-          alert(e.message);
+          showToast(e.message);
         }
+      };
+    }
+
+    const cursorBtn = container.querySelector("#audio-cursor-preview-btn");
+    if (cursorBtn) {
+      cursorBtn.onclick = async () => {
+        const t = window.EditorUI?.player?.currentEdlTime?.() ?? 0;
+        const prevMode = (this._cursorPreview && this._cursorPreview.mode) || "enhanced";
+        this._cursorPreview = { loading: true, mode: prevMode };
+        window.AudioPanel.render(container, project, refresh);
+        try {
+          const res = await api(`/projects/${state.pid}/audio-preview-at`, {
+            method: "POST",
+            body: { start_s: t, duration_s: 8 },
+          });
+          window.AudioPanel._cursorPreview = {
+            loading: false,
+            mode: "enhanced",
+            start_s: res.start_s,
+            duration_s: res.duration_s,
+            original_url: res.original_url,
+            enhanced_url: res.enhanced_url,
+            _autoplay: true,
+          };
+        } catch (e) {
+          window.AudioPanel._cursorPreview = { loading: false, error: e.message };
+        }
+        window.AudioPanel.render(container, project, refresh);
+      };
+    }
+
+    const cursorAbToggle = container.querySelector("#audio-cursor-ab-toggle");
+    if (cursorAbToggle) {
+      cursorAbToggle.onclick = () => {
+        const current = window.AudioPanel._cursorPreview;
+        if (!current || current.loading) return;
+        current.mode = current.mode === "original" ? "enhanced" : "original";
+        current._autoplay = true;
+        window.AudioPanel.render(container, project, refresh);
       };
     }
 
@@ -337,7 +442,7 @@ window.AudioPanel = window.AudioPanel || {
           };
           window.AudioPanel.render(container, project, refresh);
         } catch (e) {
-          alert(e.message);
+          showToast(e.message);
         } finally {
           previewBtn.disabled = false;
           previewBtn.textContent = "Generate preview";

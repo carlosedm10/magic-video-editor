@@ -169,7 +169,7 @@ function renderActivityPopover() {
     try {
       await api(`/projects/${state.pid}/queue/${el.dataset.cancel}`, { method: "DELETE" });
       await pollQueue();
-    } catch (e) { alert(e.message); }
+    } catch (e) { showToast(e.message); }
   });
   pop.querySelectorAll("[data-details]").forEach((el) => el.onclick = () => {
     const id = el.dataset.details;
@@ -210,7 +210,7 @@ function _wireActivityDrag(list) {
     try {
       await api(`/projects/${state.pid}/queue/reorder`, { method: "POST", body: { ids } });
       await pollQueue();
-    } catch (err) { alert(err.message); }
+    } catch (err) { showToast(err.message); }
   });
 }
 

@@ -45,6 +45,7 @@ from .api import (
 from .api import safety as safety_api
 from .api import transitions as transitions_api
 from .api import updater as updater_api
+from .pipeline import ingest as ingest_pipeline
 
 app = FastAPI(title="Magic Video Editor")
 UI_DIR = Path(__file__).parent.parent / "ui"
@@ -196,17 +197,52 @@ def media_clip(pid: str, cid: str, request: Request):
     return _stream(Path(clip["path"]), request)
 
 
+def _preview_source(clip: dict) -> str | None:
+    """Which file media_preview should stream, or None if nothing usable is
+    ready yet. Mirrors pipeline/ingest.py's `_proxy_needed` (the SAME check
+    that decides whether ingest.run()/run_make_proxy actually generate a
+    proxy for this clip) so this endpoint's browser-safety decision can
+    never drift from theirs:
+
+    - unprobed / audio-only clips (no video stream): the proxy logic simply
+      doesn't apply -- the original is fine.
+    - a browser-safe original (h264/yuv420p/<=1080p, `_proxy_needed` False):
+      serve it directly, same as today.
+    - anything else (HEVC/10-bit/4K/etc.): only the proxy is browser-safe.
+      If it hasn't been generated yet (the make_proxy:*/analyze_clip:* queue
+      job is still pending/running -- see ingest.py's
+      _enqueue_analyze_for_new_clips), there is nothing safe to stream."""
+    info = clip.get("info")
+    if not info or not info.get("has_video"):
+        return clip["path"]
+    if not ingest_pipeline._proxy_needed(info):
+        return clip["path"]
+    return clip.get("proxy") or None
+
+
 @app.get("/api/projects/{pid}/media/preview/{cid}")
 def media_preview(pid: str, cid: str, request: Request):
     """Browser-safe preview stream: the per-clip H.264 proxy when one exists
     (HEVC/10-bit/4K sources Chrome can't decode — see docs/PLATFORM-SPEC.md),
-    else the original file (already browser-playable)."""
+    else the original file when it's already browser-playable.
+
+    Bug fix: this used to fall back to the original unconditionally
+    (`clip.get("proxy") or clip["path"]`) -- for a clip whose original is
+    NOT browser-safe and whose proxy hasn't been generated yet, that served
+    an undecodable file: Chromium/WKWebView happily decode the AUDIO track
+    but not the video, so the player showed a permanent black screen with
+    sound instead of ever recovering once the proxy finished. Now: if
+    nothing browser-safe is ready yet, return 425 (Too Early) with a JSON
+    detail instead of undecodable bytes, so the UI can show a "preview
+    generating…" state and retry rather than render a black frame."""
     project = store.load(pid)
     try:
         clip = store.get_clip(project, cid)
     except KeyError:
         raise HTTPException(404) from None
-    path = clip.get("proxy") or clip["path"]
+    path = _preview_source(clip)
+    if path is None:
+        raise HTTPException(425, "preview proxy not ready")
     return _stream(Path(path), request)
 
 

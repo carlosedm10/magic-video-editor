@@ -727,7 +727,7 @@ function _mountSpeakerSelect(project) {
         await api(`/projects/${state.pid}`, { method: "PATCH", body: { speaker_count: value } });
         if (state.project) state.project.speaker_count = value;
       } catch (e) {
-        alert(`Couldn't update speaker count: ${e.message}`);
+        showToast(`Couldn't update speaker count: ${e.message}`);
         sel.value = String(project.speaker_count ?? 1);
       }
     };
@@ -788,7 +788,7 @@ function _mountLanguageSelect(project) {
         await api(`/projects/${state.pid}`, { method: "PATCH", body: { language_override: value } });
         if (state.project) state.project.language_override = value;
       } catch (e) {
-        alert(`Couldn't update language: ${e.message}`);
+        showToast(`Couldn't update language: ${e.message}`);
         sel.value = project.language_override || "auto";
       }
     };

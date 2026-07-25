@@ -37,6 +37,18 @@
 #      after the fact (previously: /tmp/mve-update-helper.log, which nobody
 #      goes looking for and which any /tmp cleaner can wipe).
 #
+# FIELD BUG #2 (owner report): ffprobe fails on the FIRST post-update
+# relaunch only -- a manual quit + reopen fixes it. Root cause: quarantine
+# was only ever stripped from the STAGED copy (step 3) before the `mv` into
+# place; an unsigned app's first launch from a "new" bundle path can still
+# trip Gatekeeper's first-launch assessment / App Translocation right at
+# that swap-in moment. Fix (step 5b, right before relaunch): re-strip
+# `com.apple.quarantine` from the FINAL live bundle path too, best-effort,
+# plus a `sync` before `open -n`. Defense in depth -- the real fix is the
+# app-side self-heal in ffmpeg_utils.py/app.py (see their headers), which
+# means even if Gatekeeper still wins this race once, the app recovers on
+# its own instead of requiring a manual quit+reopen.
+#
 # Usage (invoked by magic_video_editor/updater.py's install job, already
 # copied outside the bundle and launched fully detached):
 #
@@ -213,6 +225,33 @@ if [ "$SWAP_OK" -ne 1 ]; then
   log "update FAILED -- not relaunching (app should still be usable at its previous version, or see rollback-failure note above)"
   exit 1
 fi
+
+# --------------------------------------------------------------------------
+# 5b. FIELD BUG (first-relaunch ffprobe failure): quarantine was stripped
+# from the STAGED copy (step 4) BEFORE it was moved into place -- but `mv`
+# is a rename, not a copy, so that alone should be enough. In the field, an
+# unsigned app's *first* launch from a path it hasn't run from before can
+# still trip Gatekeeper's first-launch assessment / App Translocation
+# (macOS re-evaluates a bundle the moment it lands somewhere new, and the
+# staged copy's move-in can race that). Symptom: the nested unsigned
+# ffprobe fails to exec on the update-relaunched process, but a manual quit
+# + reopen from the canonical path works fine (translocation/assessment has
+# settled by then). Re-stripping quarantine on the FINAL, live bundle path
+# -- right before relaunch -- closes that window. Best-effort: never abort
+# the update over this, an update that landed with a lingering Gatekeeper
+# prompt is recoverable; one that never relaunches is the bug we're fixing.
+# --------------------------------------------------------------------------
+log "re-stripping com.apple.quarantine from the FINAL live bundle at $APP_BUNDLE_PATH (belt-and-suspenders for first-launch Gatekeeper/translocation)"
+if xattr -dr com.apple.quarantine "$APP_BUNDLE_PATH" >>"$LOG_FILE" 2>&1; then
+  log "quarantine attribute removed from live bundle"
+else
+  log "xattr -dr com.apple.quarantine on live bundle failed or had nothing to remove -- continuing anyway"
+fi
+
+# Let the rename/xattr changes settle on disk before we hand off to `open`
+# -- cheap insurance against relaunching before the filesystem/Gatekeeper's
+# view of the just-swapped-in bundle is fully consistent.
+sync 2>/dev/null || true
 
 # --------------------------------------------------------------------------
 # 6. Relaunch (app-first: a fresh instance, not reusing stale window state).

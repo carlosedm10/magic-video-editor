@@ -121,6 +121,10 @@ fuzzy dedup misses these. New LLM pass (task `transcript_cleaner`) runs inside t
 - ffmpeg only through magic_video_editor/ffmpeg_utils.py (`ffmpeg_bin()` handles the libass fallback).
 - Never `git commit` — the orchestrator handles git.
 - File ownership per task is strict (listed in each task brief) to allow parallel work.
+- **HARD RULE — versioning: NEVER tag `v1.0.0` (or any `v1.x`/`V1`). Stay sub-1.0 forever.**
+  Bump freely within 0.x (0.8.1, 0.9.0, … even 0.12.21 — the minor/patch numbers are
+  unbounded), but the `1.0` milestone is released ONLY when the owner (carlosedm10) explicitly
+  says so. No agent or orchestrator may cut a v1 tag on its own initiative.
 
 ---
 
@@ -1251,3 +1255,61 @@ the program (loop/trim path); ducking on/off toggles `sidechaincompress` in the
 built filtergraph; missing-asset/past-end `start_s` are safe no-ops; a structural
 guard that `pipeline/ordering.py` has no notion of `audio_assets`/`audio_track` at
 all.
+
+# vNext — Reel dedup analyst (owner request, 2026-07-25: "el creador de reels no
+debería hacer 20 siempre. 20 es el MÁXIMO")
+
+`config.REEL_SUGGESTIONS` (20) is a **ceiling**, not a target. `pipeline/reels.py`'s
+`suggest()` used to always pad its pick loop up to 20 candidates whenever enough
+existed, which meant weak/near-identical windows got promoted just to fill the
+count — practically identical reels suggested side by side.
+
+**The distinction that matters (owner said it twice):** talking about a similar
+TOPIC is not the same as repeating the same clip.
+- **Duplicate (collapse it):** two reels built from the SAME underlying source
+  moment — same clip(s), an overlapping/near-identical source time window, and/or
+  near-identical transcript wording. The same moment packaged twice.
+- **Not a duplicate (keep both):** two reels from DIFFERENT moments/segments that
+  merely discuss a similar theme. Different footage/wording, related subject —
+  these are legitimately distinct suggestions.
+
+## Mechanism (mirrors `pipeline/takes.py`'s cross-clip dedup design exactly)
+1. **Gather a buffered pool.** The existing top-N/mutual-overlap gather (`_overlap`
+   < 0.45) now collects up to `REEL_SUGGESTIONS * REEL_DEDUP_POOL_MULTIPLIER`
+   candidates instead of stopping at the ceiling — otherwise there'd be nothing left
+   to dedup once the ceiling truncated the list.
+2. **Structural pre-filter for candidate PAIRS** (`_reel_dedup_candidate_pairs`):
+   flags a pair only when it shares a clip_id with an overlapping/near-adjacent
+   source window (reusing `_overlap`) and/or has near-identical transcript text
+   (rapidfuzz `token_set_ratio` ≥ `REEL_DEDUP_TEXT_SIM_CANDIDATE`). Deliberately
+   never filters on shared keywords/topic — that's exactly the signal that must
+   NOT trigger a merge. Capped at `REEL_DEDUP_MAX_PAIRS` candidate pairs.
+3. **`reel_dedup` LLM agent** (`agents/agents.py` AGENT_SPECS, prompt in
+   `agents/prompts.py`, schema `ReelDedup` in `agents/schemas.py`) judges each
+   pre-filtered pair: same underlying moment (duplicate) vs. same theme/different
+   footage (keep both), plus `keep: "a"|"b"` (prefer the higher score/longer/
+   stronger hook) and a 1-5 `confidence`.
+4. **Two-tier confidence gate**, same shape as `CROSS_DEDUP_AUTOCUT_CONFIDENCE`/
+   `CROSS_DEDUP_SUGGEST_CONFIDENCE`: `same_content` + confidence ≥
+   `REEL_DEDUP_COLLAPSE_CONFIDENCE` auto-collapses the pair (the weaker reel is
+   dropped from the pool); confidence ≥ `REEL_DEDUP_FLAG_CONFIDENCE` (but below
+   collapse) keeps BOTH and sets the weaker reel's `reel["dedup_flag"]` to the
+   agent's reason instead of cutting anything. Biased toward keeping when
+   uncertain — a false merge silently destroys a good, distinct suggestion, which
+   is worse than a near-dup slipping through for a human to dismiss.
+5. **Ceiling applied last.** Only after dedup collapses true duplicates is the pool
+   sorted by score and truncated to `REEL_SUGGESTIONS` — `project["reels"]` can end
+   up with far fewer than 20 when that's all the distinct content supports.
+
+New config (`config.py`): `REEL_DEDUP_MIN_WINDOW_OVERLAP` (0.25),
+`REEL_DEDUP_TEXT_SIM_CANDIDATE` (70), `REEL_DEDUP_MAX_PAIRS` (30),
+`REEL_DEDUP_COLLAPSE_CONFIDENCE` (4), `REEL_DEDUP_FLAG_CONFIDENCE` (2),
+`REEL_DEDUP_POOL_MULTIPLIER` (2).
+
+Covered by `scripts/test_reel_dedup.py` (mocked `reel_dedup` agent, scratch
+`MVE_DATA`): two reels from the same clip with overlapping windows + near-identical
+text are flagged as a candidate pair and, on a high-confidence mock verdict,
+collapsed to one; two reels from different source windows sharing only a topic are
+NOT flagged and both survive; the returned count is the number of distinct reels,
+never padded to the ceiling; the structural pre-filter keys on source-window
+overlap/text similarity, not topic keywords.

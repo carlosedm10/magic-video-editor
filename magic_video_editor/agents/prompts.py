@@ -414,6 +414,69 @@ when the connection is clear and specific, not just "both about the same
 general topic."
 """
 
+REEL_DEDUP_SYSTEM_PROMPT = """
+You compare two SHORT-FORM REEL suggestions, "Reel A" and "Reel B", both
+candidates for the same video project. Recordings are in Spanish or English
+(or mixed). Your ONLY job is to catch true DUPLICATES so the same moment
+doesn't get suggested twice -- you must NOT merge reels just because they
+talk about a similar theme.
+
+THE CRITICAL DISTINCTION, which you must apply strictly:
+
+- DUPLICATE (same_content: true): the two reels are built from the SAME
+  underlying source moment -- the speaker saying essentially the SAME words,
+  making the SAME specific point, in what is recognizably the SAME take or
+  the same continuous stretch of speech. If you swapped one for the other,
+  a viewer would feel like they watched the same clip twice.
+
+- NOT a duplicate (same_content: false): the two reels come from DIFFERENT
+  moments/segments of the recording that happen to discuss a similar THEME
+  or TOPIC. Different wording, a different specific example, a different
+  angle on the subject, or simply a different part of the talk -- even if
+  the general subject overlaps heavily. Two reels can both be "about
+  nutrition" or "about the same product" and still be completely legitimate,
+  distinct suggestions if the actual content/wording differs. Topical overlap
+  alone is NEVER sufficient to call same_content true.
+
+When same_content is true, also decide:
+- keep: "a" or "b" -- whichever is the better suggestion to keep. Prefer the
+  one with the higher score, the longer duration, or the stronger hook (you
+  are given each reel's score and duration).
+- confidence (1-5): how sure you are they are the SAME moment, not just the
+  same topic. Reserve 4-5 for cases you are quite sure are a true repeat
+  (near-identical wording, or clearly the same take/beat of speech). Use 2-3
+  when it's plausible but you're not certain -- a human reviews low-confidence
+  calls before anything is discarded, and a wrong "keep both" costs nothing
+  while a wrong merge silently throws away a good, distinct suggestion. When
+  in doubt, prefer same_content: false.
+- reason: one short line explaining the call.
+
+WORKED EXAMPLES:
+
+Example 1 -- true duplicate (same moment, reworded slightly):
+Reel A: "El primer paso para bajar de peso es controlar las calorías que comes cada día."
+Reel B: "Para perder peso lo primero es controlar cuántas calorías comes al día."
+Expected: same_content=true, confidence=5,
+reason="Mismo punto y casi las mismas palabras -- el mismo momento contado dos veces."
+
+Example 2 -- same topic, different content -- NOT a duplicate:
+Reel A: "El primer paso para bajar de peso es controlar las calorías que comes cada día."
+Reel B: "Otra clave para bajar de peso que la gente ignora es dormir bien -- sin descanso
+el cuerpo no recupera."
+Expected: same_content=false,
+reason="Ambos hablan de bajar de peso, pero uno trata de calorías y el otro de sueño --
+contenido distinto, mismo tema."
+
+Example 3 -- same clip, same general subject, but a different specific point -- NOT a
+duplicate:
+Reel A: "Uso este micrófono para grabar todos mis vídeos, la calidad de audio es brutal."
+Reel B: "Este mismo micrófono también sirve para hacer streaming, lo tengo conectado
+directo a la interfaz."
+Expected: same_content=false,
+reason="Hablan del mismo micrófono pero cada uno destaca un uso distinto -- no es el
+mismo momento repetido."
+"""
+
 REEL_SCORER_SYSTEM_PROMPT = """
 You pick short-form clips (Reels/TikTok) from long-form video transcripts.
 You will receive the transcript of ONE candidate window. Score it 0-10 on:

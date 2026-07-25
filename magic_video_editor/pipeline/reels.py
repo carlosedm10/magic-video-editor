@@ -62,6 +62,32 @@ imported lazily so this module works whether or not that file has landed
 yet. On success it replaces reel_scorer's title; on failure/absence the
 scorer's title is kept as a fallback.
 
+Reel dedup analyst (vNext "distinct reels, not always REEL_SUGGESTIONS" --
+owner-reported: "por intentar llenar los 20 crea reels prácticamente
+idénticos"): config.REEL_SUGGESTIONS is a CEILING on how many reels `suggest`
+may return, never a target it pads toward. After the single-window scoring
+pass (and the composer pass above), the top-N/overlap-limited gather builds a
+POOL buffered beyond the ceiling (REEL_DEDUP_POOL_MULTIPLIER), then
+`_run_reel_dedup_pass` looks for reels that are the SAME underlying source
+moment repackaged twice -- as opposed to reels that merely share a topic with
+different footage/wording, which must both survive. Two-stage design
+mirroring takes.py's cross-clip dedup (_cross_clip_dedup): a cheap structural
+pre-filter (`_reel_dedup_candidate_pairs`) flags a pair only when it shares a
+source-content signal -- an overlapping/near-adjacent window on the same
+clip_id (`_overlap`, reused from the top-N pick's own mutual-overlap limit)
+and/or near-identical transcript text (rapidfuzz token_set_ratio) -- never on
+shared keywords/topic alone. Only pre-filtered pairs go to the 'reel_dedup'
+LLM agent (task registered in agents.py, prompt in prompts.py), which judges
+same_content + confidence + which to keep. A high-confidence verdict
+(REEL_DEDUP_COLLAPSE_CONFIDENCE) collapses the pair down to the better
+candidate; a lower-but-still-flagged confidence (REEL_DEDUP_FLAG_CONFIDENCE)
+keeps BOTH and annotates the weaker one's reel["dedup_flag"] instead of
+cutting anything -- biased toward keeping when uncertain, since a false merge
+silently destroys a good, distinct suggestion. Only AFTER this pass is the
+pool sorted and truncated to config.REEL_SUGGESTIONS, so `project["reels"]`
+may end up with far fewer than the ceiling when that's all the distinct
+content supports.
+
 Preview render (spec v7.14 "Reel preview render"): the drawer used to have
 nothing decodable to point a <video> at for a suggestion (no rendered file)
 and the full render is too expensive to run eagerly for all ~20 candidates.
@@ -269,6 +295,84 @@ def _run_composer_pass(log, scored: list[dict]) -> list[dict]:
     return combined
 
 
+def _reel_dedup_candidate_pairs(pool: list[dict]) -> list[tuple[dict, dict]]:
+    """Structural pre-filter for the reel_dedup pass (vNext "distinct reels,
+    not always REEL_SUGGESTIONS"), mirroring takes.py's _cross_clip_dedup /
+    _rare_keyword_buckets two-stage design: a pair only reaches the LLM when
+    it shares a SOURCE-CONTENT signal -- an overlapping/near-adjacent window
+    on the same clip_id (`_overlap`, already used by the top-N pick's own
+    mutual-overlap limit) and/or near-identical transcript TEXT (rapidfuzz
+    token_set_ratio). Deliberately does NOT look at topic/keyword overlap --
+    two reels about the same theme with different wording must never reach
+    this filter, only ones that plausibly repeat the same moment. Ranked by
+    the stronger of the two signals and capped at REEL_DEDUP_MAX_PAIRS."""
+    ranked = []
+    for i in range(len(pool)):
+        for j in range(i + 1, len(pool)):
+            a, b = pool[i], pool[j]
+            overlap = _overlap(a, b)
+            sim = fuzz.token_set_ratio(a["text"], b["text"])
+            if (
+                overlap >= config.REEL_DEDUP_MIN_WINDOW_OVERLAP
+                or sim >= config.REEL_DEDUP_TEXT_SIM_CANDIDATE
+            ):
+                ranked.append((max(overlap, sim / 100.0), a, b))
+    ranked.sort(key=lambda t: -t[0])
+    return [(a, b) for _, a, b in ranked[: config.REEL_DEDUP_MAX_PAIRS]]
+
+
+def _run_reel_dedup_pass(log, pool: list[dict]) -> list[dict]:
+    """Runs the 'reel_dedup' agent over each structurally pre-filtered
+    candidate pair (see _reel_dedup_candidate_pairs). A high-confidence
+    "same underlying moment" verdict collapses the pair down to the better
+    candidate (the weaker one is dropped from the pool); a borderline
+    verdict keeps BOTH but annotates the weaker one with a `_dedup_flag`
+    note (carried into reel["dedup_flag"] by `suggest`) instead of silently
+    cutting anything. Mirrors takes.py's _cross_clip_dedup two-tier
+    confidence gate (CROSS_DEDUP_AUTOCUT_CONFIDENCE/SUGGEST_CONFIDENCE) via
+    REEL_DEDUP_COLLAPSE_CONFIDENCE/FLAG_CONFIDENCE. Bias toward KEEPING when
+    uncertain -- a pair only ever collapses on same_content=True at or above
+    the collapse confidence; every other outcome (same_content=False, low
+    confidence, or an agent error) leaves both candidates in the pool.
+    Fail-open per pair, like every other agent pass in this pipeline."""
+    pairs = _reel_dedup_candidate_pairs(pool)
+    if not pairs:
+        return pool
+    log(f"{len(pairs)} candidate duplicate pair(s) for reel_dedup")
+    agent = get_agent("reel_dedup")
+    removed_ids: set[int] = set()
+    for a, b in pairs:
+        if id(a) in removed_ids or id(b) in removed_ids:
+            continue  # already collapsed via an earlier, stronger pair
+        prompt = (
+            f'Reel A — "{a.get("title", "")}" ({a["duration"]}s, score {a["score"]}):\n'
+            f'"{a["text"][:800]}"\n\n'
+            f'Reel B — "{b.get("title", "")}" ({b["duration"]}s, score {b["score"]}):\n'
+            f'"{b["text"][:800]}"'
+        )
+        try:
+            result = agent.run_sync(prompt).output
+        except Exception as e:
+            log(f"reel_dedup pair error, skipping ({e})")
+            continue
+        if not result.same_content:
+            continue
+        loser = b if result.keep == "a" else a
+        winner = a if loser is b else b
+        if result.confidence >= config.REEL_DEDUP_COLLAPSE_CONFIDENCE:
+            removed_ids.add(id(loser))
+            log(
+                f"reel_dedup: collapsing duplicate reel {loser.get('title', '')!r} "
+                f"into {winner.get('title', '')!r} — {result.reason}"
+            )
+        elif result.confidence >= config.REEL_DEDUP_FLAG_CONFIDENCE:
+            loser["_dedup_flag"] = (
+                result.reason or "possible duplicate of another suggestion"
+            )[:200]
+            log(f"reel_dedup: borderline duplicate flagged, keeping both — {result.reason}")
+    return [c for c in pool if id(c) not in removed_ids]
+
+
 def _hashtags_list(value) -> list[str]:
     """Normalize the copywriter's `hashtags` output into a list of tag
     strings. copywriter.py's CopywriterOutput.hashtags is a single
@@ -342,14 +446,41 @@ def suggest(log, project: dict) -> None:
     if composed_candidates:
         log(f"Composer combined {len(composed_candidates)} pair(s).")
 
-    # top N with limited mutual overlap (singles + composed pairs uniformly)
+    # Gather a POOL with limited mutual overlap (singles + composed pairs
+    # uniformly), buffered BEYOND the REEL_SUGGESTIONS ceiling
+    # (REEL_DEDUP_POOL_MULTIPLIER) so the reel_dedup pass below has enough
+    # distinct-ish candidates to collapse from -- the ceiling is applied only
+    # AFTER dedup, never during this gather (vNext "distinct reels, not
+    # always REEL_SUGGESTIONS": the ceiling is a MAXIMUM, not a target, so we
+    # must not truncate away real candidates before checking for dupes).
     all_candidates = sorted(scored + composed_candidates, key=lambda c: -c["score"])
-    picked = []
+    pool_cap = config.REEL_SUGGESTIONS * config.REEL_DEDUP_POOL_MULTIPLIER
+    pool = []
     for c in all_candidates:
-        if all(_overlap(c, p) < 0.45 for p in picked):
-            picked.append(c)
-        if len(picked) >= config.REEL_SUGGESTIONS:
+        if all(_overlap(c, p) < 0.45 for p in pool):
+            pool.append(c)
+        if len(pool) >= pool_cap:
             break
+
+    # Reel dedup analyst pass (vNext, user-reported bug: "por intentar llenar
+    # los 20 crea reels prácticamente idénticos"): catches SAME-CONTENT reels
+    # the 0.45 mutual-overlap gather above can miss (different clips, or a
+    # low-overlap-but-near-identical window on the same clip). A reel sharing
+    # merely a TOPIC with another is explicitly NOT a duplicate and must
+    # survive -- see _reel_dedup_candidate_pairs / REEL_DEDUP_SYSTEM_PROMPT.
+    pool_before = len(pool)
+    if len(pool) >= 2:
+        log("Checking suggested reels for duplicates (same content, not just same topic)...")
+        try:
+            pool = _run_reel_dedup_pass(log, pool)
+        except Exception as e:
+            log(f"reel dedup pass error, skipping ({e})")
+    n_collapsed = pool_before - len(pool)
+    if n_collapsed:
+        log(f"reel_dedup collapsed {n_collapsed} duplicate reel(s).")
+
+    # Ceiling, not a target: however many DISTINCT reels remain, capped here.
+    picked = sorted(pool, key=lambda c: -c["score"])[: config.REEL_SUGGESTIONS]
 
     project["reels"] = []
     for i, c in enumerate(picked):
@@ -410,6 +541,11 @@ def suggest(log, project: dict) -> None:
             # Preview render (spec v7.14) — see PREVIEW_W/_H above.
             "preview_ready": False,
             "preview_hash": None,
+            # Reel dedup analyst (vNext) — set only when a borderline
+            # (FLAG_CONFIDENCE <= confidence < COLLAPSE_CONFIDENCE) verdict
+            # kept this reel alongside a possible near-duplicate rather than
+            # collapsing it; None otherwise. Report-only, never auto-cut.
+            "dedup_flag": c.get("_dedup_flag"),
         }
         if composed:
             reel["composer_why"] = c.get("composer_why", "")
@@ -426,8 +562,9 @@ def suggest(log, project: dict) -> None:
     store.save(project)
     n_composed = sum(1 for r in project["reels"] if r.get("composed"))
     log(
-        f"Suggested {len(picked)} reels (from {len(scored)} scored candidates, "
-        f"{n_composed} composed)."
+        f"Suggested {len(picked)} distinct reels (ceiling {config.REEL_SUGGESTIONS}; "
+        f"from {len(scored)} scored candidates, {n_composed} composed, "
+        f"{n_collapsed} duplicate(s) collapsed)."
     )
 
 
@@ -614,6 +751,7 @@ def ensure_segments(reel: dict) -> None:
     reel.setdefault("composed", False)
     reel.setdefault("preview_ready", False)
     reel.setdefault("preview_hash", None)
+    reel.setdefault("dedup_flag", None)
     _normalize_transitions(reel)
     _sync_legacy_fields(reel)
     _normalize_transform(reel)

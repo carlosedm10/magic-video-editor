@@ -118,6 +118,17 @@ window.EditorUI.mediabin = {
     list.querySelectorAll(".bin-clip[data-clip]").forEach((el) => {
       const enter = (e) => {
         if (e.target.closest("button")) return;
+        const clip = project.clips.find((c) => c.id === el.dataset.clip);
+        // Bug fix: a clip whose preview proxy is still generating (see
+        // pipeline/ingest.py's make_proxy:*/analyze_clip:* queue jobs) has
+        // nothing browser-safe for server.py's media_preview to stream yet
+        // -- entering source mode used to hit a black player (silently
+        // served the undecodable HEVC/10-bit original) or now a 425. Show a
+        // quick hint instead of handing player.js a clip it can't play.
+        if (this._proxyPending(clip)) {
+          showToast(`Preview generating for "${clip.filename}"…`);
+          return;
+        }
         window.EditorUI?.player?.enterSourceMode?.(el.dataset.clip);
       };
       el.addEventListener("click", enter);
@@ -137,7 +148,7 @@ window.EditorUI.mediabin = {
       refreshProject();
     });
     list.querySelectorAll("[data-del]").forEach((el) => el.onclick = async () => {
-      if (!confirm("Remove this clip from the project?")) return;
+      if (!await confirmModal("Remove this clip from the project?", { danger: true, okLabel: "Delete" })) return;
       await api(`/projects/${project.id}/clips/${el.dataset.del}`, { method: "DELETE" });
       refreshProject();
     });
@@ -145,10 +156,19 @@ window.EditorUI.mediabin = {
   },
 
   _proxyTag(c) {
-    if (!c.info || !c.info.has_video) return "";
-    if (!("proxy" in c)) return '<span class="dim" title="Generating preview proxy…"><i data-lucide="loader-2" class="lucide-spin"></i></span>';
-    if (c.proxy) return '<span class="pill dim" title="H.264 preview proxy ready">proxy</span>';
+    if (this._proxyPending(c)) return '<span class="dim" title="Generating preview proxy…"><i data-lucide="loader-2" class="lucide-spin"></i></span>';
+    if (c.info && c.info.has_video && c.proxy) return '<span class="pill dim" title="H.264 preview proxy ready">proxy</span>';
     return "";
+  },
+
+  // True while a clip has video but no "proxy" key yet -- the
+  // make_proxy:*/analyze_clip:* queue job (pipeline/ingest.py) hasn't run
+  // (or finished) for it. Cleared to a normal state (proxy pill, or nothing
+  // for an already browser-safe original) the moment the key appears, which
+  // happens via the existing 2s queue poll -> refreshProject() once the
+  // queue item settles (ui/core.js) -- no new poller needed here.
+  _proxyPending(c) {
+    return !!(c && c.info && c.info.has_video && !("proxy" in c));
   },
 
   /* ---------- main audio track: audio_assets section (spec vNext) ----------
@@ -193,7 +213,7 @@ window.EditorUI.mediabin = {
     el.querySelectorAll("[data-del-audio]").forEach((btn) => {
       btn.onclick = async (e) => {
         e.stopPropagation();
-        if (!confirm("Remove this audio file from the project?")) return;
+        if (!await confirmModal("Remove this audio file from the project?", { danger: true, okLabel: "Delete" })) return;
         await api(`/projects/${project.id}/audio-assets/${btn.dataset.delAudio}`, { method: "DELETE" });
         refreshProject();
       };
@@ -508,6 +528,12 @@ window.EditorUI.mediabin = {
     const style = document.createElement("style");
     style.id = "mvebin-dnd-style";
     style.textContent = `
+      /* Draggable-to-timeline affordance (spec #4 "manual is first-class"):
+         a plain grab cursor + hover cue so dragging a clip onto the timeline
+         reads as an obvious, primary action, not a hidden feature. */
+      .bin-clip[draggable="true"] { cursor: grab; }
+      .bin-clip[draggable="true"]:active { cursor: grabbing; }
+      .bin-clip[draggable="true"]:hover { box-shadow: inset 0 0 0 1px var(--border); }
       .mvebin-uploads { flex-shrink: 0; margin-bottom: 6px; }
       .mvebin-upload-row { opacity: .9; }
       .mvebin-upload-bar { width: 64px; flex-shrink: 0; }

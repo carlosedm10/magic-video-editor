@@ -288,7 +288,7 @@ window.ColorPanel = window.ColorPanel || {
     if (deleteBtn) {
       deleteBtn.onclick = async () => {
         if (!cfg.lut.name) return;
-        if (!confirm(`Remove "${cfg.lut.name}" from the LUT library? This can't be undone.`)) return;
+        if (!(await confirmModal(`Remove "${cfg.lut.name}" from the LUT library? This can't be undone.`, { okLabel: "Remove", danger: true }))) return;
         try {
           await api(`/luts/${encodeURIComponent(cfg.lut.name)}`, { method: "DELETE" });
           cfg.lut.name = null;

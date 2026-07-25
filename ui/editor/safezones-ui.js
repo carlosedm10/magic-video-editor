@@ -336,7 +336,7 @@
         this._runCheck();
       } catch (e) {
         if (btn) { btn.disabled = false; btn.textContent = "Arreglar: zoom out con fondo blur"; }
-        alert(`No se pudo aplicar el ajuste: ${e.message}`);
+        showToast(`No se pudo aplicar el ajuste: ${e.message}`);
       }
     },
 

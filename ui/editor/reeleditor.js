@@ -220,7 +220,7 @@
         this._openInner(rid);
       } catch (e) {
         console.error("ReelEditor failed to open", e);
-        alert("Could not open the Reel Editor — see console.");
+        showToast("Could not open the Reel Editor — see console.");
       }
     },
 
@@ -228,7 +228,7 @@
       if (!state.pid || !state.project) return;
       const reel = (state.project.reels || []).find((r) => r.id === rid);
       if (!reel) {
-        alert("Reel not found — it may have been re-suggested since this view loaded.");
+        showToast("Reel not found — it may have been re-suggested since this view loaded.");
         return;
       }
       this.pid = state.pid;
@@ -1326,7 +1326,7 @@
        strip)") ---- */
 
     _openAddPicker() {
-      if (!this.clip) { alert("Source clip not found — can't add a segment."); return; }
+      if (!this.clip) { showToast("Source clip not found — can't add a segment."); return; }
       const picker = document.getElementById("re-add-picker");
       if (!picker) return;
       picker.hidden = false;
@@ -1447,7 +1447,7 @@
           this._mergeReel(updated);
           this._renderReelTab();
         } catch (e) {
-          alert(`Regenerate failed: ${e.message}`);
+          showToast(`Regenerate failed: ${e.message}`);
           regenBtn.disabled = false;
           regenBtn.innerHTML = '<i data-lucide="refresh-cw"></i> Regenerate copy';
           refreshIcons();
@@ -1674,7 +1674,7 @@
           await pollQueue();
           this._renderExportTab();
         } catch (e) {
-          alert(`Couldn't queue render: ${e.message}`);
+          showToast(`Couldn't queue render: ${e.message}`);
         }
       };
       const openBtn = el.querySelector("#re-open-folder");
@@ -1682,7 +1682,7 @@
         const dir = (reel.path || "").replace(/\/[^/]*$/, "");
         if (!dir) return;
         try { await api("/open-folder", { method: "POST", body: { path: dir } }); }
-        catch (e) { alert(`Couldn't open folder: ${e.message}`); }
+        catch (e) { showToast(`Couldn't open folder: ${e.message}`); }
       };
       refreshIcons();
     },

@@ -377,8 +377,40 @@ def _static_ffmpeg_exes() -> tuple[str | None, str | None]:
         return None, None
 
 
-@functools.cache
-def ffmpeg_bin() -> str:
+def _is_usable_path(path: str | None) -> bool:
+    """True if `path` looks like a real, executable file right now. Used to
+    decide whether a previously-cached resolution is still trustworthy --
+    a bare command name (e.g. "ffmpeg" resolved via PATH lookup at call
+    time, not a fixed path) is treated as always-usable here since its
+    liveness is re-checked by _bin_works()/_supports_ass() at resolve time,
+    not by stat()'ing a fixed path."""
+    if not path:
+        return False
+    p = Path(path)
+    if not p.is_absolute():
+        return True
+    try:
+        return p.exists() and os.access(p, os.X_OK)
+    except OSError:
+        return False
+
+
+# Field bug (post-update first relaunch): ffmpeg_bin()/ffprobe_bin() used to
+# be plain @functools.cache -- once resolved, a path baked into the process
+# forever. If the app auto-updates and relaunches into a new bundle whose
+# nested vendored binary isn't executable YET (Gatekeeper first-launch
+# assessment / App Translocation racing the swap, see
+# packaging/update_helper.sh's header), a resolution made during that brief
+# window would otherwise be cached and never retried for the rest of that
+# process's life. These now use a manual cache (module-level dict, guarded
+# by a lock) that _is_usable_path() can invalidate on the next call instead
+# of trusting a stale hit forever.
+_ffmpeg_bin_cache: str | None = None
+_ffprobe_bin_cache: str | None = None
+_bin_cache_lock = threading.Lock()
+
+
+def _resolve_ffmpeg_bin() -> str:
     """Prefer an ffmpeg that can burn subtitles (libass). Homebrew's ffmpeg 8
     formula ships without libass, so fall back to the static build bundled
     with imageio-ffmpeg, and finally to the `static-ffmpeg` package's build
@@ -413,8 +445,28 @@ def ffmpeg_bin() -> str:
     return chosen
 
 
-@functools.cache
-def ffprobe_bin() -> str:
+def ffmpeg_bin() -> str:
+    """Cached resolution of the ffmpeg binary this module should use -- see
+    _resolve_ffmpeg_bin() for the candidate order. SELF-HEALING (field bug:
+    first relaunch after an auto-update could fail if the cached path
+    became stale mid-swap): if the cached path no longer exists/isn't
+    executable, it is NOT returned -- re-resolve from scratch instead of
+    trusting a dangling cache entry for the rest of the process's life."""
+    global _ffmpeg_bin_cache
+    with _bin_cache_lock:
+        if _ffmpeg_bin_cache is not None and _is_usable_path(_ffmpeg_bin_cache):
+            return _ffmpeg_bin_cache
+        if _ffmpeg_bin_cache is not None:
+            print(
+                f"[ffmpeg_utils] cached ffmpeg binary {_ffmpeg_bin_cache!r} is no longer "
+                "usable -- re-resolving"
+            )
+            _supports_ass.cache_clear()
+        _ffmpeg_bin_cache = _resolve_ffmpeg_bin()
+        return _ffmpeg_bin_cache
+
+
+def _resolve_ffprobe_bin() -> str:
     """Resolve ffprobe: env override -> system ffprobe -> the `static-ffmpeg`
     package's bundled ffprobe. imageio-ffmpeg ships ffmpeg only (no ffprobe),
     so it is NOT a candidate here -- static-ffmpeg is the only fallback that
@@ -442,6 +494,29 @@ def ffprobe_bin() -> str:
     chosen = next((cand for cand in candidates if _bin_works(cand)), candidates[0])
     print(f"[ffmpeg_utils] using ffprobe binary: {chosen}")
     return chosen
+
+
+def ffprobe_bin() -> str:
+    """Cached resolution of the ffprobe binary this module should use -- see
+    _resolve_ffprobe_bin() for the candidate order. SELF-HEALING (field bug:
+    ffprobe failing on the FIRST relaunch after an auto-update, fixed by a
+    manual quit+reopen): if the cached path no longer exists/isn't
+    executable -- e.g. it pointed into a bundle that has since been
+    replaced by the swap, or a Gatekeeper first-launch assessment hadn't
+    settled yet when it was first resolved -- it is NOT returned; re-resolve
+    from scratch instead of trusting a dangling cache entry."""
+    global _ffprobe_bin_cache
+    with _bin_cache_lock:
+        if _ffprobe_bin_cache is not None and _is_usable_path(_ffprobe_bin_cache):
+            return _ffprobe_bin_cache
+        if _ffprobe_bin_cache is not None:
+            print(
+                f"[ffmpeg_utils] cached ffprobe binary {_ffprobe_bin_cache!r} is no longer "
+                "usable -- re-resolving"
+            )
+            _bin_works.cache_clear()
+        _ffprobe_bin_cache = _resolve_ffprobe_bin()
+        return _ffprobe_bin_cache
 
 
 def supports_subtitles() -> bool:
@@ -472,6 +547,74 @@ def binaries_status() -> dict:
         "ffprobe_path": ffprobe_path,
         "ffmpeg_libass": _supports_ass(ffmpeg_path) if ffmpeg_path else False,
     }
+
+
+def binaries_healthy() -> bool:
+    """Filesystem-only health check (NEVER spawns the resolved binary --
+    just exists()+os.access(X_OK), same test _is_usable_path() uses): True
+    if ffmpeg_bin() and ffprobe_bin() both resolve to a path that is
+    currently a real, executable file (or a bare command name, trusted to
+    resolve at call time). Used by app.py's startup self-heal (field bug:
+    ffprobe failing on the FIRST post-update relaunch) to decide whether a
+    re-resolution pass is needed, without ever exec'ing the vendored
+    binary itself."""
+    try:
+        ffmpeg_path = ffmpeg_bin()
+    except FFmpegError:
+        return False
+    try:
+        ffprobe_path = ffprobe_bin()
+    except FFmpegError:
+        return False
+    return _is_usable_path(ffmpeg_path) and _is_usable_path(ffprobe_path)
+
+
+def invalidate_binary_caches() -> None:
+    """Force every cached resolution in this module (ffmpeg_bin()/
+    ffprobe_bin()'s manual caches, the _supports_ass()/_bin_works()
+    functools caches, and the exported PATH shim state) back to
+    unresolved, so the NEXT call to any of them re-resolves from scratch
+    instead of trusting anything decided earlier in this process. Used by
+    app.py's startup self-heal when binaries_healthy() reports a problem
+    right after an auto-update relaunch."""
+    global _ffmpeg_bin_cache, _ffprobe_bin_cache, _exported_shim_dir
+    with _bin_cache_lock:
+        _ffmpeg_bin_cache = None
+        _ffprobe_bin_cache = None
+    _supports_ass.cache_clear()
+    _bin_works.cache_clear()
+    with _export_lock:
+        _exported_shim_dir = None
+
+
+def ensure_binaries_healthy_at_startup() -> bool:
+    """Startup self-heal entrypoint (field bug: after an auto-update
+    relaunches the app, ffprobe fails on that FIRST relaunch only -- a
+    manual quit + reopen fixes it; see packaging/update_helper.sh and this
+    module's ffmpeg_bin()/ffprobe_bin()/export_binaries_to_path() for the
+    two suspected causes: a Gatekeeper first-launch race on the just-
+    swapped bundle, and/or a stale cached path or PATH shim left over from
+    the PREVIOUS bundle). Call once, right after export_binaries_to_path(),
+    from app.py's main(): if a fs-only health check (no exec) reports a
+    problem, invalidate every cache and retry resolution ONCE so the first
+    post-update launch can recover on its own instead of requiring the user
+    to quit and reopen. Returns the final healthy/unhealthy state (for
+    logging) -- never raises."""
+    try:
+        if binaries_healthy():
+            return True
+        print(
+            "[ffmpeg_utils] startup health check failed (ffmpeg/ffprobe path missing or "
+            "not executable) -- re-resolving once (self-heal)"
+        )
+        invalidate_binary_caches()
+        export_binaries_to_path()
+        healthy = binaries_healthy()
+        print(f"[ffmpeg_utils] self-heal re-resolution result: healthy={healthy}")
+        return healthy
+    except Exception as e:
+        print(f"[ffmpeg_utils] startup health self-heal itself failed (non-fatal): {e}")
+        return False
 
 
 _exported_shim_dir: str | None = None
@@ -516,12 +659,19 @@ def export_binaries_to_path() -> str | None:
     ffmpeg_utils._exported_shim_dir = None). Returns the shim dir path if
     PATH now includes it (freshly created or already prepended earlier in
     this process), else None if no shim was necessary.
+
+    SELF-HEALING (field bug: first relaunch after an auto-update): the
+    "already handled this process" shortcut below used to return early
+    just because a shim DIR existed / had been visited before, even if the
+    shim symlinks inside it now point at a target that no longer exists
+    (e.g. the previous run's resolution pointed into the OLD bundle, which
+    the update swap has since replaced). That's a dangling shim -- worse
+    than no shim, since it shadows PATH with something broken. Every call
+    now re-checks each shim target and recreates any that are missing or
+    non-executable instead of trusting "the dir is already there".
     """
     global _exported_shim_dir
     with _export_lock:
-        if _exported_shim_dir is not None:
-            return _exported_shim_dir or None
-
         try:
             resolved_ffmpeg = ffmpeg_bin()
         except FFmpegError:
@@ -530,6 +680,43 @@ def export_binaries_to_path() -> str | None:
             resolved_ffprobe = ffprobe_bin()
         except FFmpegError:
             resolved_ffprobe = None
+
+        if _exported_shim_dir:
+            # Already set up in this process -- but verify the shim
+            # symlinks still point at something usable before trusting the
+            # shortcut. A dangling symlink (target removed/replaced by an
+            # update swap since we last checked) must be recreated, not
+            # silently left broken for the rest of this process's life.
+            shim_dir = Path(_exported_shim_dir)
+            stale = False
+            for name, target in (("ffmpeg", resolved_ffmpeg), ("ffprobe", resolved_ffprobe)):
+                if not target:
+                    continue
+                link = shim_dir / name
+                if not _is_usable_path(str(link)):
+                    stale = True
+                    break
+            if not stale:
+                return _exported_shim_dir
+            print(
+                f"[ffmpeg_utils] PATH shim dir {_exported_shim_dir} has a dangling/stale "
+                "shim -- recreating"
+            )
+        elif _exported_shim_dir == "":
+            # Previously determined "no shim needed" -- re-verify that's
+            # still true rather than trusting it forever (the bare command
+            # name may no longer resolve to the right binary after a swap).
+            still_no_shim = True
+            if resolved_ffmpeg and not _resolves_on_path("ffmpeg", resolved_ffmpeg):
+                still_no_shim = False
+            if resolved_ffprobe and not _resolves_on_path("ffprobe", resolved_ffprobe):
+                still_no_shim = False
+            if still_no_shim:
+                return None
+            print(
+                "[ffmpeg_utils] bare ffmpeg/ffprobe on PATH no longer match the resolved "
+                "binaries -- creating shims"
+            )
 
         needs: dict[str, str] = {}
         if resolved_ffmpeg and not _resolves_on_path("ffmpeg", resolved_ffmpeg):

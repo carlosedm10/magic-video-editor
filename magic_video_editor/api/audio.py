@@ -5,7 +5,12 @@ magic_video_editor/pipeline/eq.py's build_audio_filter), and an A/B preview
 endpoint that extracts a short sample from a clip, runs it through the same
 enhance() used at render time plus the current EQ chain, and hands back URLs
 for both the original and enhanced wav so the UI can play them side by
-side.
+side. POST .../audio-preview-at is the newer, cursor-driven variant of the
+same idea (spec v7.13 "audio preview UX"): given an absolute EDL/timeline
+position it resolves the active segment's clip audio at that point and runs
+ONLY audio_enhance.enhance() (no EQ -- matching what pipeline/render.py's
+final render actually applies) over a short bounded window, for the
+"Probar (desde el cursor)" button in ui/panels/audio.js.
 
 vNext "Main audio track" (music bed with auto-ducking) additive section:
 CRUD for project["audio_assets"] (imported .mp3/.wav/.m4a music files -- see
@@ -26,7 +31,7 @@ from pydantic import BaseModel, field_validator
 
 from .. import config, store
 from ..ffmpeg_utils import FFmpegError, ffmpeg_bin, run
-from ..pipeline import audio_enhance, eq, ingest
+from ..pipeline import audio_enhance, eq, ingest, sync
 
 router = APIRouter(prefix="/api", tags=["audio"])
 
@@ -34,6 +39,64 @@ PREVIEW_SECONDS = 10.0
 _UPLOAD_CHUNK = 1024 * 1024
 GAIN_MIN_DB = -60.0
 GAIN_MAX_DB = 12.0
+
+# ---------- cursor-position enhance preview (on-demand, spec v7.13 "audio
+# preview UX") ----------
+# "Enhance voice" is neural (DeepFilterNet3, see pipeline/audio_enhance.py)
+# and can't run live in the browser like the 8-band EQ does -- today it only
+# ever audibly applies at a real render/export. This endpoint lets the UI
+# generate a short A/B sample (original vs. enhanced) of the CURRENT program
+# audio at the player's cursor position, on demand, WITHOUT rendering the
+# whole project -- reusing the exact same audio_enhance.enhance() chain
+# render.py's _build() calls on the final render (see that module's
+# `if project.get("audio_enhance"):` block). Deliberately does NOT also
+# apply the 8-band EQ (unlike the older clip-picker /audio-preview below) --
+# pipeline/render.py's actual final render never applies the EQ filter
+# either, so this preview stays an honest 1:1 match of what enhance-voice
+# alone sounds like on export.
+PREVIEW_AT_DEFAULT_SECONDS = 8.0
+PREVIEW_AT_MAX_SECONDS = 15.0
+PREVIEW_AT_MIN_SECONDS = 0.3
+
+
+class AudioPreviewAtCursorRequest(BaseModel):
+    start_s: float = 0.0
+    duration_s: float = PREVIEW_AT_DEFAULT_SECONDS
+
+    @field_validator("start_s")
+    @classmethod
+    def _validate_start_s(cls, v):
+        if v < 0:
+            raise ValueError("start_s must be >= 0")
+        return v
+
+    @field_validator("duration_s")
+    @classmethod
+    def _validate_duration_s(cls, v):
+        if v <= 0:
+            raise ValueError("duration_s must be > 0")
+        return min(v, PREVIEW_AT_MAX_SECONDS)
+
+
+def _resolve_edl_position(segments: list[dict], start_s: float):
+    """Map an absolute EDL/program-time cursor position to (segment,
+    clip_local_start, remaining_in_segment) -- the same segment coordinate
+    space pipeline/render.py._build walks (`seg["start"]`/`seg["end"]` are
+    clip-local; program time is the cumulative sum of each segment's
+    `end - start`). Caller is expected to have already checked start_s
+    against the total program duration."""
+    program_t = 0.0
+    for seg in segments:
+        seg_len = max(0.0, seg["end"] - seg["start"])
+        if start_s < program_t + seg_len:
+            offset_in_seg = max(0.0, start_s - program_t)
+            clip_local_start = seg["start"] + offset_in_seg
+            return seg, clip_local_start, seg_len - offset_in_seg
+        program_t += seg_len
+    # Floating-point edge case (start_s lands exactly on the total duration):
+    # clamp into the tail of the last segment rather than raising.
+    last = segments[-1]
+    return last, last["end"], 0.0
 
 
 class AudioEnhanceUpdate(BaseModel):
@@ -145,6 +208,85 @@ def audio_preview(pid: str, body: AudioPreviewRequest):
         return f"/api/projects/{pid}/media/file?path={quote(str(path))}"
 
     return {
+        "original_url": media_url(original_path),
+        "enhanced_url": media_url(enhanced_path),
+    }
+
+
+@router.post("/projects/{pid}/audio-preview-at")
+def audio_preview_at_cursor(pid: str, body: AudioPreviewAtCursorRequest):
+    """On-demand "probar desde el cursor" preview: extracts a short window of
+    the CURRENT program audio at `start_s` (an absolute EDL/timeline
+    position, e.g. window.EditorUI.player.currentEdlTime() in the frontend)
+    -- the active segment's clip audio at that position, same source
+    resolution render.py._build uses (sync.audio_source_for for
+    synced-external-audio clips, falling back to the clip's own audio) --
+    runs it through audio_enhance.enhance() (the identical DeepFilterNet3 /
+    -16 LUFS / limiter chain, with the same noisereduce fallback, used at
+    final render), and returns both the enhanced sample and the untouched
+    original window as small Range-servable wav files (via the existing
+    media/file streaming route) for an A/B comparison in the UI. Bounded to
+    a short window (default 8s, capped at 15s) and clipped to not cross a
+    segment boundary -- this is a preview of the enhance chain's effect on
+    ONE segment's audio, not a partial re-render of the assembled program.
+    """
+    try:
+        project = store.load(pid)
+    except FileNotFoundError:
+        raise HTTPException(404) from None
+
+    segments = project.get("edl") or []
+    if not segments:
+        raise HTTPException(
+            400, "project has no EDL segments to preview yet — cut the project first"
+        )
+
+    total_duration = sum(max(0.0, s["end"] - s["start"]) for s in segments)
+    if body.start_s >= total_duration:
+        raise HTTPException(
+            400,
+            f"start_s ({body.start_s:.2f}) is beyond the program duration ({total_duration:.2f})",
+        )
+
+    seg, clip_local_start, remaining_in_seg = _resolve_edl_position(segments, body.start_s)
+    if remaining_in_seg < PREVIEW_AT_MIN_SECONDS:
+        raise HTTPException(400, "cursor is too close to the end of its segment to preview")
+    duration = max(PREVIEW_AT_MIN_SECONDS, min(body.duration_s, remaining_in_seg))
+
+    try:
+        clip = store.get_clip(project, seg["clip_id"])
+    except KeyError:
+        raise HTTPException(404, f"clip {seg['clip_id']} not found") from None
+
+    # Same source resolution as render.py._build: prefer a synced external
+    # audio recording over the camera clip's own audio track, when present.
+    audio_src, audio_start = clip["path"], clip_local_start
+    synced = sync.audio_source_for(project, seg["clip_id"])
+    if synced:
+        ext_path, delta = synced
+        ext_start = clip_local_start + delta
+        if ext_start >= 0:
+            audio_src, audio_start = ext_path, ext_start
+
+    work_dir = store.project_dir(pid) / "work"
+    work_dir.mkdir(exist_ok=True)
+    token = uuid.uuid4().hex[:8]
+    original_path = work_dir / f"audio_cursor_preview_{token}_original.wav"
+    enhanced_path = work_dir / f"audio_cursor_preview_{token}_enhanced.wav"
+
+    try:
+        _extract_wav_segment(audio_src, audio_start, duration, str(original_path))
+        audio_enhance.enhance(str(original_path), str(enhanced_path))
+    except FFmpegError as e:
+        raise HTTPException(400, str(e)) from None
+
+    def media_url(path):
+        return f"/api/projects/{pid}/media/file?path={quote(str(path))}"
+
+    return {
+        "clip_id": seg["clip_id"],
+        "start_s": body.start_s,
+        "duration_s": duration,
         "original_url": media_url(original_path),
         "enhanced_url": media_url(enhanced_path),
     }

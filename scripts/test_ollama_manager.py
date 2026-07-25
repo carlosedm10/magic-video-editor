@@ -169,8 +169,14 @@ class EnsureOllamaModeTests(unittest.TestCase):
         self.assertEqual(mode, "system")
 
     def test_falls_back_to_download_when_no_bundled_binary(self):
+        # _system_binary_path() is mocked to None here (not just left to run
+        # for real) -- otherwise, on a machine that actually has a system
+        # `ollama` install, this would fall into the new system-binary-spawn
+        # step and try to launch a REAL `ollama serve` child, which tests
+        # must never do.
         with (
             mock.patch.object(self.om, "_reachable", return_value=False),
+            mock.patch.object(self.om, "_system_binary_path", return_value=None),
             mock.patch.object(self.om, "bundled_binary_path", return_value=None),
             mock.patch.object(self.om, "_download_and_spawn", return_value=None) as dl,
         ):
@@ -183,6 +189,7 @@ class EnsureOllamaModeTests(unittest.TestCase):
         fake_proc = mock.Mock()
         with (
             mock.patch.object(self.om, "_reachable", return_value=False),
+            mock.patch.object(self.om, "_system_binary_path", return_value=None),
             mock.patch.object(self.om, "bundled_binary_path", return_value=fake_binary),
             mock.patch.object(self.om, "_spawn_binary", return_value=None) as spawn,
             mock.patch.object(self.om, "_download_and_spawn", return_value=fake_proc) as dl,

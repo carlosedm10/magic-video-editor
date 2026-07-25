@@ -1,14 +1,31 @@
-"""Ollama process lifecycle (v6 packaging Option B, + field-bug follow-up).
+"""Ollama process lifecycle (v6 packaging Option B, + field-bug follow-up,
++ system-binary auto-spawn).
 
 Prefer an already-running system Ollama reachable at config.OLLAMA_URL --
-that's the user's own install and wins whenever it's up. Only when nothing
-answers there do we fall back to the Ollama binary we bundle ourselves
-(packaging/fetch_ollama.sh vendors it into packaging/vendor/ollama/), spawned
-as `ollama serve` with OLLAMA_MODELS pointed under our own app data dir so it
-never touches the user's real model library. If no bundled binary shipped in
-this build (or it fails to spawn/answer), we self-provision: download the
-same official darwin-arm64 standalone runtime straight from GitHub Releases
-into <data_dir>/bin/ollama and spawn that instead.
+that's the user's own install (e.g. Ollama.app already open, or a prior
+`ollama serve`) and wins whenever it's up; we never spawn anything in that
+case (avoids a port 11434 conflict). If nothing answers there, but the user
+already has the `ollama` CLI installed (Ollama.app present, just not
+running), we spawn THAT as `ollama serve` ourselves -- the whole point (see
+owner ask below) is that the user shouldn't have to manually launch
+Ollama.app just to use this app. That system binary is left free to use its
+own default model store (no OLLAMA_MODELS override), so the user's existing
+pulled models (e.g. qwen2.5:14b) are available immediately. Only if no
+system-installed binary can be found do we fall back to the Ollama binary we
+bundle ourselves (packaging/fetch_ollama.sh vendors it into
+packaging/vendor/ollama/), spawned as `ollama serve` with OLLAMA_MODELS
+pointed under our own app data dir so it never touches the user's real model
+library. If no bundled binary shipped in this build (or it fails to
+spawn/answer), we self-provision: download the same official darwin-arm64
+standalone runtime straight from GitHub Releases into <data_dir>/bin/ollama
+and spawn that instead.
+
+OWNER ASK (verbatim, translated): "to run this I don't want to have to have
+the Ollama app turned on; it should run behind the scenes as a subprocess."
+i.e. ensure_ollama() must actively start `ollama serve` itself rather than
+just detecting/downloading -- covered by the system-binary-spawn step below,
+which is now tried BEFORE the bundled/downloaded fallbacks (those remain for
+machines with no system ollama install at all).
 
 FIELD BUG (clean M2/8GB install, released dmg, Ollama.app installed but not
 running): the packaged .app never called ensure_ollama() at all. The
@@ -33,6 +50,7 @@ already call ffmpeg_utils.terminate_all(), and that now cleans up
 import hashlib
 import logging
 import os
+import shutil
 import subprocess
 import sys
 import tarfile
@@ -75,8 +93,18 @@ _DOWNLOAD_IDLE_TIMEOUT_S = 30.0
 
 _proc: subprocess.Popen | None = None
 _proc_lock = threading.Lock()
-# "system" | "bundled" | "downloaded" | "starting" | "downloading" | "unreachable"
+# "system" | "system-spawned" | "bundled" | "downloaded" | "starting" |
+# "downloading" | "unreachable"
 _mode = "unreachable"
+
+# Best-effort extra locations to check if shutil.which("ollama") comes up
+# empty -- e.g. a packaged .app launched from Finder/Dock doesn't inherit a
+# login shell's PATH the way a Terminal-launched `mve-server` does, so
+# Homebrew's install locations are checked directly too.
+_EXTRA_SYSTEM_OLLAMA_PATHS = (
+    Path("/usr/local/bin/ollama"),
+    Path("/opt/homebrew/bin/ollama"),
+)
 
 _ensure_lock = threading.Lock()
 _ensure_started = False
@@ -144,6 +172,22 @@ def bundled_binary_path() -> Path | None:
     return None
 
 
+def _system_binary_path() -> Path | None:
+    """Best-effort lookup of a user-installed `ollama` CLI binary -- the one
+    that ships alongside Ollama.app (or a standalone Homebrew install) and
+    already owns the user's real model library. Checked via PATH first
+    (shutil.which), then a couple of common install locations PATH might
+    miss. Returns None if nothing is found, in which case ensure_ollama()
+    falls through to the bundled/downloaded binary as before."""
+    found = shutil.which("ollama")
+    if found:
+        return Path(found)
+    for candidate in _EXTRA_SYSTEM_OLLAMA_PATHS:
+        if candidate.exists():
+            return candidate
+    return None
+
+
 def _downloaded_binary_path() -> Path:
     """Where a self-provisioned (runtime-downloaded) binary lives -- always
     under the app's own data dir, never inside the (read-only, potentially
@@ -198,19 +242,30 @@ def _wait_reachable(url: str, timeout_s: float) -> bool:
 # --------------------------------------------------------------------------
 
 
-def _spawn_binary(binary: Path) -> subprocess.Popen | None:
+def _spawn_binary(binary: Path, *, set_models_dir: bool = True) -> subprocess.Popen | None:
     """Spawn `<binary> serve` bound to config.OLLAMA_URL, retrying the
     reachability check for up to _STARTUP_TIMEOUT_S. Returns the tracked
     Popen on success, None (having already cleaned up) on failure. All
     stdout/stderr goes to a log file under the data dir so a failure can
-    report a real stderr tail instead of just "didn't come up"."""
+    report a real stderr tail instead of just "didn't come up".
+
+    set_models_dir=True (bundled/downloaded binaries, the default) points
+    OLLAMA_MODELS at our own app data dir so that private copy never touches
+    the user's real model library. set_models_dir=False (the user's own
+    system-installed binary) leaves OLLAMA_MODELS unset so it falls back to
+    its own default model store -- the whole point of spawning the system
+    binary is to expose the user's EXISTING pulled models, not a fresh
+    empty one."""
     try:
         os.chmod(binary, 0o755)
     except Exception:
         pass
 
     env = dict(os.environ)
-    env["OLLAMA_MODELS"] = str(_models_dir())
+    if set_models_dir:
+        env["OLLAMA_MODELS"] = str(_models_dir())
+    else:
+        env.pop("OLLAMA_MODELS", None)
     # Bind the bundled/downloaded server to the same host:port
     # config.OLLAMA_URL already points at, so every other module (llm.py,
     # agents/agents.py) keeps talking to the same configured URL unchanged.
@@ -475,11 +530,15 @@ def ensure_ollama() -> str:
     from a health check, it just confirms/re-derives the current mode).
     Runs synchronously on the calling thread -- prefer ensure_ollama_async()
     from a real startup path so a slow probe/spawn/download never blocks the
-    UI. Returns the resulting mode: "system" (an external Ollama answered at
-    config.OLLAMA_URL -- always preferred), "bundled" (spawned our vendored
-    binary), "downloaded" (no vendored binary/spawn worked, so we fetched
-    the official release at runtime and spawned that), or "unreachable"
-    (nothing worked)."""
+    UI. Returns the resulting mode: "system" (an external Ollama already
+    answered at config.OLLAMA_URL -- always preferred, never spawns
+    anything), "system-spawned" (nothing was reachable, but a system-
+    installed `ollama` binary was found on PATH/common install locations and
+    we spawned `ollama serve` from it ourselves, using its own default model
+    store), "bundled" (no system binary found, so we spawned our vendored
+    binary instead, pointed at our own private model dir), "downloaded" (no
+    vendored binary/spawn worked either, so we fetched the official release
+    at runtime and spawned that), or "unreachable" (nothing worked)."""
     global _proc, _mode
     with _proc_lock:
         if _proc is not None and _proc.poll() is None:
@@ -500,6 +559,25 @@ def ensure_ollama() -> str:
                 _mode = "system"
                 return _mode
             logger.info("ollama: unreachable at %s", config.OLLAMA_URL)
+
+            system_binary = _system_binary_path()
+            if system_binary is not None:
+                logger.info(
+                    "ollama: system-installed binary found at %s -- spawning "
+                    "`ollama serve` ourselves (user's own model store)",
+                    system_binary,
+                )
+                proc = _spawn_binary(system_binary, set_models_dir=False)
+                if proc is not None:
+                    _proc = proc
+                    _mode = "system-spawned"
+                    return _mode
+                logger.warning(
+                    "ollama: system-installed binary present but failed to come up -- "
+                    "falling back to bundled/downloaded"
+                )
+            else:
+                logger.info("ollama: no system-installed `ollama` binary found on PATH")
 
             binary = bundled_binary_path()
             if binary is not None:
@@ -547,7 +625,7 @@ def ensure_ollama_async() -> None:
     packaged .app used to call ensure_ollama() nowhere at all -- see
     app.py/server.py's main()). current_mode() reports "starting" the
     instant this returns, then "downloading" if we end up self-provisioning,
-    then settles on system/bundled/downloaded/unreachable -- poll GET
+    then settles on system/system-spawned/bundled/downloaded/unreachable -- poll GET
     /api/health to show progress. Idempotent: a second call while the first
     is still in flight (or already settled) is a no-op."""
     global _ensure_started, _mode
@@ -578,8 +656,9 @@ def retry_ensure_ollama() -> None:
 
 def current_mode() -> str:
     """Last mode determined/being-determined by ensure_ollama(): "system"|
-    "bundled"|"downloaded"|"starting"|"downloading"|"unreachable". Exposed
-    on the health endpoint (server.py) so the UI can show live progress."""
+    "system-spawned"|"bundled"|"downloaded"|"starting"|"downloading"|
+    "unreachable". Exposed on the health endpoint (server.py) so the UI can
+    show live progress."""
     return _mode
 
 

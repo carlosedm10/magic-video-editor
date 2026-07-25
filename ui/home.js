@@ -241,7 +241,7 @@
       await api(`/projects/${pid}`, { method: "PATCH", body: { name } });
       project.name = name;
     } catch (e) {
-      alert(e.message);
+      showToast(e.message);
     }
     render();
   }
@@ -255,16 +255,17 @@
       await api(`/projects/${pid}`, { method: "PATCH", body: { workflow_status: value } });
     } catch (e) {
       if (project) project.workflow_status = prev;
-      alert(e.message);
+      showToast(e.message);
       render();
     }
   }
 
   async function onDelete(pid) {
     const project = projects.find((p) => p.id === pid);
-    const ok = confirm(
+    const ok = await confirmModal(
       `Delete "${project?.name || "this project"}"?\n\n` +
-      "This deletes transcripts and renders, not your original footage."
+      "This deletes transcripts and renders, not your original footage.",
+      { okLabel: "Delete", danger: true }
     );
     if (!ok) return;
     try {
@@ -272,18 +273,18 @@
       projects = projects.filter((p) => p.id !== pid);
       render();
     } catch (e) {
-      alert(e.message);
+      showToast(e.message);
     }
   }
 
   async function onNewProject() {
-    const name = prompt("Project name:");
+    const name = await promptModal("Project name:");
     if (!name) return;
     try {
       const p = await api("/projects", { method: "POST", body: { name } });
       if (typeof window.selectProject === "function") await window.selectProject(p.id);
     } catch (e) {
-      alert(e.message);
+      showToast(e.message);
     }
   }
 

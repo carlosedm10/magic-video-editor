@@ -773,7 +773,7 @@ function _sfsAttachDeleteHandlers() {
   document.querySelectorAll("[data-delete-model]").forEach((btn) => {
     btn.onclick = async () => {
       const name = btn.dataset.deleteModel;
-      if (!confirm(`Delete "${name}" from Ollama?`)) return;
+      if (!(await confirmModal(`Delete "${name}" from Ollama?`, { okLabel: "Delete", danger: true }))) return;
       btn.disabled = true;
       try {
         await api(`/ollama/models/${encodeURIComponent(name)}`, { method: "DELETE" });

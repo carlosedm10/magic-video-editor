@@ -86,7 +86,7 @@ const Timeline = {
     bind("tl-redo", () => Editor.redo());
     bind("tl-save", () => Editor.save());
     bind("tl-reset", async () => {
-      if (!confirm("Discard manual edits and reset the timeline to the AI cut?")) return;
+      if (!(await confirmModal("Discard manual edits and reset the timeline to the AI cut?"))) return;
       await Editor.resetToAiCut();
     });
     bind("tl-fit", () => this.zoomToFit());
@@ -145,6 +145,13 @@ const Timeline = {
       .tl-shortcuts-pop td:first-child { color: var(--text); font-variant-numeric: tabular-nums;
         white-space: nowrap; padding-right: 10px; width: 1%; }
       #timeline-content.tl-drop-target { outline: 2px dashed var(--accent); outline-offset: -2px; }
+      /* Empty-project main track (spec #3): equal-footing hint that manual
+         drag-drop works with zero pipeline output — mirrors the overlay/
+         audio tracks' own empty-state labels below. */
+      .tl-empty { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
+        padding: 0 8px; font-size: 12px; color: var(--dim); opacity: .8; pointer-events: none;
+        white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+      #timeline-content.tl-drop-target .tl-empty { color: var(--accent); opacity: 1; }
       /* junction chip now shows the transition NAME (spec v7.5), not a single
          letter — override the fixed 18x18 circle from ui/style.css (two
          classes beats their one-class rule) whenever it carries a label. */
@@ -412,7 +419,7 @@ const Timeline = {
       await api(`/projects/${pid}/audio-track`, { method: "PUT", body });
       await refreshProject();
     } catch (e) {
-      alert(`Couldn't update the main audio track: ${e.message}`);
+      showToast(`Couldn't update the main audio track: ${e.message}`);
     }
   },
 
@@ -636,7 +643,7 @@ const Timeline = {
     Editor.trim(hit.index, field, hit.local); // commit() re-selects hit.index for us
   },
 
-  _onKeydown(e) {
+  async _onKeydown(e) {
     if (state.tab) return; // a drawer (Takes/Reels/Settings/Activity) is open
     const tag = (document.activeElement?.tagName || "").toLowerCase();
     if (tag === "input" || tag === "textarea" || tag === "select" || document.activeElement?.isContentEditable) return;
@@ -667,7 +674,7 @@ const Timeline = {
     else if (e.key === "m" || e.key === "M") {
       e.preventDefault();
       const t = player?.currentEdlTime?.() ?? 0;
-      const label = prompt("Marker label (optional):", "") || "";
+      const label = (await promptModal("Marker label (optional):", { defaultValue: "" })) || "";
       Editor.addMarker(t, label);
     } else if (e.key === "?") { e.preventDefault(); this._toggleShortcuts(); }
   },
@@ -855,7 +862,7 @@ const Timeline = {
     try {
       await api(`/projects/${Editor.pid}/queue`, { method: "POST", body: { kind: "preview_render", payload: {} } });
     } catch (e) {
-      alert(`Couldn't queue preview render: ${e.message}`);
+      showToast(`Couldn't queue preview render: ${e.message}`);
     }
   },
 
@@ -931,6 +938,15 @@ const Timeline = {
   _renderTrack(segs, px) {
     const track = document.getElementById("timeline-track");
     if (!track) return;
+    // Discoverability empty-state (spec #3 "manual editor without the
+    // pipeline"): a brand-new project's timeline starts with Editor.segments
+    // == [] (no sentences/pipeline output required) — without this hint the
+    // main track was just a blank strip, easy to miss as a drop target. Same
+    // dim-label-until-first-item pattern as the overlay/audio tracks above.
+    if (!segs.length) {
+      track.innerHTML = `<div class="tl-empty">Drag a clip from the media bin here to start your cut</div>`;
+      return;
+    }
     let t = 0;
     let html = "";
     segs.forEach((s, i) => {

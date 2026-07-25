@@ -24,6 +24,7 @@ from .prompts import (
     COPYWRITER_SYSTEM_PROMPT,
     DEDUP_JUDGE_SYSTEM_PROMPT,
     REEL_COMPOSER_SYSTEM_PROMPT,
+    REEL_DEDUP_SYSTEM_PROMPT,
     REEL_SCORER_SYSTEM_PROMPT,
     REVIEWER_SYSTEM_PROMPT,
     TAKE_JUDGE_SYSTEM_PROMPT,
@@ -38,6 +39,7 @@ from .schemas import (
     CopywriterOutput,
     DedupJudge,
     ReelComposer,
+    ReelDedup,
     ReelScore,
     ReviewFindings,
     TakePick,
@@ -83,6 +85,7 @@ AGENT_SPECS: dict[str, dict] = {
     "clip_order": {"prompt": CLIP_ORDER_SYSTEM_PROMPT, "output_type": ClipOrder},
     "reel_scorer": {"prompt": REEL_SCORER_SYSTEM_PROMPT, "output_type": ReelScore},
     "reel_composer": {"prompt": REEL_COMPOSER_SYSTEM_PROMPT, "output_type": ReelComposer},
+    "reel_dedup": {"prompt": REEL_DEDUP_SYSTEM_PROMPT, "output_type": ReelDedup},
     "transcript_cleaner": {
         "prompt": TRANSCRIPT_CLEANER_SYSTEM_PROMPT,
         "output_type": TranscriptCleanup,
