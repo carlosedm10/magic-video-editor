@@ -174,6 +174,8 @@ const Player = {
   // below checks BOTH, so an intended-playing session that silently dropped
   // `this.playing` still gets recovered.
   _intendPlaying: false,
+  _lastEdlTime: 0,      // last successfully-computed currentEdlTime(); see currentEdlTime()'s
+                          // fallback and onSegmentsChanged's EDL-mutation continuity logic below.
 
   mode: "draft",         // "draft" | "preview"
   _cues: [],
@@ -556,25 +558,86 @@ const Player = {
       this._showEmpty(false);
       if (this.mode === "draft") {
         // v_FIX §9: any EDL edit while playing (add/split/delete/reorder a
-        // segment, etc.) lands here mid-playback. The old `andPlay: false`
-        // unconditionally paused the underlying <video> while leaving
-        // `this.playing`/the play-pause button UNTOUCHED -- so the UI kept
-        // showing "playing" (pause icon) with a frozen frame, or, on the
-        // reverse case (edit while paused racing a stray play), the video
-        // could keep rolling under a "paused" UI. Thread the REAL desired
-        // state through instead: capture `this.playing` before reloading and
-        // hand it to _loadSegment as `andPlay`, then reconcile this.playing
-        // and the button to whatever we actually just did (loadSegment's
-        // play() call can itself fail/reject silently, e.g. autoplay-block,
-        // so we don't just assume success).
+        // segment, etc.) lands here mid-playback, synchronously from
+        // state.js's _notify() on commit. Thread the REAL desired play state
+        // through (capture `this.playing` before reloading, reconcile
+        // afterwards) instead of unconditionally pausing the underlying
+        // <video> while leaving `this.playing`/the button lying about it.
+        //
+        // ---- EDL-mutation freeze hardening (v3) ----
+        // Two further hazards showed up specifically on split/delete (NOT
+        // plain boundary-crossing, which was already fixed): see
+        // `_reloadAfterEdlEdit` for the continuity fix (don't blindly jump to
+        // `Editor.selected` — that's the index the EDIT happened to leave
+        // selected, e.g. a split's second half or whatever a delete shifted
+        // focus to, not where the playhead actually was) and the hard index
+        // clamp (an old `Editor.segments[i].start` on an out-of-range/NaN
+        // `Editor.selected` — very possible right after a delete — used to
+        // THROW synchronously out of this function, aborting the reload with
+        // the video frozen and no recovery). Wrapped in try/catch so NO edit
+        // shape can ever throw out of here; on any unanticipated failure we
+        // force a clean, truthful stop rather than a frozen "still playing".
         const wasPlaying = this.playing;
-        const i = Math.min(Editor.selected, Editor.segments.length - 1);
-        this._loadSegment(i, Editor.segments[i].start, { andPlay: wasPlaying });
-        this._reconcilePlayState(wasPlaying);
+        const playheadT = this.currentEdlTime();
+        try {
+          this._reloadAfterEdlEdit(wasPlaying, playheadT);
+        } catch (err) {
+          console.error("[player] onSegmentsChanged failed to reload after an EDL edit — stopping cleanly instead of freezing", err);
+          this._advancing = false;
+          this._reconcilePlayState(false);
+        }
       }
     }
     this.reloadSubtitles();
     this._autoSelectMode();
+  },
+
+  // Resolve where playback should land after an EDL mutation (split/delete/
+  // reorder/add) and reload there. Split out of onSegmentsChanged so the
+  // whole decision is covered by one try/catch without obscuring its shape.
+  //   - While PLAYING: continuity wins. Re-derive the segment from the
+  //     PRE-edit playhead time (`playheadT`, captured before this function
+  //     runs) via Editor.segmentAtEdlTime() — not from `Editor.selected`,
+  //     which reflects the EDIT's own selection side-effect, not the
+  //     playhead. If the exact time no longer falls inside any segment (its
+  //     own segment got deleted, or it now exceeds the shortened timeline),
+  //     retry clamped to the new total duration; if that still comes up
+  //     empty, land on the nearest valid segment (the last one) rather than
+  //     ever falling through to `Editor.selected`.
+  //   - While PAUSED: honor `Editor.selected`, hard-clamped into
+  //     [0, segments.length - 1] (it can be -1/undefined/NaN right after a
+  //     delete) so this can never index into `undefined`.
+  _reloadAfterEdlEdit(wasPlaying, playheadT) {
+    const segs = Editor.segments;
+    let index;
+    let localTime;
+    if (wasPlaying) {
+      let hit = Editor.segmentAtEdlTime?.(playheadT);
+      if (!hit) {
+        const total = Editor.totalDuration?.() ?? 0;
+        const clampedT = Math.max(0, Math.min(playheadT, Math.max(0, total - this.epsilon)));
+        hit = Editor.segmentAtEdlTime?.(clampedT);
+      }
+      if (hit && segs[hit.index]) {
+        index = hit.index;
+        localTime = hit.local;
+      } else {
+        index = segs.length - 1; // last-resort nearest segment — never Editor.selected while playing
+      }
+    } else {
+      const sel = Number.isInteger(Editor.selected) ? Editor.selected : 0;
+      index = sel;
+    }
+    // Belt-and-suspenders hard clamp regardless of which branch set `index`
+    // — this is the line that used to throw (`Editor.segments[i]` on an
+    // out-of-range `i`) and freeze the video with no way back.
+    index = Math.min(Math.max(index, 0), segs.length - 1);
+    const seg = segs[index];
+    if (!seg) { this._reconcilePlayState(false); return; } // defensive only; segs is non-empty here
+    if (localTime === undefined) localTime = seg.start;
+    Editor.select(index);
+    this._loadSegment(index, localTime, { andPlay: wasPlaying });
+    this._reconcilePlayState(wasPlaying);
   },
 
   onProjectRefreshed() {
@@ -1044,13 +1107,23 @@ const Player = {
   currentEdlTime() {
     if (this.mode === "preview") return this._previewVideo?.currentTime || 0;
     const segs = Editor.segments;
-    if (!segs?.length || !this.videos) return 0;
+    // EDL-mutation hardening: `_currentIndex` can transiently point at a
+    // segment slot that no longer means what it used to (a split/delete/
+    // reorder just landed, shifting the array, before onSegmentsChanged has
+    // had a chance to reload) -- computing against a stale/undefined mapping
+    // used to just return 0 (a visible jump to the start), and worse, was
+    // the ONLY signal onSegmentsChanged had for "where was the playhead" —
+    // so a fully-undefined mapping there would erase continuity entirely.
+    // Cache the last successfully-computed time and fall back to it instead.
+    if (!segs?.length || !this.videos) return this._lastEdlTime || 0;
     const cum = Editor.cumulative();
     const seg = segs[this._currentIndex];
     const row = cum[this._currentIndex];
-    if (!seg || !row) return 0;
+    if (!seg || !row) return this._lastEdlTime || 0;
     const local = this._active().currentTime - seg.start;
-    return row.start + Math.max(0, local);
+    const t = row.start + Math.max(0, local);
+    this._lastEdlTime = t;
+    return t;
   },
 
   _onTimeUpdate() {
