@@ -28,7 +28,18 @@ project["speakers"]) for user-edited labels/colors; omitting it (existing
 call sites don't) still works -- a palette is derived on the fly from
 pipeline.speakers.DEFAULT_PALETTE in first-appearance order, so this is a
 zero-touch upgrade for render.py/reels.py until they're wired to pass the
-project's speaker list through."""
+project's speaker list through.
+
+v7 §7.6 project-level subtitle inline edit: project["subtitles"]["cue_overrides"]
+({cue_index: text}) is a NEW config field (normalize_config below). Its index
+is the GLOBAL, flat position in cue_list()'s output (the same numbering the
+player's inline editor and the Subs tab's cue list both use) -- cue_list()
+applies it directly. The .ass burn-in (write_ass/ass_for_range) is called
+PER EDL SEGMENT by render.py, where cue indices are LOCAL to that segment's
+window, so the global map can't be handed to write_ass as-is; use
+`segment_cue_overrides(project, seg_index)` to slice out the right LOCAL
+sub-map for a given EDL segment (render.py integration is a follow-up outside
+this file's ownership for this task -- see the final report)."""
 
 from .. import store
 from .speakers import DEFAULT_PALETTE
@@ -43,6 +54,8 @@ DEFAULTS: dict = {
     "position": "bottom",
     "words_per_cue": 4,
     "speaker_names": False,  # v5.8c: prefix diarized cues with "<Name>: "
+    "vpos": 0.0,  # v7 §7.6: vertical nudge, frame-height fraction, from the position preset
+    "cue_overrides": {},  # v7 §7.6: {cue_index: text}, GLOBAL index (see cue_list())
 }
 
 STYLES = ("clean", "bold", "karaoke")
@@ -101,6 +114,13 @@ def normalize_config(raw: dict | None) -> dict:
     if cfg.get("font") not in FONTS:
         cfg["font"] = DEFAULTS["font"]
     cfg["speaker_names"] = bool(cfg.get("speaker_names", DEFAULTS["speaker_names"]))
+    try:
+        vpos = float(cfg.get("vpos") or 0.0)
+    except (TypeError, ValueError):
+        vpos = 0.0
+    cfg["vpos"] = max(-0.35, min(0.35, vpos))
+    cue_overrides = cfg.get("cue_overrides")
+    cfg["cue_overrides"] = cue_overrides if isinstance(cue_overrides, dict) else {}
     return cfg
 
 
@@ -146,7 +166,16 @@ def _style_line(
 
     alignment = 5 if cfg["position"] == "center" else 2
     margin_lr = max(0, round(play_res[0] * 0.0556))
-    margin_v = max(0, round(play_h * 0.0729)) if cfg["position"] == "bottom" else 0
+    # v7 §7.6: "vpos" is the live vertical-drag nudge (fraction of frame
+    # height, positive = dragged DOWN, see ui/editor/player.js's convention).
+    # Only wired into the "bottom" alignment, where ASS MarginV is a plain
+    # distance-from-the-bottom-edge -- subtracting the nudge moves the text
+    # down, exactly like the DOM overlay does. "center" alignment (5) mostly
+    # ignores MarginV in libass, so vpos there stays a DOM-preview-only
+    # approximation (documented, not attempted here to avoid guessing at
+    # renderer-specific behavior for a rarely-dragged-from preset).
+    vpos = float(cfg.get("vpos") or 0.0)
+    margin_v = max(0, round(play_h * 0.0729 - vpos * play_h)) if cfg["position"] == "bottom" else 0
 
     font = cfg["font"]
     return (
@@ -369,33 +398,67 @@ def cues_for_range(
     return out
 
 
+CueTuple = tuple[float, float, str, str | None]
+
+
+def _grouped_cues_per_segment(project: dict, cfg: dict) -> list[list[CueTuple]]:
+    """Per-EDL-segment grouped (pre-override, pre-display-text) cues, in
+    exactly the order/grouping `cue_list` iterates -- the shared building
+    block behind both cue_list's GLOBAL flat index and
+    `segment_cue_overrides`'s per-segment slicing, so the two indexing
+    schemes can never drift apart from each other."""
+    segments = project.get("edl") or []
+    out = []
+    for seg in segments:
+        try:
+            clip = store.get_clip(project, seg["clip_id"])
+        except KeyError:
+            out.append([])
+            continue
+        words = _words_in_range(clip, seg["start"], seg["end"])
+        out.append(_group_words_into_cues(words, seg["start"], cfg["words_per_cue"]))
+    return out
+
+
 def cue_list(project: dict) -> list[dict]:
-    """[{edl_t_start, edl_t_end, text, speaker, speaker_label, speaker_color}]
-    mapping every kept word through the persisted EDL into rendered-timeline
-    seconds, for the Draft-mode DOM subtitle overlay (both the overlay and
-    the burn-in group words the same way, so Draft preview matches the real
-    burn). Words_per_cue/gap/speaker_names come from project["subtitles"]; a
-    cue never spans an EDL segment boundary (v5.8c: nor a speaker change).
-    speaker_label/speaker_color use project["speakers"] when present."""
+    """[{index, edl_t_start, edl_t_end, text, speaker, speaker_label,
+    speaker_color}] mapping every kept word through the persisted EDL into
+    rendered-timeline seconds, for the Draft-mode DOM subtitle overlay (both
+    the overlay and the burn-in group words the same way, so Draft preview
+    matches the real burn). Words_per_cue/gap/speaker_names come from
+    project["subtitles"]; a cue never spans an EDL segment boundary (v5.8c:
+    nor a speaker change). speaker_label/speaker_color use project["speakers"]
+    when present.
+
+    `index` (v7 §7.6) is this cue's GLOBAL, flat position across the whole
+    EDL (0, 1, 2, ... in the order cues are emitted here) -- it's the key
+    space `project["subtitles"]["cue_overrides"]` uses, and `text` already
+    reflects any override for that index. The player's inline edit and the
+    Subs tab's cue list both address cues by this same `index`."""
     cfg = normalize_config(project.get("subtitles"))
+    cue_overrides = cfg["cue_overrides"]
     speakers = project.get("speakers")
     segments = project.get("edl") or []
+    per_segment = _grouped_cues_per_segment(project, cfg)
     cues: list[dict] = []
     t_cursor = 0.0
-    for seg in segments:
+    global_i = 0
+    for seg, grouped in zip(segments, per_segment, strict=True):
         seg_len = max(0.0, seg["end"] - seg["start"])
         try:
             clip = store.get_clip(project, seg["clip_id"])
         except KeyError:
             t_cursor += seg_len
             continue
-        words = _words_in_range(clip, seg["start"], seg["end"])
         palette = _speaker_palette(clip, speakers)
-        grouped = _group_words_into_cues(words, seg["start"], cfg["words_per_cue"])
         for t0, t1, text, speaker in grouped:
+            override = cue_overrides.get(global_i, cue_overrides.get(str(global_i)))
+            if override is not None:
+                text = str(override).strip().replace("\n", " ")
             info = palette.get(speaker)
             cues.append(
                 {
+                    "index": global_i,
                     "edl_t_start": round(t_cursor + max(0.0, t0), 3),
                     "edl_t_end": round(t_cursor + max(0.0, t1), 3),
                     "text": _cue_display_text(cfg, text, speaker, palette),
@@ -404,5 +467,41 @@ def cue_list(project: dict) -> list[dict]:
                     "speaker_color": info["color"] if info else None,
                 }
             )
+            global_i += 1
         t_cursor += seg_len
     return cues
+
+
+def segment_cue_overrides(project: dict, seg_index: int) -> dict[int, str]:
+    """LOCAL cue_overrides slice (0-based WITHIN that segment's own cue
+    window, matching what `ass_for_range`/`write_ass`'s `cue_overrides` param
+    already expects) for EDL segment `seg_index`, derived from the project-
+    level GLOBAL map (project["subtitles"]["cue_overrides"], keyed by
+    cue_list()'s flat `index`).
+
+    Intended caller: render.py's per-segment .ass burn-in loop (final render
+    + preview render share one `_build`), e.g.:
+        overrides = subtitles.segment_cue_overrides(project, i)
+        subtitles.write_ass(ass_path, clip, seg["start"], seg["end"], sub_cfg,
+                             (width, height), cue_overrides=overrides,
+                             speakers=project.get("speakers"))
+    That one-line wiring is outside this file's ownership for this task --
+    flagged for the integrator/render.py owner. Always safe to call: returns
+    {} when there's nothing to override or `seg_index` is out of range."""
+    cfg = normalize_config(project.get("subtitles"))
+    raw_overrides = cfg["cue_overrides"]
+    if not raw_overrides:
+        return {}
+    segments = project.get("edl") or []
+    if not (0 <= seg_index < len(segments)):
+        return {}
+    per_segment = _grouped_cues_per_segment(project, cfg)
+    offset = sum(len(c) for c in per_segment[:seg_index])
+    count = len(per_segment[seg_index])
+    out: dict[int, str] = {}
+    for local_i in range(count):
+        global_i = offset + local_i
+        val = raw_overrides.get(global_i, raw_overrides.get(str(global_i)))
+        if val is not None:
+            out[local_i] = val
+    return out

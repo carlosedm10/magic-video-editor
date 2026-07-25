@@ -33,6 +33,8 @@ from .api import (
     suggestions,
     thumbs,
 )
+from .api import safety as safety_api
+from .api import transitions as transitions_api
 from .api import updater as updater_api
 
 app = FastAPI(title="Magic Video Editor")
@@ -51,6 +53,8 @@ app.include_router(thumbs.router)
 app.include_router(reels.router)
 app.include_router(overlays.router)
 app.include_router(updater_api.router)
+app.include_router(transitions_api.router)
+app.include_router(safety_api.router)
 
 
 # ---------- error handling ----------
@@ -213,6 +217,12 @@ def main():
     import uvicorn
 
     config.ensure_dirs()
+
+    # Field bug fix (M2): mlx-whisper shells out to bare `ffmpeg`/`ffprobe`
+    # from PATH internally, bypassing our ffmpeg_bin()/ffprobe_bin()
+    # resolution entirely -- make sure PATH already points at the right
+    # binaries before any pipeline stage can run. See ffmpeg_utils.
+    ffmpeg_utils.export_binaries_to_path()
 
     # v6 packaging Option B: prefer a system Ollama already reachable at
     # config.OLLAMA_URL; else spawn our bundled binary if one was vendored

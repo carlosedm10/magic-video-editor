@@ -171,6 +171,24 @@
       this._loadSubsBase();
       this.switchTab(this.activeTab);
       this._startTick();
+      this._renderFitBlurLayer();
+
+      try {
+        if (typeof window.SafeZonesUI !== "undefined") {
+          window.SafeZonesUI.setContext({
+            pid: this.pid,
+            rid: this.rid,
+            getReel: () => this._reel(),
+            getTotalDuration: () => this._totalDuration(),
+            onSeek: (t) => this._seekToGlobalTime(t),
+            onReelPatched: (updated) => {
+              this._mergeReel(updated);
+              this._renderFitBlurLayer();
+              if (this.activeTab === "reel") this._renderReelTab();
+            },
+          });
+        }
+      } catch (e) { console.error("SafeZonesUI setContext failed", e); }
     },
 
     close() {
@@ -183,6 +201,28 @@
       const pv = document.getElementById("project-view");
       if (pv) pv.hidden = !state.pid;
       this._stopTick();
+      try { window.SafeZonesUI?.reset(); } catch (_e) { /* ignore */ }
+    },
+
+    // Elapsed-time-on-the-reel's-own-concatenated-timeline -> (segment idx,
+    // local time) -> _seekTo. Used by SafeZonesUI's interval click handler
+    // (the safety endpoint reports intervals on that same 0=reel-start
+    // timeline, mirroring pipeline/safezones.py's _sample_times).
+    _seekToGlobalTime(t) {
+      const segs = this._segments();
+      if (!segs.length) return;
+      let offset = 0;
+      for (let i = 0; i < segs.length; i++) {
+        const { start, end } = this._segEffectiveWindow(i);
+        const dur = Math.max(0, end - start);
+        const isLast = i === segs.length - 1;
+        if (t <= offset + dur || isLast) {
+          const local = Math.min(Math.max(t - offset, 0), dur);
+          this._seekTo(i, start + local);
+          return;
+        }
+        offset += dur;
+      }
     },
 
     /* ---------- one-time DOM + styles ---------- */
@@ -217,6 +257,29 @@
         #re-frame-note { position: absolute; left: 8px; right: 8px; bottom: 8px; text-align: center; z-index: 4;
           background: rgba(0,0,0,.5); border-radius: 8px; padding: 4px 6px; }
         .re-transport { flex-shrink: 0; padding: 8px 16px; border-top: 1px solid var(--border); }
+
+        /* fit_blur CSS approximation (spec v7.7 item 3): lives INSIDE
+           #re-crop-window so it only ever covers the actual 9:16 output
+           rect, layered above the real #re-video via DOM order + z-index.
+           Hidden entirely unless the reel's fit_mode is "fit_blur" (see
+           _renderFitBlurLayer). Ghost <video>s are muted and kept in sync
+           with #re-video by the segment-load/timeupdate/play/pause hooks
+           below -- they never carry their own audio. */
+        #re-fitblur-layer { position: absolute; inset: 0; background: #000; overflow: hidden; z-index: 1; }
+        #re-fitblur-bg { position: absolute; inset: -12%; width: 124%; height: 124%; object-fit: cover;
+          filter: blur(22px) brightness(.55) saturate(1.05); pointer-events: none; }
+        #re-fitblur-fg { position: absolute; object-fit: contain; background: #000; pointer-events: none; }
+
+        /* Reel Safety UI (spec v7.7 items 1-2): thin bar above the 9:16
+           preview hosting platform toggle chips + the safety message; the
+           actual mockup/hatch overlay is mounted BY safezones-ui.js as a
+           child of #re-crop-window (see _ensureDom below) so it always
+           matches the true output rect regardless of layout size. Content
+           of #re-safezone-bar and the overlay is owned entirely by
+           ui/editor/safezones-ui.js (window.SafeZonesUI) -- this file only
+           reserves the container and its own spacing. */
+        #re-safezone-bar { flex-shrink: 0; display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+          padding: 6px 16px 0; }
 
         #re-inspector { grid-area: inspector; display: flex; flex-direction: column; overflow: hidden; }
         .re-tabs { display: flex; flex-shrink: 0; border-bottom: 1px solid var(--border); background: var(--panel2); }
@@ -289,12 +352,18 @@
         </div>
         <div class="re-body">
           <section id="re-preview-pane" class="re-area">
+            <div id="re-safezone-bar"></div>
             <div id="re-frame-wrap">
               <div id="re-frame" title="Drag to reframe the 9:16 crop">
                 <video id="re-video" playsinline preload="auto"></video>
                 <div id="re-band-l" class="re-band"></div>
                 <div id="re-band-r" class="re-band"></div>
-                <div id="re-crop-window"></div>
+                <div id="re-crop-window">
+                  <div id="re-fitblur-layer" hidden>
+                    <video id="re-fitblur-bg" muted playsinline preload="auto"></video>
+                    <video id="re-fitblur-fg" muted playsinline preload="auto"></video>
+                  </div>
+                </div>
                 <div id="re-frame-note" class="dim" hidden></div>
               </div>
             </div>
@@ -341,6 +410,18 @@
         </div>`;
       content.appendChild(div);
       this._wireOnce();
+      // safezones-ui.js owns everything inside #re-safezone-bar and the
+      // mockup overlay it appends into #re-crop-window; guarded so a script
+      // load-order hiccup or a JS error inside that module can never blank
+      // this view (same defensive pattern as home.js's HomeView guard).
+      try {
+        if (typeof window.SafeZonesUI !== "undefined") {
+          window.SafeZonesUI.mount(
+            document.getElementById("re-safezone-bar"),
+            document.getElementById("re-crop-window"),
+          );
+        }
+      } catch (e) { console.error("SafeZonesUI mount failed", e); }
       refreshIcons();
     },
 
@@ -500,6 +581,10 @@
         const { start, end } = this._segEffectiveWindow(this._activeSeg);
         if (v.currentTime < start || v.currentTime > end) { try { v.currentTime = start; } catch (_e) { /* ignore */ } }
       }
+      this._renderFitBlurLayer(); // active segment's clip may have changed
+      // in/out (segment trims) changed -> re-run the safety check (spec
+      // v7.7 item 2: "after in/out/crop/fit changes, debounced").
+      try { window.SafeZonesUI?.notifyChange(); } catch (_e) { /* ignore */ }
     },
 
     /* ---------- framing (crop_x) ---------- */
@@ -554,6 +639,40 @@
       win.style.width = `${widthPx}px`;
     },
 
+    // Shows/hides + sizes the fit_blur CSS approximation (spec v7.7 item 3):
+    // when reel.fit_mode is "fit_blur", #re-fitblur-layer covers the whole
+    // crop-window rect (blurred underlay via #re-fitblur-bg, object-fit:
+    // cover) with #re-fitblur-fg centered and sized to fit_scale on top --
+    // the classic vertical-video zoom-out-with-blur-background treatment.
+    // Called on open, after any PATCH that can touch fit_mode/fit_scale,
+    // and after add/delete-segment (clip_id used by the ghosts can change).
+    _renderFitBlurLayer() {
+      const layer = document.getElementById("re-fitblur-layer");
+      const fg = document.getElementById("re-fitblur-fg");
+      if (!layer || !fg) return;
+      const reel = this._reel();
+      const mode = reel.fit_mode || "fill";
+      if (mode !== "fit_blur") {
+        layer.hidden = true;
+        // stop any decode work the ghosts were doing while active
+        const bg = document.getElementById("re-fitblur-bg");
+        try { bg?.pause(); fg.pause(); } catch (_e) { /* ignore */ }
+        return;
+      }
+      layer.hidden = false;
+      const scale = Math.max(0.6, Math.min(1.0, Number(reel.fit_scale) || 0.82));
+      const marginPct = ((1 - scale) / 2) * 100;
+      fg.style.width = `${scale * 100}%`;
+      fg.style.height = `${scale * 100}%`;
+      fg.style.left = `${marginPct}%`;
+      fg.style.top = `${marginPct}%`;
+      // bring the ghosts up to date with wherever #re-video currently is
+      // (covers the open()/tab-switch case where nothing is "loading" a
+      // fresh segment right now, just toggling the layer on).
+      const v = document.getElementById("re-video");
+      if (v?.dataset.src) this._syncFitBlurGhosts(v.dataset.src, v.currentTime, this.playing);
+    },
+
     _wireFrameDrag() {
       const frame = document.getElementById("re-frame");
       if (!frame) return;
@@ -584,7 +703,12 @@
         // though it visibly did. Only drop it once the server confirms the
         // same value (success) so there's no visual jump either way.
         this._patch({ crop_x: Math.round(frac * 1000) / 1000 }, {
-          afterSave: () => { this._cropDragPreview = null; this._renderCropOverlay(); },
+          afterSave: () => {
+            this._cropDragPreview = null;
+            this._renderCropOverlay();
+            // crop_x changed -> re-run the safety check (debounced).
+            try { window.SafeZonesUI?.notifyChange(); } catch (_e) { /* ignore */ }
+          },
         });
       };
       window.addEventListener("pointermove", onMove);
@@ -626,6 +750,32 @@
       } else {
         doSeek();
       }
+      this._syncFitBlurGhosts(src, localTime, resumePlaying);
+    },
+
+    // Mirrors #re-video's src/currentTime/play-state into the two muted
+    // ghost <video>s that approximate fit_blur (spec v7.7 item 3). Only
+    // loaded/seeked while fit_mode is actually "fit_blur" -- otherwise left
+    // paused with no src so a hidden reel never burns decode time on two
+    // extra video streams for nothing.
+    _syncFitBlurGhosts(src, localTime, resumePlaying) {
+      if ((this._reel().fit_mode || "fill") !== "fit_blur") return;
+      const bg = document.getElementById("re-fitblur-bg");
+      const fg = document.getElementById("re-fitblur-fg");
+      if (!bg || !fg) return;
+      [bg, fg].forEach((ghost) => {
+        const seekAndPlay = () => {
+          try { ghost.currentTime = localTime; } catch (_e) { /* not ready */ }
+          if (resumePlaying) ghost.play().catch(() => {});
+        };
+        if (ghost.dataset.src !== src) {
+          ghost.dataset.src = src;
+          ghost.src = src;
+          ghost.onloadedmetadata = seekAndPlay;
+        } else {
+          seekAndPlay();
+        }
+      });
     },
 
     _seekTo(idx, localTime) {
@@ -661,6 +811,22 @@
       }
       this._updateTimeDisplay();
       this._renderPlayhead();
+      this._resyncFitBlurGhostsDrift(v.currentTime);
+    },
+
+    // Cheap periodic drift correction (called from the same ~4/s timeupdate
+    // tick as everything else above) rather than seeking the ghosts on
+    // every frame -- good enough for a live CSS approximation.
+    _resyncFitBlurGhostsDrift(currentTime) {
+      if ((this._reel().fit_mode || "fill") !== "fit_blur") return;
+      const bg = document.getElementById("re-fitblur-bg");
+      const fg = document.getElementById("re-fitblur-fg");
+      [bg, fg].forEach((ghost) => {
+        if (!ghost || !ghost.dataset.src) return;
+        if (Math.abs(ghost.currentTime - currentTime) > 0.35) {
+          try { ghost.currentTime = currentTime; } catch (_e) { /* not ready */ }
+        }
+      });
     },
 
     play() {
@@ -670,6 +836,12 @@
       if (v.currentTime < start || v.currentTime >= end) { try { v.currentTime = start; } catch (_e) { /* ignore */ } }
       this.playing = true;
       v.play().catch(() => {});
+      if ((this._reel().fit_mode || "fill") === "fit_blur") {
+        const bg = document.getElementById("re-fitblur-bg");
+        const fg = document.getElementById("re-fitblur-fg");
+        if (bg?.dataset.src) bg.play().catch(() => {});
+        if (fg?.dataset.src) fg.play().catch(() => {});
+      }
       const btn = document.getElementById("re-playpause");
       if (btn) { btn.innerHTML = '<i data-lucide="pause"></i>'; refreshIcons(); }
     },
@@ -677,6 +849,8 @@
       this.playing = false;
       const v = document.getElementById("re-video");
       v?.pause();
+      document.getElementById("re-fitblur-bg")?.pause();
+      document.getElementById("re-fitblur-fg")?.pause();
       const btn = document.getElementById("re-playpause");
       if (btn) { btn.innerHTML = '<i data-lucide="play"></i>'; refreshIcons(); }
     },
@@ -1035,6 +1209,22 @@
             ${reel.composed ? '<span class="pill main">Compuesto</span>' : ""}
           </div>
           ${reel.composed && reel.composer_why ? `<div class="dim" style="margin-top:6px">${esc(reel.composer_why)}</div>` : ""}
+        </div>
+        <div class="card">
+          <b>Framing</b>
+          <div class="hint">"Fit + blur" zooms the video out and fills the rest of the 9:16 frame with a
+            blurred copy of itself -- the fix offered when the face gets covered by a platform's UI.</div>
+          <div class="transition-btns" id="re-fitmode-btns">
+            <button type="button" class="btn small ${(reel.fit_mode || "fill") === "fill" ? "active" : ""}" data-v="fill">Fill</button>
+            <button type="button" class="btn small ${reel.fit_mode === "fit_blur" ? "active" : ""}" data-v="fit_blur">Fit + blur</button>
+          </div>
+          ${reel.fit_mode === "fit_blur" ? `
+            <div class="field-row" style="margin-top:8px">
+              <label>Fit scale</label>
+              <input type="range" id="re-fitscale-input" min="0.6" max="1.0" step="0.05"
+                value="${Number(reel.fit_scale) || 0.82}" style="flex:1">
+              <span class="dim mono" id="re-fitscale-val">${(Number(reel.fit_scale) || 0.82).toFixed(2)}</span>
+            </div>` : ""}
         </div>`;
 
       const titleInput = el.querySelector("#re-title-input");
@@ -1067,6 +1257,34 @@
           regenBtn.innerHTML = '<i data-lucide="refresh-cw"></i> Regenerate copy';
           refreshIcons();
         }
+      };
+
+      el.querySelectorAll("#re-fitmode-btns button").forEach((b) => {
+        b.onclick = () => {
+          const fields = { fit_mode: b.dataset.v };
+          if (b.dataset.v === "fit_blur" && reel.fit_scale == null) fields.fit_scale = 0.82;
+          this._patch(fields, {
+            afterSave: () => {
+              this._renderReelTab();
+              this._renderFitBlurLayer();
+              try { window.SafeZonesUI?.notifyChange(); } catch (_e) { /* ignore */ }
+            },
+          });
+        };
+      });
+      const fitScaleInput = el.querySelector("#re-fitscale-input");
+      if (fitScaleInput) fitScaleInput.oninput = () => {
+        const val = document.getElementById("re-fitscale-val");
+        if (val) val.textContent = Number(fitScaleInput.value).toFixed(2);
+        clearTimeout(this._timers.fitscale);
+        this._timers.fitscale = setTimeout(() => {
+          this._patch({ fit_scale: Number(fitScaleInput.value) }, {
+            afterSave: () => {
+              this._renderFitBlurLayer();
+              try { window.SafeZonesUI?.notifyChange(); } catch (_e) { /* ignore */ }
+            },
+          });
+        }, 300);
       };
       refreshIcons();
     },

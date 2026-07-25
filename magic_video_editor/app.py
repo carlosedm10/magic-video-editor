@@ -277,6 +277,15 @@ def main():
 
     config.ensure_dirs()
 
+    # Field bug fix (M2): mlx-whisper shells out to bare `ffmpeg`/`ffprobe`
+    # from PATH internally, bypassing our ffmpeg_bin()/ffprobe_bin()
+    # resolution entirely -- make sure PATH already points at the right
+    # binaries before any pipeline stage can run. Mirrors server.py's
+    # main(), which app.py bypasses by driving uvicorn itself (v0.6.1
+    # lesson: app.py is the packaged entrypoint and must not depend on
+    # server.main running). See ffmpeg_utils.
+    ffmpeg_utils.export_binaries_to_path()
+
     # v6 packaging Option B (field bug fix): mirrors server.py's main(),
     # which app.py bypasses by driving uvicorn itself -- ensure_ollama() was
     # missing here entirely, so the packaged .app never spawned the bundled

@@ -55,7 +55,47 @@
      4. The preview <video> src is cache-busted with `?v=<manifest hash>`
         (_previewSrc) so a previously half-loaded/stale preview.mp4 is never
         reused just because the path string didn't change.
-   Regression-checked by code walkthrough — see this task's final report. */
+   Regression-checked by code walkthrough — see this task's final report.
+
+   ---------- v7 §7.1: Source mode ----------
+   Clicking (or double-clicking) a clip in the media bin (ui/editor/
+   mediabin.js calls Player.enterSourceMode(clipId)) plays that clip's own
+   preview proxy from 0 in a THIRD, independent <video id="video-source">
+   (draft/preview videos hidden underneath). A "Source: <name>" chip appears
+   in the player controls with an X to return to Edit mode; Esc (wired in
+   ui/core.js) and clicking anywhere in the timeline OTHER than the ruler
+   also exit (wired below via a capture-phase listener on #timeline-content
+   -- ui/editor/timeline.js is owned by another agent this phase, so this
+   file adds its own listener rather than editing that one, per the task
+   brief's fallback instruction). While in Source mode the EDL track is
+   dimmed AND inert (a CSS class toggled on #timeline-content, since there is
+   no window event to hook into for this); the ruler stays interactive but is
+   repurposed to scrub the FULL SOURCE CLIP instead of the EDL (mapped 0..1
+   across the ruler's on-screen width -- a deliberate simplification: the
+   ruler's ticks still read the EDL's own scale/labels underneath, since only
+   ui/editor/timeline.js owns what's drawn there; only the scrub gesture
+   itself is repurposed). Transport keys (play/pause/J/K/L) operate on the
+   source video while active; the EDL playhead and subtitle overlay are left
+   alone (both are meaningless for a raw, un-cut clip).
+
+   ---------- v7 §7.6: Subtitle inline edit on the player ----------
+   While paused and subtitles are enabled, the overlay becomes interactive
+   (pointer-events flips on): double-click starts a contentEditable inline
+   edit of the CURRENT cue (Enter or blur commits, Esc cancels) AND opens the
+   Subs inspector tab scrolled/focused to that cue's row (ui/editor/
+   inspector.js's Inspector.switchTab + the new window.SubtitlesPanel.
+   focusCue, ui/panels/subtitles.js -- both read as globals here, not
+   imported, per this app's plain-script-tag convention). A commit saves via
+   window.SubtitlesPanel.setCueOverride(project, index, text), which PUTs the
+   FULL subtitles config (project["subtitles"]["cue_overrides"], keyed by
+   cue_list()'s GLOBAL index -- see magic_video_editor/pipeline/subtitles.py).
+   Vertical drag on the (paused, non-editing) overlay nudges the subtitle's
+   vertical position live (translateY, no network calls mid-drag) and
+   persists the result on release via SubtitlesPanel.saveStyleField --
+   snapping back to whichever of "bottom"/"center" it ends up closest to
+   (spec: "snaps to bottom/center presets when close"), otherwise keeping the
+   free offset in the NEW cfg.vpos field. While playing, the overlay is
+   fully non-interactive (pointer-events off) — untouched by any of this. */
 
 window.EditorUI = window.EditorUI || {};
 
@@ -76,6 +116,17 @@ const Player = {
   _subtitleEl: null,
   _readyGlow: false,     // v5.14: "a fresh preview landed but we're playing — glow, don't switch"
 
+  // ---- v7 §7.1 Source mode ----
+  sourceClipId: null,    // set while previewing a media-bin clip standalone
+  _sourceVideo: null,
+  _sourceDuration: 0,
+  _sourceChip: null,
+  _tlCaptureHandler: null,
+
+  // ---- v7 §7.6 subtitle inline edit / vertical drag ----
+  _editingCue: null,     // {index} while the overlay is contentEditable
+  _subDrag: null,        // {startY, startVpos, moved} while dragging the overlay vertically
+
   mount() {
     this.videos = [document.getElementById("video-a"), document.getElementById("video-b")];
     if (!this.videos[0] || !this.videos[1]) return;
@@ -94,8 +145,121 @@ const Player = {
     if (playBtn) playBtn.onclick = () => this.togglePlay();
     if (fsBtn) fsBtn.onclick = () => this.toggleFullscreen();
 
+    this._wireSourceMode();
+    this._wireSubtitleOverlayInteraction();
+
     this.onSegmentsChanged();
     if (!this._rafId) this._startLoop();
+  },
+
+  /* ---------- v7 §7.1 Source mode: timeline hookup ----------
+     ui/editor/timeline.js is owned by another agent this phase and exposes
+     no event/hook for "something else wants the ruler + wants clicks
+     elsewhere in the timeline to mean something different" — so this file
+     adds its OWN capture-phase listener on the shared #timeline-content
+     element instead of editing that one. Capture phase means this runs
+     BEFORE any of timeline.js's own bubble-phase handlers (block drag,
+     background-click-seek, chip click, …), and stopPropagation() here stops
+     those from ALSO firing — exactly "the EDL track stays untouched" while
+     in Source mode. Wired once; harmlessly re-wired if mount() ever runs
+     twice (removeEventListener first). */
+  _wireSourceMode() {
+    const content = document.getElementById("timeline-content");
+    if (!content) return;
+    if (this._tlCaptureHandler) content.removeEventListener("pointerdown", this._tlCaptureHandler, true);
+    this._tlCaptureHandler = (e) => {
+      if (!this.sourceClipId) return;
+      if (e.target.closest("#timeline-ruler")) {
+        e.stopPropagation();
+        this._onSourceRulerPointerDown(e);
+        return;
+      }
+      e.stopPropagation();
+      this.exitSourceMode();
+    };
+    content.addEventListener("pointerdown", this._tlCaptureHandler, true);
+
+    const exitBtn = document.getElementById("pp-source-exit");
+    if (exitBtn) exitBtn.onclick = () => this.exitSourceMode();
+  },
+
+  enterSourceMode(clipId) {
+    const clip = Editor?.clip?.(clipId);
+    if (!clip || !Editor?.pid) return;
+    if (this.sourceClipId === clipId) return; // already the active source clip
+    this.pause({ auto: false });
+    this.sourceClipId = clipId;
+    this._sourceDuration = clip.info?.duration || 0;
+    this.videos?.forEach((v) => (v.style.visibility = "hidden"));
+    if (this._previewVideo) this._previewVideo.style.visibility = "hidden";
+    if (this._subtitleEl) this._subtitleEl.style.display = "none";
+    const empty = document.getElementById("player-empty");
+    if (empty) empty.style.display = "none";
+
+    const v = this._sourceVideo;
+    if (v) {
+      v.style.visibility = "visible";
+      const start = () => { try { v.currentTime = 0; } catch (_e) { /* not ready */ } v.play().catch(() => {}); };
+      if (v.dataset.clipId === clipId) start();
+      else {
+        v.dataset.clipId = clipId;
+        v.src = `/api/projects/${Editor.pid}/media/preview/${clipId}`;
+        v.onloadedmetadata = start;
+      }
+    }
+    if (this._sourceChip) {
+      this._sourceChip.hidden = false;
+      const nameEl = document.getElementById("pp-source-name");
+      if (nameEl) nameEl.textContent = clip.filename || clipId;
+    }
+    document.getElementById("timeline-content")?.classList.add("tl-source-dim");
+
+    this.playing = true;
+    const btn = document.getElementById("pp-playpause");
+    if (btn) { btn.innerHTML = '<i data-lucide="pause"></i>'; refreshIcons(); }
+    this._updateSubtitleInteractivity();
+  },
+
+  exitSourceMode() {
+    if (!this.sourceClipId) return;
+    this.sourceClipId = null;
+    if (this._sourceVideo) { this._sourceVideo.pause(); this._sourceVideo.style.visibility = "hidden"; }
+    if (this._sourceChip) this._sourceChip.hidden = true;
+    document.getElementById("timeline-content")?.classList.remove("tl-source-dim");
+    this.playing = false;
+
+    if (this.mode === "preview" && this._previewVideo) this._previewVideo.style.visibility = "visible";
+    this._showEmpty(!Editor.segments?.length);
+    if (this.mode === "draft" && Editor.segments?.length) {
+      const i = Math.min(Editor.selected, Editor.segments.length - 1);
+      this._loadSegment(i, Editor.segments[i].start, { andPlay: false });
+    }
+    const btn = document.getElementById("pp-playpause");
+    if (btn) { btn.innerHTML = '<i data-lucide="play"></i>'; refreshIcons(); }
+    this._updateSubtitleInteractivity();
+  },
+
+  // Ruler is repurposed, while in Source mode, into a full-clip scrub strip
+  // mapped 0..1 across its own rendered (scroll-independent) width — see the
+  // module docstring for why this is a deliberate simplification rather than
+  // a real clip-duration ruler.
+  _onSourceRulerPointerDown(e) {
+    const ruler = document.getElementById("timeline-ruler");
+    const dur = this._sourceDuration;
+    if (!ruler || !dur) return;
+    const rect = ruler.getBoundingClientRect();
+    const scrub = (clientX) => {
+      const frac = Math.max(0, Math.min(1, (clientX - rect.left) / Math.max(1, rect.width)));
+      if (this._sourceVideo) { try { this._sourceVideo.currentTime = frac * dur; } catch (_e) { /* ignore */ } }
+    };
+    scrub(e.clientX);
+    const onMove = (ev) => scrub(ev.clientX);
+    const onUp = () => {
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onUp);
+    };
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp);
   },
 
   /* ---------- injected chrome: mode toggle, subtitle overlay, fade overlay
@@ -123,6 +287,27 @@ const Player = {
           0%, 100% { box-shadow: 0 0 0 1px var(--accent2), 0 0 6px rgba(53,194,143,.4); }
           50% { box-shadow: 0 0 0 1px var(--accent2), 0 0 14px rgba(53,194,143,.85); }
         }
+
+        /* ---- v7 §7.1 Source mode ---- */
+        #pp-source-chip { display: inline-flex; align-items: center; gap: 6px; padding: 4px 8px 4px 10px;
+          border-radius: 999px; border: 1px solid var(--accent); background: var(--panel2);
+          color: var(--text); font-size: 12px; line-height: 1; }
+        #pp-source-chip i:first-child { width: 13px; height: 13px; color: var(--accent-hover); }
+        #pp-source-name { max-width: 160px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        #pp-source-exit { padding: 2px; }
+        /* dims + disables the EDL track (NOT the ruler, which is repurposed
+           for source-clip scrubbing) while Source mode is active — this file
+           toggles the class; the rule itself lives here since ui/style.css
+           belongs to another agent this phase. */
+        #timeline-content.tl-source-dim #timeline-track,
+        #timeline-content.tl-source-dim #timeline-playhead,
+        #timeline-content.tl-source-dim #timeline-markers,
+        #timeline-content.tl-source-dim #timeline-overlay-track { opacity: .3; pointer-events: none; }
+
+        /* ---- v7 §7.6 subtitle inline edit / drag ---- */
+        #subtitle-overlay.pp-subs-interactive { pointer-events: auto; cursor: grab; }
+        #subtitle-overlay.pp-subs-editing { pointer-events: auto; cursor: text; outline: 1px dashed var(--accent2);
+          outline-offset: 4px; background: rgba(0,0,0,.35); border-radius: 6px; }
       `;
       document.head.appendChild(style);
     }
@@ -157,6 +342,22 @@ const Player = {
     } else {
       this._previewVideo = document.getElementById("video-preview");
     }
+    // v7 §7.1: a fourth, fully independent <video> for Source mode — kept
+    // separate from the draft/preview elements so entering/exiting it never
+    // disturbs their src/currentTime/ontimeupdate state.
+    if (stage && !document.getElementById("video-source")) {
+      const v = document.createElement("video");
+      v.id = "video-source";
+      v.className = "player-video";
+      v.preload = "auto";
+      v.playsInline = true;
+      v.style.visibility = "hidden";
+      v.onerror = () => console.error("source video error", v.error);
+      stage.insertBefore(v, this._subtitleEl || null);
+      this._sourceVideo = v;
+    } else {
+      this._sourceVideo = document.getElementById("video-source");
+    }
     const controls = document.querySelector(".player-controls");
     if (controls && !document.getElementById("pp-mode-toggle")) {
       const btn = document.createElement("button");
@@ -166,6 +367,19 @@ const Player = {
       btn.onclick = () => this.setMode(this.mode === "draft" ? "preview" : "draft", { manual: true });
       const fsBtn = document.getElementById("pp-fullscreen");
       controls.insertBefore(btn, fsBtn || null);
+    }
+    // v7 §7.1: "Source: <name>" chip, X to return to Edit mode.
+    if (controls && !document.getElementById("pp-source-chip")) {
+      const chip = document.createElement("span");
+      chip.id = "pp-source-chip";
+      chip.hidden = true;
+      chip.innerHTML = '<i data-lucide="film"></i><span id="pp-source-name"></span>'
+        + '<button id="pp-source-exit" class="icon-btn" title="Back to Edit (Esc)"><i data-lucide="x"></i></button>';
+      const playBtn = document.getElementById("pp-playpause");
+      controls.insertBefore(chip, playBtn ? playBtn.nextSibling : controls.firstChild);
+      this._sourceChip = chip;
+    } else {
+      this._sourceChip = document.getElementById("pp-source-chip");
     }
     this._updateModeButton();
   },
@@ -320,17 +534,183 @@ const Player = {
     el.style.webkitTextStroke = `1px ${cfg.outline_color || "#000000"}`;
     el.classList.toggle("pos-bottom", cfg.position !== "center");
     el.classList.toggle("pos-center", cfg.position === "center");
+    this._applySubtitlePosition();
+    this._updateSubtitleInteractivity();
+  },
+  // v7 §7.6: the live vertical-drag nudge (cfg.vpos, fraction of the stage's
+  // height) layered on top of whichever preset's CSS class positions the
+  // overlay — translateY works uniformly for both "bottom" (no base
+  // transform) and "center" (base transform already centers it).
+  _applySubtitlePosition() {
+    const el = this._subtitleEl;
+    const cfg = this._subtitleCfg;
+    if (!el || !cfg) return;
+    const stage = document.getElementById("player-stage");
+    const stageH = stage?.clientHeight || 0;
+    const px = Math.round((Number(cfg.vpos) || 0) * stageH);
+    const base = cfg.position === "center" ? "translateY(-50%)" : "";
+    el.style.transform = px ? `${base} translateY(${px}px)`.trim() : base;
+  },
+  _cueAt(t) {
+    if (!this._cues?.length) return null;
+    return this._cues.find((c) => t >= c.edl_t_start && t < c.edl_t_end) || null;
   },
   _currentSubtitleText(t) {
-    if (!this._subtitleCfg?.enabled || !this._cues?.length) return "";
-    const cue = this._cues.find((c) => t >= c.edl_t_start && t < c.edl_t_end);
-    return cue?.text || "";
+    if (!this._subtitleCfg?.enabled) return "";
+    return this._cueAt(t)?.text || "";
   },
   _updateSubtitleOverlay() {
-    if (!this._subtitleEl) return;
+    if (!this._subtitleEl || this._editingCue) return; // never clobber an in-progress edit
     const text = this._currentSubtitleText(this.currentEdlTime());
     if (this._subtitleEl.textContent !== text) this._subtitleEl.textContent = text;
     this._subtitleEl.style.display = text ? "block" : "none";
+  },
+
+  /* ---------- v7 §7.6 subtitle inline edit + vertical drag ---------- */
+
+  // Paused + enabled + not in Source mode + not already editing = the
+  // overlay accepts pointer events (dblclick to edit, drag to nudge
+  // position); otherwise it stays click-through, exactly as before.
+  _updateSubtitleInteractivity() {
+    const el = this._subtitleEl;
+    if (!el) return;
+    const canInteract = !this.playing && !this.sourceClipId && !!this._subtitleCfg?.enabled;
+    el.classList.toggle("pp-subs-interactive", canInteract && !this._editingCue);
+    if (!canInteract && this._editingCue) this._cancelCueEdit(); // e.g. playback resumed mid-edit
+  },
+
+  _wireSubtitleOverlayInteraction() {
+    const el = this._subtitleEl;
+    if (!el || el.dataset.wiredEdit) return;
+    el.dataset.wiredEdit = "1";
+    el.addEventListener("dblclick", (e) => this._onSubtitleDblClick(e));
+    el.addEventListener("pointerdown", (e) => this._onSubtitlePointerDown(e));
+    el.addEventListener("keydown", (e) => this._onSubtitleKeydown(e));
+    el.addEventListener("blur", () => this._onSubtitleBlur());
+  },
+
+  _onSubtitleDblClick(e) {
+    if (this.playing || this.sourceClipId || !this._subtitleCfg?.enabled) return;
+    const cue = this._cueAt(this.currentEdlTime());
+    if (!cue) return;
+    e.preventDefault();
+    this._startCueEdit(cue);
+  },
+
+  _startCueEdit(cue) {
+    const el = this._subtitleEl;
+    if (!el) return;
+    this._editingCue = { index: cue.index, cancelled: false };
+    el.classList.add("pp-subs-editing");
+    el.contentEditable = "true";
+    el.style.display = "block";
+    el.textContent = cue.text;
+    el.focus();
+    try {
+      const range = document.createRange();
+      range.selectNodeContents(el);
+      const sel = document.getSelection();
+      sel?.removeAllRanges();
+      sel?.addRange(range);
+    } catch (_e) { /* selection API quirks — non-fatal, edit still works */ }
+    // Simultaneously scroll/focus the Subs inspector tab to this cue (spec
+    // v7 §7.6) — both globals are owned by other files this phase
+    // (ui/editor/inspector.js, ui/panels/subtitles.js) but are read here the
+    // same plain-script-tag way every other cross-module call in this app is.
+    try {
+      window.EditorUI.inspector?.switchTab?.("subs");
+      window.SubtitlesPanel?.focusCue?.(cue.index);
+    } catch (err) {
+      console.error("Failed to focus the Subs tab for this cue", err);
+    }
+  },
+
+  _onSubtitleKeydown(e) {
+    if (!this._editingCue) return;
+    if (e.key === "Enter") { e.preventDefault(); this._subtitleEl?.blur(); }
+    else if (e.key === "Escape") { e.preventDefault(); this._editingCue.cancelled = true; this._subtitleEl?.blur(); }
+  },
+
+  _onSubtitleBlur() {
+    if (!this._editingCue) return;
+    if (this._editingCue.cancelled) { this._endCueEdit(); this._updateSubtitleOverlay(); return; }
+    this._commitCueEdit();
+  },
+
+  _commitCueEdit() {
+    const editing = this._editingCue;
+    if (!editing) return;
+    const el = this._subtitleEl;
+    const text = (el?.textContent || "").trim();
+    this._endCueEdit();
+    const cue = this._cues.find((c) => c.index === editing.index);
+    if (cue) cue.text = text; // optimistic local update — no round trip needed to reflect it
+    Promise.resolve(window.SubtitlesPanel?.setCueOverride?.(state.project, editing.index, text))
+      .catch((err) => console.error("Failed to save subtitle edit", err));
+  },
+
+  _cancelCueEdit() { this._endCueEdit(); },
+
+  _endCueEdit() {
+    const el = this._subtitleEl;
+    this._editingCue = null;
+    if (!el) return;
+    el.contentEditable = "false";
+    el.classList.remove("pp-subs-editing");
+    this._updateSubtitleInteractivity();
+  },
+
+  // Vertical drag on the (interactive) overlay nudges cfg.vpos live via CSS
+  // only; a plain click (no meaningful movement) does nothing here — dblclick
+  // (separate listener above) owns entering edit mode.
+  _onSubtitlePointerDown(e) {
+    if (this._editingCue) return; // let contentEditable own its own clicks/selection
+    if (this.playing || this.sourceClipId || !this._subtitleCfg?.enabled) return;
+    const stage = document.getElementById("player-stage");
+    if (!stage) return;
+    const startY = e.clientY;
+    const startVpos = Number(this._subtitleCfg.vpos) || 0;
+    const stageH = stage.clientHeight || 1;
+    let moved = false;
+    const onMove = (ev) => {
+      const dy = ev.clientY - startY;
+      if (Math.abs(dy) > 3) moved = true;
+      if (!moved) return;
+      this._subtitleCfg.vpos = Math.max(-0.35, Math.min(0.35, startVpos + dy / stageH));
+      this._applySubtitlePosition();
+    };
+    const onUp = () => {
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onUp);
+      if (moved) this._snapAndSaveSubtitlePosition();
+    };
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp);
+  },
+
+  // "snaps to bottom/center presets when close" (spec v7 §7.6): unify both
+  // presets onto one "fraction down the stage" axis using the same
+  // approximate baselines the CSS presets place them at (8% from the bottom
+  // / dead center — see #subtitle-overlay.pos-bottom/.pos-center), so a drag
+  // that started on one preset but ends up near the OTHER one switches
+  // presets outright (vpos resets to 0); otherwise the free offset from
+  // whichever preset is now closer is kept.
+  _snapAndSaveSubtitlePosition() {
+    const cfg = this._subtitleCfg;
+    if (!cfg) return;
+    const BASE = { bottom: 0.92, center: 0.5 };
+    const SNAP = 0.06;
+    const liveFrac = Math.max(0.05, Math.min(0.97, BASE[cfg.position] + (Number(cfg.vpos) || 0)));
+    let position = cfg.position;
+    let vpos = liveFrac - BASE[cfg.position];
+    const closer = Math.abs(liveFrac - BASE.bottom) <= Math.abs(liveFrac - BASE.center) ? "bottom" : "center";
+    if (Math.abs(liveFrac - BASE[closer]) < SNAP) { position = closer; vpos = 0; }
+    else if (closer !== position) { position = closer; vpos = liveFrac - BASE[closer]; }
+    cfg.position = position;
+    cfg.vpos = Math.round(vpos * 1000) / 1000;
+    this._applySubtitleStyle();
+    Promise.resolve(window.SubtitlesPanel?.saveStyleField?.({ position: cfg.position, vpos: cfg.vpos }))
+      .catch((err) => console.error("Failed to save subtitle position", err));
   },
 
   _showEmpty(show) {
@@ -382,7 +762,11 @@ const Player = {
   },
 
   play() {
-    if (this.mode === "preview") {
+    if (this.sourceClipId) {
+      // v7 §7.1: "Transport keys work on the source clip."
+      this.playing = true;
+      this._sourceVideo?.play().catch(() => {});
+    } else if (this.mode === "preview") {
       if (!this._previewVideo?.src) return;
       this.playing = true;
       this._previewVideo.play().catch(() => {});
@@ -393,6 +777,7 @@ const Player = {
     }
     const btn = document.getElementById("pp-playpause");
     if (btn) { btn.innerHTML = '<i data-lucide="pause"></i>'; refreshIcons(); }
+    this._updateSubtitleInteractivity(); // v7 §7.6: non-interactive again while playing
   },
   // `auto` guards against the internal pause() that setMode() itself does
   // right before flipping this.mode — re-running _autoSelectMode() there
@@ -402,19 +787,28 @@ const Player = {
   // through the default auto=true path.
   pause({ auto = true } = {}) {
     this.playing = false;
-    if (this.mode === "preview") this._previewVideo?.pause();
+    if (this.sourceClipId) this._sourceVideo?.pause();
+    else if (this.mode === "preview") this._previewVideo?.pause();
     else this._active()?.pause();
     const btn = document.getElementById("pp-playpause");
     if (btn) { btn.innerHTML = '<i data-lucide="play"></i>'; refreshIcons(); }
     // v5.14: "auto-select ... when paused" — the instant it's safe (no
     // active playback to interrupt), let a fresh preview settle in on its
     // own instead of leaving the user staring at a glowing toggle forever.
-    if (auto) this._autoSelectMode();
+    // Source mode (v7 §7.1) is orthogonal to Draft/Preview and must never
+    // trigger an auto mode-flip underneath it.
+    if (auto && !this.sourceClipId) this._autoSelectMode();
+    this._updateSubtitleInteractivity(); // v7 §7.6: interactive again now that we're paused
   },
   togglePlay() { this.playing ? this.pause() : this.play(); },
 
   /* ---------- J/K/L shuttle (spec v4 §4) ---------- */
   jump(deltaSec) {
+    if (this.sourceClipId) {
+      const v = this._sourceVideo;
+      if (v) { try { v.currentTime = Math.max(0, Math.min((v.currentTime || 0) + deltaSec, this._sourceDuration || v.duration || 0)); } catch (_e) { /* ignore */ } }
+      return;
+    }
     const t = Math.max(0, this.currentEdlTime() + deltaSec);
     this.seekToEdlTime(t, { andPlay: this.playing });
   },
@@ -425,7 +819,7 @@ const Player = {
       this.play();
     } else {
       this._rate = this._rate === 1 ? 2 : 1;
-      const v = this.mode === "preview" ? this._previewVideo : this._active();
+      const v = this.sourceClipId ? this._sourceVideo : (this.mode === "preview" ? this._previewVideo : this._active());
       if (v) v.playbackRate = this._rate;
     }
   },
@@ -553,6 +947,11 @@ const Player = {
   _updateTimeDisplay() {
     const el = document.getElementById("pp-time");
     if (!el) return;
+    if (this.sourceClipId) {
+      const v = this._sourceVideo;
+      el.textContent = `${fmtT(v?.currentTime || 0)} / ${fmtT(this._sourceDuration || v?.duration || 0)}`;
+      return;
+    }
     el.textContent = `${fmtT(this.currentEdlTime())} / ${fmtT(Editor.totalDuration())}`;
   },
 
@@ -560,8 +959,13 @@ const Player = {
     const tick = () => {
       try {
         this._updateTimeDisplay();
-        this._updateSubtitleOverlay();
-        if (this.videos) window.EditorUI.timeline?.updatePlayhead(this.currentEdlTime());
+        // v7 §7.1: the EDL playhead + subtitle overlay are meaningless for a
+        // raw source clip (no cue timings / cut position apply) — leave both
+        // exactly where they were while Source mode is active.
+        if (!this.sourceClipId) {
+          this._updateSubtitleOverlay();
+          if (this.videos) window.EditorUI.timeline?.updatePlayhead(this.currentEdlTime());
+        }
       } catch (_e) { /* never let the raf loop die */ }
       this._rafId = requestAnimationFrame(tick);
     };

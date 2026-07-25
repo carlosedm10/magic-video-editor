@@ -10,6 +10,7 @@ settings.performance.min_free_ram_gb."""
 import functools
 import json
 import os
+import shutil
 import subprocess
 import sys
 import threading
@@ -318,6 +319,97 @@ def binaries_status() -> dict:
         "ffprobe_path": ffprobe_path,
         "ffmpeg_libass": _supports_ass(ffmpeg_path) if ffmpeg_path else False,
     }
+
+
+_exported_shim_dir: str | None = None
+_export_lock = threading.Lock()
+
+
+def _resolves_on_path(name: str, resolved: str) -> bool:
+    """True if plain `name` (as a bare command, via PATH lookup) already
+    resolves to the same file as `resolved` (our ffmpeg_bin()/ffprobe_bin()
+    pick). If so, third-party code shelling out to the bare command name
+    gets the right binary for free and no shim is needed."""
+    which = shutil.which(name)
+    if not which:
+        return False
+    try:
+        return Path(which).resolve() == Path(resolved).resolve()
+    except OSError:
+        return False
+
+
+def export_binaries_to_path() -> str | None:
+    """Make plain `ffmpeg`/`ffprobe` (bare command name, PATH lookup) resolve
+    to the SAME binaries this module already picked via ffmpeg_bin()/
+    ffprobe_bin(), for third-party code that shells out to the bare command
+    name directly instead of calling into this module.
+
+    Field bug (M2, packaged app, no system ffmpeg): mlx-whisper's internal
+    audio.load_audio() runs `subprocess.run(["ffmpeg", ...])` straight from
+    PATH -- our own ffmpeg_bin() resolution (vendor/static-ffmpeg fallback
+    chain) never applied to it, so transcribe failed with "ffmpeg missing"
+    even though ingest/probe (which go through this module) worked fine.
+
+    If bare `ffmpeg`/`ffprobe` already resolve on PATH to the exact binaries
+    this module would pick, this is a no-op (no shim needed). Otherwise it
+    creates -- once, idempotently, safe to call from multiple entrypoints or
+    repeatedly across runs -- a shim dir under DATA_DIR/bin-shims/ holding
+    symlinks named exactly `ffmpeg` and `ffprobe` pointing at the resolved
+    binaries, and prepends that dir to os.environ["PATH"] for this process.
+
+    Cached after the first call in this process (module-level guard, not
+    functools.cache, so tests can reset it via
+    ffmpeg_utils._exported_shim_dir = None). Returns the shim dir path if
+    PATH now includes it (freshly created or already prepended earlier in
+    this process), else None if no shim was necessary.
+    """
+    global _exported_shim_dir
+    with _export_lock:
+        if _exported_shim_dir is not None:
+            return _exported_shim_dir or None
+
+        try:
+            resolved_ffmpeg = ffmpeg_bin()
+        except FFmpegError:
+            resolved_ffmpeg = None
+        try:
+            resolved_ffprobe = ffprobe_bin()
+        except FFmpegError:
+            resolved_ffprobe = None
+
+        needs: dict[str, str] = {}
+        if resolved_ffmpeg and not _resolves_on_path("ffmpeg", resolved_ffmpeg):
+            needs["ffmpeg"] = resolved_ffmpeg
+        if resolved_ffprobe and not _resolves_on_path("ffprobe", resolved_ffprobe):
+            needs["ffprobe"] = resolved_ffprobe
+
+        if not needs:
+            _exported_shim_dir = ""
+            return None
+
+        shim_dir = config.DATA_DIR / "bin-shims"
+        shim_dir.mkdir(parents=True, exist_ok=True)
+        for name, target in needs.items():
+            link = shim_dir / name
+            target_path = Path(target).resolve()
+            try:
+                if link.is_symlink() or link.exists():
+                    if link.is_symlink() and Path(os.readlink(link)).resolve() == target_path:
+                        continue
+                    link.unlink()
+                link.symlink_to(target_path)
+            except OSError as e:
+                print(f"[ffmpeg_utils] failed to create PATH shim {link} -> {target_path}: {e}")
+
+        shim_dir_str = str(shim_dir)
+        path_entries = os.environ.get("PATH", "").split(os.pathsep)
+        if shim_dir_str not in path_entries:
+            os.environ["PATH"] = os.pathsep.join([shim_dir_str, *path_entries])
+
+        print(f"[ffmpeg_utils] exported ffmpeg/ffprobe PATH shims: {shim_dir_str}")
+        _exported_shim_dir = shim_dir_str
+        return shim_dir_str
 
 
 def run(cmd: list[str], heavy: bool = False) -> None:

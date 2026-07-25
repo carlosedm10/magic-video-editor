@@ -51,7 +51,7 @@ import re
 import time
 from pathlib import Path
 
-from .. import config, ffmpeg_utils, settings, store
+from .. import config, ffmpeg_utils, queue, settings, store
 from . import audio_enhance, filters, ordering, subtitles, sync
 
 PREVIEW_HEIGHT = 540
@@ -753,13 +753,11 @@ def render_preview(log, project: dict) -> None:
 # themselves only take (log, project), so they're wrapped rather than
 # registered directly (a bare `KIND_RUNNERS["final_render"] = run` blew up at
 # runtime with "takes 2 positional arguments but 3 were given").
-try:
-    from .. import queue  # type: ignore[import-not-found]
-
-    queue.register_runner("final_render", lambda log, project, payload=None: run(log, project))
-    queue.register_runner(
-        "preview_render", lambda log, project, payload=None: render_preview(log, project)
-    )
-except ImportError:
-    # magic_video_editor/queue.py doesn't exist in this working tree.
-    pass
+# queue.py is a hard, unconditional dependency of the app now (see
+# api/pipeline.py, api/projects.py, pipeline/ingest.py) -- no ImportError
+# fallback needed here; a stale guard from when queue.py was still being
+# built in parallel would otherwise silently hide a real registration bug.
+queue.register_runner("final_render", lambda log, project, payload=None: run(log, project))
+queue.register_runner(
+    "preview_render", lambda log, project, payload=None: render_preview(log, project)
+)

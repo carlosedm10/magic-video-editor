@@ -24,7 +24,7 @@ import math
 import cv2
 import numpy as np
 
-from .. import ffmpeg_utils, store
+from .. import ffmpeg_utils, queue, store
 
 FRAME_W, FRAME_H = 160, 90
 TARGET_INTERVAL_S = 2.0
@@ -144,12 +144,8 @@ def run(log, project: dict) -> None:
         log("Nothing to do: every clip already has thumbs.")
 
 
-# Register with the queue's per-kind runner table (spec v4 #2). queue.py was
-# being built in parallel by another agent -- this stays a no-op if it isn't
-# present yet, so thumbs.py can ship independently either way.
-try:
-    from .. import queue
-
-    queue.register_runner("thumbs", lambda log, project, payload=None: run(log, project))
-except ImportError:
-    pass
+# Register with the queue's per-kind runner table (spec v4 #2). queue.py is
+# now a hard, unconditional dependency of the app -- no ImportError fallback
+# needed (a stale guard from the parallel-build era would otherwise silently
+# hide a real registration bug).
+queue.register_runner("thumbs", lambda log, project, payload=None: run(log, project))

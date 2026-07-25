@@ -272,6 +272,39 @@ Decide where the new clip belongs:
 Be conservative flagging duplicates: only when confident the new clip is
 genuinely redundant, not merely on a related topic. When in doubt, prefer a
 placement suggestion over a duplicate one.
+
+IMPORTANT: always check for a duplicate FIRST. If your own reasoning (and
+message) says the new clip repeats an existing one, you MUST set
+duplicate_of_clip_index to that clip's index — never describe a clip as
+repeating/duplicating another in `message` while leaving
+duplicate_of_clip_index at -1; the two must agree. duplicate_of_clip_index
+is only -1 when the new clip is genuinely NOT a repeat of anything.
+
+WORKED EXAMPLES (Spanish):
+
+Example 1 — genuine duplicate of an earlier clip:
+Existing clips:
+CLIP 0: Hoy os voy a explicar como montar una rutina de entrenamiento desde cero.
+CLIP 1: Antes de nada, el calentamiento es fundamental para evitar lesiones.
+CLIP 2: Por ultimo, recordad que la constancia es la clave para ver resultados.
+NEW CLIP transcript: Hoy os voy a explicar de nuevo como montar una rutina de
+entrenamiento partiendo de cero.
+Expected: placement_after_clip_index=-1, duplicate_of_clip_index=0, confidence=5,
+message="Repite la introducción del clip 0 con las mismas palabras clave."
+(the new clip restates CLIP 0's own introduction almost verbatim — this is a
+duplicate, so duplicate_of_clip_index must point at CLIP 0, not stay -1.)
+
+Example 2 — fits after a specific clip, not a duplicate:
+Existing clips:
+CLIP 0: Hoy os voy a explicar como montar una rutina de entrenamiento desde cero.
+CLIP 1: Antes de nada, el calentamiento es fundamental para evitar lesiones.
+CLIP 2: Por ultimo, recordad que la constancia es la clave para ver resultados.
+NEW CLIP transcript: Un buen calentamiento debe incluir movilidad articular y
+unos minutos de cardio suave antes de coger peso.
+Expected: placement_after_clip_index=1, duplicate_of_clip_index=-1, confidence=5,
+message="Encaja después del clip 1: añade detalle práctico sobre cómo calentar."
+(this clip ADDS new detail about warming up instead of just restating CLIP 1
+— not a duplicate, so it goes right after CLIP 1.)
 """
 
 REVIEWER_SYSTEM_PROMPT = """

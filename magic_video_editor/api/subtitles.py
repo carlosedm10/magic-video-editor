@@ -24,6 +24,12 @@ class SubtitlesUpdate(BaseModel):
     position: Literal["bottom", "center"] = "bottom"
     words_per_cue: int = subtitles.DEFAULTS["words_per_cue"]
     speaker_names: bool = subtitles.DEFAULTS["speaker_names"]
+    # v7 §7.6: vertical-drag nudge (fraction of frame height) + project-level
+    # cue text overrides ({cue_index: text}, GLOBAL index -- see
+    # pipeline/subtitles.cue_list's docstring). Keys arrive as JSON object
+    # keys (always strings); cue_list/segment_cue_overrides accept both.
+    vpos: float = subtitles.DEFAULTS["vpos"]
+    cue_overrides: dict[str, str] = {}
 
 
 @router.get("/projects/{pid}/subtitles")

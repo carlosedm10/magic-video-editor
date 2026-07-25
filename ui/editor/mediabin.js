@@ -94,6 +94,21 @@ window.EditorUI.mediabin = {
       });
     });
 
+    // Source mode (spec v7 §7.1): click OR double-click a clip -> plays its
+    // preview proxy standalone in the main player (ui/editor/player.js owns
+    // the actual mode switch/chrome). Ignores clicks on the row's own
+    // buttons (role toggle, remove, set-main) so those keep working
+    // unchanged. A dblclick fires a click first (browsers always do), so
+    // enterSourceMode() is idempotent about re-entering the same clip.
+    list.querySelectorAll(".bin-clip[data-clip]").forEach((el) => {
+      const enter = (e) => {
+        if (e.target.closest("button")) return;
+        window.EditorUI?.player?.enterSourceMode?.(el.dataset.clip);
+      };
+      el.addEventListener("click", enter);
+      el.addEventListener("dblclick", enter);
+    });
+
     list.querySelectorAll("[data-main-group]").forEach((el) => el.onclick = async () => {
       await api(`/projects/${project.id}/groups/${encodeURIComponent(el.dataset.mainGroup)}/main`, { method: "POST" });
       refreshProject();

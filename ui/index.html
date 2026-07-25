@@ -204,6 +204,10 @@
 <script src="/ui/editor/timeline.js"></script>
 <script src="/ui/editor/compare.js"></script>
 <script src="/ui/editor/inspector.js"></script>
+<!-- Transitions catalog + browser (spec v7.5) — after inspector.js so it
+     can wrap Inspector.renderVideo (see the patch at the bottom of the
+     file). -->
+<script src="/ui/editor/transitions.js"></script>
 <script src="/ui/editor/suggestions.js"></script>
 <script src="/ui/editor/reeleditor.js"></script>
 <!-- Resizable layout + manual overlay track (spec v5.9) -->
@@ -219,5 +223,8 @@
      is already defined. -->
 <script src="/ui/menubus.js"></script>
 <script src="/ui/fx.js"></script>
+<!-- Reel social safe zones + face safety UI (spec v7.7) — window.SafeZonesUI,
+     called from ui/editor/reeleditor.js (guarded, never throws through). -->
+<script src="/ui/editor/safezones-ui.js"></script>
 </body>
 </html>

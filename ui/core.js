@@ -257,23 +257,165 @@ function updateTopbarForProject() {
   if (!has) updateActivityChip();
 }
 
-/* ---------- stage bar + run pipeline ---------- */
+/* ---------- pipeline status chip (spec v7 §7.2) ----------
+   Replaces the old 8 always-visible stage pills with ONE compact chip
+   ("Pipeline ✓" done / "Pipeline N/8" in progress / garnet error) that opens
+   an anchored popover listing every stage with its status and a per-stage
+   re-run button (same runStage() the old pills called). The run-all
+   progress strip (#run-all-panel, renderRunAllPanel below) is untouched --
+   it stays visible during a run-all exactly as before; this chip is purely
+   the "what's each stage's last status, and let me re-run just one" surface,
+   always available (not just mid-run-all). Self-contained: injects its own
+   <style> + popover DOM into #stage-bar (still the anchor element from
+   ui/index.html) the first time renderStageBar() runs, the same "chrome
+   injection" pattern ui/editor/player.js and ui/editor/timeline.js already
+   use for pieces index.html/style.css don't know about. */
+
+let _pipelineRows = [];
+
+function _ensurePipelineChip() {
+  let chip = document.getElementById("pipeline-chip");
+  if (chip) return chip;
+  if (!document.getElementById("pipeline-chip-styles")) {
+    const style = document.createElement("style");
+    style.id = "pipeline-chip-styles";
+    style.textContent = `
+      .pipeline-chip { display: inline-flex; align-items: center; gap: 6px; padding: 5px 12px;
+        border-radius: 999px; border: 1px solid var(--border); background: var(--panel2);
+        color: var(--dim); font-size: 12px; cursor: pointer; white-space: nowrap; line-height: 1; }
+      .pipeline-chip:hover { border-color: var(--accent); color: var(--text); }
+      .pipeline-chip.ok { border-color: var(--accent2); color: var(--accent2); }
+      .pipeline-chip.running { border-color: var(--accent); color: var(--accent-hover); }
+      .pipeline-chip.error { border-color: var(--accent-hover); color: var(--accent-hover); }
+      .pipeline-chip i { width: 14px; height: 14px; }
+      /* position: fixed (not absolute-inside-#stage-bar) + appended to
+         document.body, exactly like .activity-popover (ui/exportux.css) --
+         #stage-bar has overflow-x: auto for its own horizontal-scroll
+         reasons, which per the CSS spec forces overflow-y: auto too the
+         instant overflow-x isn't "visible", turning the bar into a clipping
+         ancestor that silently swallowed an absolutely-positioned popover
+         child (it was in the DOM, fully wired, just invisible). Top/left are
+         set inline from the chip's live getBoundingClientRect() each time it
+         opens (see togglePipelinePopover) since, unlike the always-top-right
+         Activity popover, this chip's position shifts with the stage bar's
+         content. */
+      .pipeline-popover { position: fixed; width: 260px;
+        background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 8px;
+        backdrop-filter: blur(16px); box-shadow: 0 8px 24px rgba(0,0,0,.4); z-index: 55; font-size: 12px;
+        max-height: min(70vh, 480px); overflow-y: auto; }
+      .pipeline-popover-row { display: flex; align-items: center; gap: 8px; padding: 5px 4px; border-radius: 8px; }
+      .pipeline-popover-row:hover { background: var(--panel2); }
+      .pipeline-popover-label { flex: 1; color: var(--text); }
+      .pipeline-popover-status { font-size: 10px; text-transform: uppercase; letter-spacing: .03em; }
+      .pipeline-popover-status.done { color: var(--accent2); }
+      .pipeline-popover-status.running { color: var(--accent-hover); }
+      .pipeline-popover-status.error { color: var(--accent-hover); }
+      .pipeline-popover-status.pending { color: var(--dim); }
+      .pipeline-popover-rerun { background: none; border: 1px solid var(--border); border-radius: 6px;
+        color: var(--dim); cursor: pointer; padding: 2px 5px; display: inline-flex; }
+      .pipeline-popover-rerun:hover { border-color: var(--accent); color: var(--text); }
+    `;
+    document.head.appendChild(style);
+  }
+  const bar = document.getElementById("stage-bar");
+  if (!bar) return null;
+  bar.style.position = "relative";
+  chip = document.createElement("button");
+  chip.id = "pipeline-chip";
+  chip.className = "pipeline-chip";
+  chip.innerHTML = '<i data-lucide="workflow"></i><span class="pipeline-chip-label">Pipeline</span>';
+  chip.onclick = (e) => { e.stopPropagation(); togglePipelinePopover(); };
+  bar.appendChild(chip);
+  // The popover itself lives on document.body now (see togglePipelinePopover),
+  // not inside `bar` -- so "outside click" must check both, or the very
+  // click on a re-run button inside the popover would count as "outside"
+  // and close/remove it before that button's own onclick gets a chance to
+  // fire (pointerdown precedes click).
+  document.addEventListener("pointerdown", (e) => {
+    if (!_pipelinePopoverOpen()) return;
+    const pop = document.getElementById("pipeline-popover");
+    if (bar.contains(e.target) && !chip.contains(e.target)) return; // clicks elsewhere in the stage bar chrome don't count
+    if (chip.contains(e.target) || pop?.contains(e.target)) return;
+    togglePipelinePopover(false);
+  });
+  return chip;
+}
+
+function _pipelinePopoverOpen() {
+  return !!document.getElementById("pipeline-popover");
+}
+
+// Fixed-position, body-anchored popover (see the .pipeline-popover comment
+// above for why) -- top/left computed from the chip's live position each
+// time it opens so it tracks the chip wherever the stage bar laid it out,
+// clamped so it never runs off the right edge of the window.
+function togglePipelinePopover(force) {
+  const open = force != null ? force : !_pipelinePopoverOpen();
+  const chip = document.getElementById("pipeline-chip");
+  if (!chip) return;
+  if (open) {
+    let pop = document.getElementById("pipeline-popover");
+    if (!pop) {
+      pop = document.createElement("div");
+      pop.id = "pipeline-popover";
+      pop.className = "pipeline-popover";
+      document.body.appendChild(pop);
+    }
+    const rect = chip.getBoundingClientRect();
+    const width = 260;
+    const left = Math.min(rect.left, window.innerWidth - width - 12);
+    pop.style.top = `${Math.round(rect.bottom + 6)}px`;
+    pop.style.left = `${Math.round(Math.max(8, left))}px`;
+    renderPipelinePopover();
+  } else {
+    document.getElementById("pipeline-popover")?.remove();
+  }
+}
+
+function renderPipelinePopover() {
+  const pop = document.getElementById("pipeline-popover");
+  if (!pop) return;
+  pop.innerHTML = _pipelineRows.map((r) => `
+    <div class="pipeline-popover-row">
+      <span class="pipeline-popover-label">${esc(r.label)}</span>
+      <span class="pipeline-popover-status ${r.status}" title="${esc(r.detail)}">${r.status}</span>
+      <button class="pipeline-popover-rerun" data-stage="${r.key}" title="Re-run this stage"><i data-lucide="rotate-cw"></i></button>
+    </div>`).join("");
+  pop.querySelectorAll("[data-stage]").forEach((btn) => btn.onclick = () => runStage(btn.dataset.stage));
+  refreshIcons();
+}
 
 function renderStageBar() {
   const stages = state.project.stages || {};
-  $("#stage-bar").innerHTML = STAGES.map(([key, label]) => {
-    const st = stages[key];
+  const chip = _ensurePipelineChip();
+  let doneCount = 0;
+  let runningCount = 0;
+  let errorLabel = null;
+  _pipelineRows = STAGES.map(([key, label]) => {
     // Queue-driven (spec v4 §2): a stage is "running" when its queue item
     // (kind "stage:<key>") is currently the one the worker picked up, not
     // via the old jobs.start() naming convention (queue jobs are all named
     // "queue:<kind>:<pid>" now -- see magic_video_editor/queue.py _run_item).
     const running = state.queue.some((i) => i.status === "running" && i.kind === `stage:${key}`);
-    const cls = running ? "running" : st ? st.status : "";
-    const title = st?.detail || "";
-    return `<button class="stage ${cls}" data-stage="${key}" title="${esc(title)}">${label}</button>`;
-  }).join("");
-  document.querySelectorAll(".stage").forEach((el) =>
-    el.onclick = () => runStage(el.dataset.stage));
+    const st = stages[key];
+    const status = running ? "running" : (st?.status || "pending");
+    if (status === "done") doneCount++;
+    else if (status === "running") runningCount++;
+    else if (status === "error" && !errorLabel) errorLabel = label;
+    return { key, label, status, detail: st?.detail || "" };
+  });
+  if (!chip) return;
+  const total = STAGES.length;
+  let cls;
+  let text;
+  if (errorLabel) { cls = "error"; text = "Pipeline !"; chip.title = `Error in ${errorLabel} — click for details`; }
+  else if (doneCount === total) { cls = "ok"; text = "Pipeline ✓"; chip.title = "All stages done — click for details"; }
+  else { cls = runningCount > 0 ? "running" : ""; text = `Pipeline ${doneCount}/${total}`; chip.title = "Click for stage details and re-run"; }
+  chip.className = `pipeline-chip ${cls}`;
+  const label = chip.querySelector(".pipeline-chip-label");
+  if (label) label.textContent = text;
+  if (_pipelinePopoverOpen()) renderPipelinePopover();
+  refreshIcons();
 }
 
 async function runStage(stage) {
@@ -553,6 +695,9 @@ document.addEventListener("keydown", (e) => {
   else if (window.ActivityPopover?.isOpen()) window.ActivityPopover.close();
   else if (!$("#settings-overlay").hidden) closeSettings();
   else if (state.tab) closeDrawer();
+  // spec v7 §7.1: Esc also backs out of the player's Source mode (media bin
+  // clip preview) when no other overlay/drawer is in front of it.
+  else if (window.EditorUI?.player?.sourceClipId) window.EditorUI.player.exitSourceMode();
 });
 
 /* ---------- boot ---------- */

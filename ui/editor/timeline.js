@@ -145,6 +145,16 @@ const Timeline = {
       .tl-shortcuts-pop td:first-child { color: var(--text); font-variant-numeric: tabular-nums;
         white-space: nowrap; padding-right: 10px; width: 1%; }
       #timeline-content.tl-drop-target { outline: 2px dashed var(--accent); outline-offset: -2px; }
+      /* junction chip now shows the transition NAME (spec v7.5), not a single
+         letter — override the fixed 18x18 circle from ui/style.css (two
+         classes beats their one-class rule) whenever it carries a label. */
+      .tl-chip.tl-chip-named { width: auto; height: auto; min-width: 18px; padding: 2px 7px;
+        border-radius: 9px; font-size: 9px; line-height: 1.4; white-space: nowrap; }
+      /* Junction 0 (before the very first clip, no real incoming footage)
+         sits at x=0 — the default centered transform hangs half the chip
+         off the left edge of the scroll area, clipping a named label. Keep
+         it vertically centered but left-anchored instead. */
+      .tl-chip.tl-chip-named.tl-chip-first { transform: translateY(-50%); left: 2px !important; }
       .tl-history-pop { position: absolute; bottom: 100%; right: 0; margin-bottom: 6px; width: 260px;
         max-height: 320px; overflow-y: auto; background: var(--panel); border: 1px solid var(--border);
         border-radius: 12px; padding: 8px; backdrop-filter: blur(16px); box-shadow: 0 8px 24px rgba(0,0,0,.4);
@@ -165,6 +175,10 @@ const Timeline = {
       .tl-overlay-track { position: absolute; left: 0; right: 0; top: 22px; height: 26px; z-index: 1;
         border-bottom: 1px solid var(--border); }
       .tl-overlay-track.tl-drop-target { outline: 2px dashed var(--accent2); outline-offset: -2px; }
+      .tl-overlay-empty { position: absolute; inset: 0; display: flex; align-items: center; padding: 0 8px;
+        font-size: 10px; color: var(--dim); opacity: .7; pointer-events: none; white-space: nowrap;
+        overflow: hidden; text-overflow: ellipsis; }
+      .tl-overlay-track.tl-drop-target .tl-overlay-empty { color: var(--accent2); opacity: 1; }
       .ov-block { position: absolute; top: 3px; height: 20px; border-radius: 6px; overflow: hidden;
         background: rgba(53,194,143,.20); border: 1px solid var(--accent2); cursor: grab;
         display: flex; align-items: center; }
@@ -548,6 +562,15 @@ const Timeline = {
     if (!track) return;
     const px = this.pxPerSec;
     const overlays = Editor.overlays || [];
+    // Discoverability empty-state (spec 7.4): the overlay track is easy to
+    // miss otherwise — a permanent dim label until the first overlay lands,
+    // highlighted the same way as a real bin-drag via the .tl-drop-target
+    // class already toggled by the track's own dragover/drop listeners
+    // (_ensureOverlayTrack, above).
+    if (!overlays.length) {
+      track.innerHTML = `<div class="tl-overlay-empty">Overlay — arrastra un clip aquí</div>`;
+      return;
+    }
     track.innerHTML = overlays.map((o) => {
       const leftPx = o.t_start * px;
       const widthPx = Math.max(o.duration * px, 3);
@@ -714,6 +737,7 @@ const Timeline = {
       const clip = Editor.clip(s.clip_id);
       const name = clip?.filename || s.clip_id;
       const trType = s.transition?.type || "none";
+      const trLabel = trType === "none" ? null : (window.EditorUI.transitions?.labelFor(trType) || trType);
 
       const thumbs = this._getThumbEntry(s.clip_id);
       let filmHtml = "";
@@ -728,9 +752,11 @@ const Timeline = {
         ? `<canvas class="tl-wave" data-wave="${i}" width="${Math.max(1, Math.round(widthPx))}" height="16"></canvas>`
         : "";
 
-      html += `<div class="tl-chip ${trType}" data-chip="${i}" style="left:${leftPx.toFixed(1)}px"
-        title="Transition into this clip — click to cycle">${trType === "none" ? "·" : trType === "fade" ? "F" : "X"}</div>
-      <div class="tl-block" data-idx="${i}" style="left:${leftPx.toFixed(1)}px;width:${widthPx.toFixed(1)}px">
+      html += `<div class="tl-chip ${trType}${trLabel ? " tl-chip-named" : ""}${i === 0 ? " tl-chip-first" : ""}" data-chip="${i}"
+        style="left:${leftPx.toFixed(1)}px"
+        title="${trLabel ? esc(trLabel) : "No transition"} — click to edit, or drag a transition here"
+        >${trLabel ? esc(trLabel) : "·"}</div>
+      <div class="tl-block" data-idx="${i}" style="left:${leftPx.toFixed(1)}px;width:${widthPx.toFixed(1)}px"
         ${filmHtml}
         <div class="tl-edge tl-edge-l" data-idx="${i}" data-edge="start"></div>
         <span class="tl-label">${esc(name)} · ${fmtT(dur)}</span>
@@ -745,13 +771,34 @@ const Timeline = {
       el.addEventListener("pointerdown", (e) => this._onBlockPointerDown(e, el));
     });
     track.querySelectorAll(".tl-chip").forEach((el) => {
+      // Click opens the FX browser (spec v7.5) focused on this junction,
+      // rather than cycling a hardcoded 3-value list — the catalog can hold
+      // ~50 named xfade transitions now.
       el.onclick = (e) => {
         e.stopPropagation();
         const i = Number(el.dataset.chip);
-        const cur = Editor.segments[i]?.transition?.type || "none";
-        const next = cur === "none" ? "fade" : cur === "fade" ? "crossfade" : "none";
-        Editor.setTransition(i, next);
+        window.EditorUI.transitions?.openFocused(i);
       };
+      // Drag-onto-junction-chip (spec v7.5): thumbnails in the FX browser
+      // (ui/editor/transitions.js) are draggable and carry the xfade name
+      // under this MIME type.
+      el.addEventListener("dragover", (e) => {
+        if (!e.dataTransfer?.types?.includes("application/x-mve-transition")) return;
+        e.preventDefault();
+        e.stopPropagation();
+        e.dataTransfer.dropEffect = "copy";
+        el.classList.add("tr-drop-target");
+      });
+      el.addEventListener("dragleave", (e) => { e.stopPropagation(); el.classList.remove("tr-drop-target"); });
+      el.addEventListener("drop", (e) => {
+        el.classList.remove("tr-drop-target");
+        const xfade = e.dataTransfer?.getData("application/x-mve-transition");
+        if (!xfade) return;
+        e.preventDefault();
+        e.stopPropagation();
+        const i = Number(el.dataset.chip);
+        Editor.setTransition(i, xfade);
+      });
     });
     track.querySelectorAll(".tl-wave").forEach((canvas) => {
       const i = Number(canvas.dataset.wave);
