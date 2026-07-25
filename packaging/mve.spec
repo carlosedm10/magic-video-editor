@@ -65,6 +65,44 @@ try:
 except Exception as exc:  # surfaced at build time
     print(f"[mve.spec] static-ffmpeg pre-fetch failed: {exc}")
 
+# ---------- deterministic ffmpeg/ffprobe bundling (field bug fix) ----------
+# FIELD BUG (v0.6.1 packaged .app): ffprobe reported missing while ffmpeg
+# worked fine. Root cause: the only thing putting ffmpeg/ffprobe in the
+# bundle was collect_all("static_ffmpeg") sweeping whatever the pre-fetch
+# above happened to leave in that package's install dir as package *data* --
+# no explicit `binaries` entry, no fixed in-bundle path, and no guarantee
+# PyInstaller's static-analysis-driven data collection actually reaches both
+# files (it silently caught ffmpeg but not ffprobe in the field). Fixed by
+# resolving the two binaries HERE, at build time (the pre-fetch above has
+# already ensured they exist on this machine), and adding them as EXPLICIT
+# `binaries` entries at a fixed, first-class path inside the bundle:
+# Contents/Frameworks/vendor/ffbin/{ffmpeg,ffprobe} (PyInstaller relocates
+# `binaries` datas under Frameworks/ for a onedir macOS build). ffmpeg_utils.
+# ffmpeg_bin()/ffprobe_bin() then resolve that exact path as a bundle-mode
+# candidate (mirrors how ollama_manager.py locates its own vendored binary
+# from sys.executable) instead of trusting collect_all()'s sweep alone.
+# collect_all("static_ffmpeg") above is left in place -- harmless, and it's
+# still what makes `static_ffmpeg.run.get_or_fetch_platform_executables_else_raise()`
+# importable/functional inside the frozen app if anything else calls it.
+_VENDOR_FFBIN_DEST = "vendor/ffbin"
+try:
+    import static_ffmpeg.run as _sf_run
+
+    _ffmpeg_src, _ffprobe_src = _sf_run.get_or_fetch_platform_executables_else_raise()
+    binaries += [
+        (_ffmpeg_src, _VENDOR_FFBIN_DEST),
+        (_ffprobe_src, _VENDOR_FFBIN_DEST),
+    ]
+    print(
+        f"[mve.spec] vendoring ffmpeg={_ffmpeg_src} ffprobe={_ffprobe_src} "
+        f"-> Contents/Frameworks/{_VENDOR_FFBIN_DEST}/"
+    )
+except Exception as exc:  # surfaced at build time -- do not fail the build silently
+    print(
+        f"[mve.spec] could not resolve static-ffmpeg binaries for explicit vendoring: {exc} "
+        "-- packaged app will fall back to collect_all()'s sweep / system binaries only"
+    )
+
 for pkg in _COLLECT_ALL_PACKAGES:
     try:
         d, b, h = collect_all(pkg)

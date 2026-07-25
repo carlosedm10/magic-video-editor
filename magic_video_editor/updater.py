@@ -11,12 +11,35 @@ means no update is reported this session.
 "Install" (``start_install_job()``) downloads the release's ``.dmg`` +
 ``.dmg.sha256`` assets (same sidecar convention as ``packaging/make_dmg.sh``),
 verifies the hash, and -- ONLY when this process is actually running from a
-packaged ``.app`` bundle -- hands off to ``packaging/update_helper.sh``, which
-waits for this process to exit, ditto-copies the new ``.app`` over the
-current bundle, and relaunches it. In a dev checkout (``uv run mve`` /
-``uv run mve-server``) there is no ``.app`` to swap, so install refuses
-up front with a clear ``DevModeError`` ("git pull instead") rather than
-downloading anything.
+packaged ``.app`` bundle -- hands off to ``packaging/update_helper.sh``,
+which waits for this process to exit, atomically swaps the new ``.app`` in
+over the current bundle, strips quarantine, and relaunches it. In a dev
+checkout (``uv run mve`` / ``uv run mve-server``) there is no ``.app`` to
+swap, so install refuses up front with a clear ``DevModeError`` ("git pull
+instead") rather than downloading anything.
+
+FIELD BUG (real M2 test, v0.6.0 -> v0.6.1): banner + download + progress all
+worked, but the app never relaunched and the swapped-in .app was left
+"corrupta". Root causes (see ``packaging/update_helper.sh``'s header for the
+full writeup) and the fixes applied here:
+
+  - The helper used to run FROM INSIDE the bundle it was about to overwrite.
+    It is now copied to a fresh temp dir OUTSIDE the bundle
+    (``_stage_helper_outside_bundle()``) before being launched.
+  - The helper used to be started with a plain detached ``Popen`` and no
+    hard confirmation the parent was actually gone before it started
+    touching the bundle. It's now launched via ``nohup`` (ignores SIGHUP)
+    with ``start_new_session=True`` (``setsid``-equivalent -- a new process
+    group/session so it isn't in this process's job-control tree), stdin/
+    out/err fully redirected to ``/dev/null``, and a marker-file protocol:
+    a marker file is created before the helper is launched and removed only
+    as this process's last act before ``os._exit()``, so the helper's wait
+    loop has a race-free "parent is actually done" signal instead of relying
+    on a bare ``kill -0`` alone (kept as a secondary backstop).
+  - The swap itself is now atomic-ish (temp-dir-on-same-volume + rename,
+    with rollback) and strips ``com.apple.quarantine`` -- both implemented
+    in ``update_helper.sh`` itself; this module only has to hand it the
+    right inputs and get out of the way cleanly.
 
 Sparkle (signed, delta updates) is the future path once code signing exists
 -- see README's "Releases & auto-update" section. This is the unsigned
@@ -26,6 +49,7 @@ bridge that gets us a working update loop today.
 import hashlib
 import logging
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -34,7 +58,7 @@ from pathlib import Path
 
 import httpx
 
-from . import __version__
+from . import __version__, config
 from . import jobs as jobs_module
 
 logger = logging.getLogger(__name__)
@@ -214,9 +238,12 @@ def _download(
 
 
 def _helper_script_path() -> Path:
-    """packaging/update_helper.sh, resolved the same "sibling of the package
-    dir" way ollama_manager.py finds its vendored binary (works for both a
-    PyInstaller onedir .app bundle and a bare dev checkout)."""
+    """packaging/update_helper.sh's SOURCE location, resolved the same
+    "sibling of the package dir" way ollama_manager.py finds its vendored
+    binary (works for both a PyInstaller onedir .app bundle and a bare dev
+    checkout). This is a template inside the (about to be replaced) bundle --
+    ``_stage_helper_outside_bundle()`` below copies it out before running
+    it; nothing ever executes this path in place."""
     candidates = []
     meipass = getattr(sys, "_MEIPASS", None)
     if meipass:
@@ -226,6 +253,29 @@ def _helper_script_path() -> Path:
         if c.exists():
             return c
     return candidates[-1]
+
+
+def _update_log_path() -> Path:
+    """Fixed location for the helper's own log, under the app's real data
+    dir (not /tmp) so a field failure is actually diagnosable afterwards."""
+    d = config.DATA_DIR / "logs"
+    d.mkdir(parents=True, exist_ok=True)
+    return d / "update.log"
+
+
+def _stage_helper_outside_bundle(source: Path) -> Path:
+    """Copy update_helper.sh into a fresh temp dir OUTSIDE the .app bundle
+    and return the copy's path. Root cause #1 of the v0.6.0->v0.6.1 field
+    bug: the helper used to run straight from inside the bundle it was
+    about to overwrite, i.e. it could truncate/corrupt its own running
+    script file mid-swap. Running a copy from an unrelated temp dir means
+    the bundle can be freely renamed/replaced without touching anything
+    this script needs to keep reading."""
+    staging_dir = Path(tempfile.mkdtemp(prefix="mve-update-helper-"))
+    dest = staging_dir / "update_helper.sh"
+    shutil.copy2(source, dest)
+    os.chmod(dest, 0o755)
+    return dest
 
 
 def _run_install(log, dmg_url: str, sha256_url: str, bundle: Path) -> None:
@@ -242,26 +292,64 @@ def _run_install(log, dmg_url: str, sha256_url: str, bundle: Path) -> None:
         raise RuntimeError("downloaded update failed sha256 verification -- aborting install")
     log.progress(0.9)
 
-    helper = _helper_script_path()
-    if not helper.exists():
-        raise RuntimeError(f"update helper script missing: {helper}")
+    helper_source = _helper_script_path()
+    if not helper_source.exists():
+        raise RuntimeError(f"update helper script missing: {helper_source}")
+    helper = _stage_helper_outside_bundle(helper_source)
+    log_file = _update_log_path()
+
+    # Marker-file protocol (root cause #1 continued): the helper's wait loop
+    # treats "this file is gone" as the primary, race-free signal that this
+    # process has actually finished exiting -- a bare `kill -0` on a pid can
+    # be fooled by pid reuse once we're truly gone. We remove it ourselves,
+    # as close to os._exit() as we can get, from the same timer callback
+    # that does the exit.
+    marker = helper.parent / "parent.alive"
+    marker.touch()
 
     log("handing off to the update helper and quitting")
-    # start_new_session=True detaches the helper from this process's
-    # session so it survives our own exit (it's the whole point: it waits
-    # for our pid to die, then swaps the bundle). Mirrors the "app-first"
-    # relaunch flow -- `open -n` inside the helper opens a fresh instance.
+    # Fully detached: nohup (ignore SIGHUP once this process's session ends)
+    # + start_new_session=True (setsid-equivalent -- new session/process
+    # group, so the helper is not a child of this process's job-control
+    # tree) + stdin/stdout/stderr all redirected away from us, and cwd
+    # pinned outside the bundle. This is what makes the process tree
+    # survive the app quitting (previously: same start_new_session=True,
+    # but the helper it detached *was itself inside the bundle*, and the
+    # app-quit path could still race the swap against the running script).
     subprocess.Popen(
-        ["/bin/bash", str(helper), str(dmg_path), str(bundle), str(os.getpid())],
+        [
+            "/usr/bin/nohup",
+            "/bin/bash",
+            str(helper),
+            str(dmg_path),
+            str(bundle),
+            str(os.getpid()),
+            str(marker),
+            str(log_file),
+        ],
+        stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
         start_new_session=True,
+        close_fds=True,
+        cwd="/",
     )
     log.progress(1.0)
     log("quitting now -- the app will relaunch once the update is installed")
-    # Give the job's final log lines / HTTP response a brief moment to flush
-    # before pulling the rug out from under the whole process.
-    threading.Timer(0.5, lambda: os._exit(0)).start()
+
+    def _finish() -> None:
+        # Give the job's final log lines / HTTP response a brief moment to
+        # flush, then signal the helper (marker gone) and pull the rug out
+        # from under this process. Order matters: marker removal must
+        # happen before os._exit(), since os._exit() skips atexit/finally
+        # handlers entirely.
+        try:
+            marker.unlink(missing_ok=True)
+        except Exception:
+            pass
+        os._exit(0)
+
+    threading.Timer(0.5, _finish).start()
 
 
 def start_install_job() -> str:

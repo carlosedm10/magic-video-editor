@@ -11,6 +11,7 @@ import functools
 import json
 import os
 import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
@@ -169,6 +170,43 @@ def _bin_works(binary: str) -> bool:
         return False
 
 
+def _vendor_ffbin_roots() -> list[Path]:
+    """Where the fixed-path bundled ffmpeg/ffprobe (packaging/mve.spec's
+    explicit `binaries` entries at "vendor/ffbin/{ffmpeg,ffprobe}") might
+    live inside a packaged .app. Computed from sys.executable the same way
+    ollama_manager.py's _candidate_bundle_roots() locates its own vendored
+    binary -- for a onedir macOS build, PyInstaller's `binaries` land under
+    Contents/Frameworks (Contents/Resources is checked too, since some
+    PyInstaller versions/datas mixes copy there instead)."""
+    roots: list[Path] = []
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        roots.append(Path(meipass) / "vendor" / "ffbin")
+    if getattr(sys, "frozen", False):
+        exe = Path(sys.executable).resolve()
+        for parent in (exe, *exe.parents):
+            if parent.suffix == ".app":
+                roots.append(parent / "Contents" / "Frameworks" / "vendor" / "ffbin")
+                roots.append(parent / "Contents" / "Resources" / "vendor" / "ffbin")
+                break
+    return roots
+
+
+def _vendor_bin(name: str) -> str | None:
+    """Path to `name` ("ffmpeg" or "ffprobe") under the fixed in-bundle
+    vendor dir (see packaging/mve.spec), if this build actually vendored it
+    and the file is present. This is the DETERMINISTIC bundle-mode
+    candidate -- unlike collect_all()'s sweep of static_ffmpeg's package
+    data (which, in the field, brought in ffmpeg but silently not ffprobe),
+    this path is an explicit PyInstaller `binaries` entry, so its presence
+    is a build-time guarantee, not a static-analysis best-effort."""
+    for root in _vendor_ffbin_roots():
+        candidate = root / name
+        if candidate.exists():
+            return str(candidate)
+    return None
+
+
 def _static_ffmpeg_exes() -> tuple[str | None, str | None]:
     """Lazily fetch (ffmpeg, ffprobe) from the `static-ffmpeg` package. On a
     machine that has never run this before, this downloads the platform's
@@ -202,6 +240,12 @@ def ffmpeg_bin() -> str:
         candidates.append(imageio_ffmpeg.get_ffmpeg_exe())
     except Exception:
         pass
+    # Deterministic bundle path (packaging/mve.spec explicit `binaries`)
+    # before the lazy static-ffmpeg fetch, which in a packaged app may have
+    # no network access and nothing pre-fetched at runtime.
+    vendor_ffmpeg = _vendor_bin("ffmpeg")
+    if vendor_ffmpeg:
+        candidates.append(vendor_ffmpeg)
     static_ffmpeg_exe, _ = _static_ffmpeg_exes()
     if static_ffmpeg_exe:
         candidates.append(static_ffmpeg_exe)
@@ -226,6 +270,13 @@ def ffprobe_bin() -> str:
         config.env_with_legacy_fallback("MVE_FFPROBE", "CUTROOM_FFPROBE"),
         "ffprobe",
     ]
+    # Deterministic bundle path (packaging/mve.spec explicit `binaries`) --
+    # this is the fix for the field bug where the packaged .app reported
+    # ffprobe missing (while ffmpeg worked) because collect_all()'s sweep of
+    # static_ffmpeg's package data silently didn't carry ffprobe along.
+    vendor_ffprobe = _vendor_bin("ffprobe")
+    if vendor_ffprobe:
+        candidates.append(vendor_ffprobe)
     _, static_ffprobe_exe = _static_ffmpeg_exes()
     if static_ffprobe_exe:
         candidates.append(static_ffprobe_exe)

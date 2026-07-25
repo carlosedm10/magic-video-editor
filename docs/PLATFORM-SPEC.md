@@ -949,3 +949,13 @@ setpts=PTS/<v> + atempo chain (atempo composed for >2x/<0.5x); duration math upd
 timeline lengths everywhere (cumulative, playhead, filmstrip width); draft playback uses
 video.playbackRate for that segment. Subtitle cue times for sped segments re-map
 accordingly in cue_list/burn.
+
+## ⛔ HARD RULE — no local packaging activity on this machine (2 Cortex XDR kills)
+Cortex XDR terminated the dev session twice: (1) launching a freshly built .app,
+(2) building + dry-run-simulating the update swap (detached helpers, xattr, bundle
+replacement). On THIS machine, agents must NEVER: run PyInstaller/make dist*, execute
+anything from dist/, simulate app swaps/self-replacement, or spawn vendored binaries
+for tests. Verification for packaging/updater work = static only (ruff, bash -n, code
+review, unit tests with pure-python fakes) + the GitHub Actions release build + user
+testing on their own hardware. scripts/dry_run_update_helper.sh is CI/other-machine
+material only.
