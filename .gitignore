@@ -4,7 +4,6 @@ __pycache__/
 dist/
 build/
 .DS_Store
-uv.lock
 packaging/icon.iconset/
 packaging/icon_preview.png
 
