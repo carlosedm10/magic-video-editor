@@ -13,7 +13,7 @@ from pydantic import BaseModel
 
 from .. import jobs, queue, settings, store
 from ..jobs import JobCancelled
-from ..pipeline import ingest, ordering, reels, render, review, sync, takes, transcribe
+from ..pipeline import ingest, ordering, paragraphs, reels, render, review, sync, takes, transcribe
 from . import ollama as ollama_api
 
 router = APIRouter(prefix="/api", tags=["pipeline"])
@@ -24,6 +24,7 @@ STAGES = {
     "transcribe": transcribe.run,
     "takes": takes.run,
     "order": ordering.run,
+    "paragraphs": paragraphs.run,
     "review": review.run,
     "render": render.run,
     "reels": reels.suggest,
@@ -37,6 +38,7 @@ STAGE_LABELS = {
     "transcribe": "Transcribing",
     "takes": "Analyzing takes",
     "order": "Ordering the story",
+    "paragraphs": "Marking paragraph breaks",
     "review": "Checking for suggestions",
     "render": "Editing the video",
     "reels": "Making shorts",
@@ -65,6 +67,7 @@ LLM_TASKS_BY_STAGE: dict[str, list[str]] = {
         "take_judge",
     ],
     "order": ["clip_order"],
+    "paragraphs": ["paragraph_break"],
     "review": ["reviewer"],
     "reels": ["reel_composer", "reel_scorer"],
 }

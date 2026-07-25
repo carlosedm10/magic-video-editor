@@ -102,6 +102,38 @@ class DedupJudge(BaseModel):
     reason: str = Field(default="", description="One-line rationale")
 
 
+class ParagraphBreakPoint(BaseModel):
+    """One boundary where a NEW paragraph/topic clearly begins ("punto y
+    aparte"), expressed as the local sentence number AFTER which the break
+    falls (the break sits between that sentence and the next one). Flat
+    object held in a short list -- same pattern as ContextFlag/CutRun."""
+
+    after_id: int = Field(
+        ...,
+        description="Local sentence number; the break falls between this sentence and the next",
+    )
+    confidence: int = Field(
+        ..., ge=1, le=5, description="Confidence this is a genuine paragraph/topic change, 1-5"
+    )
+    reason: str = Field(default="", description="One-line rationale for this break")
+
+
+class ParagraphBreaks(BaseModel):
+    """Windowed verdict: given a numbered list of consecutive KEPT sentences
+    from one clip, in spoken order, which boundaries mark a genuine new
+    paragraph / topic shift ("punto y aparte")? NEVER a plain sentence end
+    within the same idea ("punto y seguido"). Empty list when nothing in the
+    window qualifies -- when in doubt, don't mark. Batched per window, same
+    shape as TakeSequencer.cut_runs."""
+
+    breaks: list[ParagraphBreakPoint] = Field(
+        default_factory=list,
+        max_length=6,
+        description="Boundaries where a new paragraph/topic clearly begins. "
+        "Empty list if nothing in this window is a genuine topic change.",
+    )
+
+
 class ClipOrder(BaseModel):
     """Narrative order for separately recorded clips."""
 

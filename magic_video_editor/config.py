@@ -178,6 +178,23 @@ CONTEXT_CHECK_MAX_SENTENCES = 300  # hard cap on sentences fed to context_check 
 CONTEXT_CHECK_AUTOCUT_CONFIDENCE = 4
 CONTEXT_CHECK_SUGGEST_CONFIDENCE = 2
 
+# Paragraph-break detection (owner feature, 2026-07-25): NON-DESTRUCTIVE
+# suggested cut points where the conversation changes topic/paragraph
+# ("punto y aparte", never every "punto y seguido"/sentence end). Runs
+# AFTER takes+order over the kept sentences (pipeline/paragraphs.py) and
+# only ever forces an extra segment BOUNDARY in the EDL (a junction) at a
+# high-confidence break -- content, order, and timestamps are unchanged;
+# the transition itself stays "none" (a suggestion, not an auto-applied
+# effect). See pipeline/paragraphs.py and ordering.build_edl's
+# `paragraph_break_after` parameter.
+PARAGRAPH_BREAK_ENABLED = True
+PARAGRAPH_BREAK_WINDOW_SIZE = 12  # sentences per window sent to the agent (like take_sequencer)
+PARAGRAPH_BREAK_WINDOW_OVERLAP = 3  # sentence overlap between consecutive windows
+# Confidence gate ("suggest, don't delete" -- but here the "suggestion" IS
+# the applied junction, since it's non-destructive): only breaks reported
+# at or above this confidence actually force a segment boundary in the EDL.
+PARAGRAPH_BREAK_MIN_CONFIDENCE = 4
+
 # Video topic summary (v4)
 TOPIC_INPUT_CHARS = 3000  # truncate full transcript to ~this many chars for video_topic
 

@@ -23,6 +23,7 @@ from .prompts import (
     CONTEXT_CHECK_SYSTEM_PROMPT,
     COPYWRITER_SYSTEM_PROMPT,
     DEDUP_JUDGE_SYSTEM_PROMPT,
+    PARAGRAPH_BREAK_SYSTEM_PROMPT,
     REEL_COMPOSER_SYSTEM_PROMPT,
     REEL_DEDUP_SYSTEM_PROMPT,
     REEL_SCORER_SYSTEM_PROMPT,
@@ -38,6 +39,7 @@ from .schemas import (
     ContextCheck,
     CopywriterOutput,
     DedupJudge,
+    ParagraphBreaks,
     ReelComposer,
     ReelDedup,
     ReelScore,
@@ -83,6 +85,7 @@ _PROMPTED_OUTPUT_TASKS: set[str] = set()
 AGENT_SPECS: dict[str, dict] = {
     "take_judge": {"prompt": TAKE_JUDGE_SYSTEM_PROMPT, "output_type": TakePick},
     "clip_order": {"prompt": CLIP_ORDER_SYSTEM_PROMPT, "output_type": ClipOrder},
+    "paragraph_break": {"prompt": PARAGRAPH_BREAK_SYSTEM_PROMPT, "output_type": ParagraphBreaks},
     "reel_scorer": {"prompt": REEL_SCORER_SYSTEM_PROMPT, "output_type": ReelScore},
     "reel_composer": {"prompt": REEL_COMPOSER_SYSTEM_PROMPT, "output_type": ReelComposer},
     "reel_dedup": {"prompt": REEL_DEDUP_SYSTEM_PROMPT, "output_type": ReelDedup},

@@ -72,7 +72,7 @@ def invalidate_after_clipset_change(project: dict) -> None:
         project["clip_order"] = filtered
     project["edl"] = None
     stages = project.get("stages", {})
-    for stage in ("order", "render", "reels"):
+    for stage in ("order", "paragraphs", "render", "reels"):
         if stages.get(stage, {}).get("status") == "done":
             del stages[stage]
 
@@ -136,10 +136,29 @@ def run(log, project: dict) -> None:
     store.save(project)
 
 
-def build_edl(project: dict) -> list[dict]:
+def build_edl(project: dict, paragraph_break_after: set[str] | None = None) -> list[dict]:
     """Ordered render plan: kept sentences grouped into contiguous segments
-    (per clip, merging small gaps), following clip_order."""
+    (per clip, merging small gaps), following clip_order.
+
+    `paragraph_break_after` (owner feature, 2026-07-25): a set of sentence
+    ids after which a NON-DESTRUCTIVE paragraph/topic-change boundary must be
+    kept -- pipeline/paragraphs.py's detection pass. When a would-be-merged
+    sentence's PREVIOUS sentence id is in this set, the merge is suppressed
+    (a segment boundary is forced there instead) even though the gap is
+    small enough to normally merge; content, order, and timestamps are
+    otherwise identical to a run with no breaks -- this only ever SPLITS,
+    never re-merges or re-orders anything. Defaults to reading
+    project["paragraph_break_after_ids"] so every existing caller (api/edl.py,
+    pipeline/render.py) automatically picks up whatever paragraphs.run last
+    computed without having to pass anything explicitly; pass an explicit set
+    (e.g. in tests) to bypass the project entirely. The resulting segment
+    that starts right after such a boundary is tagged `paragraph_break: True`
+    -- a hint for the UI/render, never auto-applied (the segment's own
+    `transition` stays whatever it already was / defaults to "none")."""
     from .. import config
+
+    if paragraph_break_after is None:
+        paragraph_break_after = set(project.get("paragraph_break_after_ids") or [])
 
     order = reconcile_clip_order(project)
     segments = []
@@ -149,10 +168,16 @@ def build_edl(project: dict) -> list[dict]:
             key=lambda s: s["start"],
         )
         cur = None
+        cur_last_id = None
         for s in sents:
-            if cur and s["start"] - cur["end"] <= config.MERGE_GAP:
+            if (
+                cur
+                and s["start"] - cur["end"] <= config.MERGE_GAP
+                and cur_last_id not in paragraph_break_after
+            ):
                 cur["end"] = s["end"]
                 cur["text"] += " " + s["text"]
+                cur_last_id = s["id"]
             else:
                 if cur:
                     segments.append(cur)
@@ -161,7 +186,10 @@ def build_edl(project: dict) -> list[dict]:
                     "start": s["start"],
                     "end": s["end"],
                     "text": s["text"],
+                    "paragraph_break": cur_last_id is not None
+                    and cur_last_id in paragraph_break_after,
                 }
+                cur_last_id = s["id"]
         if cur:
             segments.append(cur)
 

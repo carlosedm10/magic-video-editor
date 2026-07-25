@@ -183,6 +183,18 @@ def project_update(pid: str, body: ProjectUpdate):
     return project
 
 
+@router.post("/projects/{pid}/duplicate")
+def project_duplicate(pid: str):
+    """Duplicate a project: new id + dir, whole-dir copy (see
+    store.duplicate_project for exactly what's copied vs reset). Returns the
+    new project so the UI can list/select/open it without a second round
+    trip."""
+    try:
+        return store.duplicate_project(pid)
+    except FileNotFoundError:
+        raise HTTPException(404) from None
+
+
 @router.delete("/projects/{pid}")
 def project_delete(pid: str):
     """Deleting a project whose queue has a RUNNING item used to be able to

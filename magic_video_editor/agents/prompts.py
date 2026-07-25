@@ -249,6 +249,110 @@ quite sure express the same content. Use confidence 2-3 when the overlap is
 plausible but not certain.
 """
 
+PARAGRAPH_BREAK_SYSTEM_PROMPT = """
+You look for genuine PARAGRAPH / TOPIC changes ("punto y aparte") in a
+NUMBERED list of consecutive sentences from ONE clip, already in spoken
+order, that all SURVIVED editing (bloopers/retakes already removed -- treat
+this as clean, intentional content). Recordings are in Spanish or English
+(or mixed).
+
+Your ONLY job is to flag the boundaries where the speaker moves on to a
+genuinely NEW subject, sub-topic, or section of the talk -- the kind of
+place a human editor would drop a transition, a title card, or a short
+intro sting. This is "punto y aparte" (new paragraph): the previous idea is
+DONE and something meaningfully different starts.
+
+This is NEVER "punto y seguido" (a plain sentence end within the SAME idea).
+Do NOT flag:
+- Every full stop / sentence boundary -- most of them are just the normal
+  rhythm of speech within one ongoing idea.
+- A sentence that elaborates, gives an example of, or continues the same
+  point (even with a connector like "however"/"but"/"and also"/"por otro
+  lado dentro del mismo tema").
+- A short pause, breath, or filler -- these are not topic signals.
+- The boundary between an intro/greeting and the FIRST real topic UNLESS it
+  is a genuinely distinct section (a channel intro before the actual content
+  starts usually IS a real paragraph break -- judge case by case).
+
+DO flag a boundary when:
+- The speaker explicitly signals a shift: "bueno, pasemos a...", "ahora
+  hablemos de...", "por otro lado...", "cambiando de tema...", "moving on
+  to...", "next, let's talk about...", "the other thing I wanted to
+  mention is...".
+- The subject matter itself clearly changes even without an explicit marker
+  (e.g. finishes explaining exercise A, starts explaining an unrelated
+  exercise B; finishes a personal anecdote, starts a product review).
+- A new distinct section begins (e.g. intro -> main content, or one
+  numbered tip -> the next numbered tip on a different sub-topic).
+
+Return `breaks`: a list of at most 6 objects `{after_id, confidence, reason}`,
+where `after_id` is the local sentence number the break falls AFTER (between
+that sentence and the next one). Only report a boundary that is fully
+INTERIOR to the given list (never the very last sentence's number, since
+there is nothing after it in this window to break from). Never invent a
+sentence number you were not given. Return an EMPTY list when nothing in
+this window is a genuine topic change -- staying silent is the correct,
+common answer; most windows will have zero or one break, rarely more.
+
+`confidence` (1-5): use 4-5 only when the topic shift is unambiguous (an
+explicit marker phrase, or a clearly unrelated subject); use 2-3 when a
+shift is plausible but you're not fully sure. A human/threshold reviews
+confidence before anything is actually applied, so it is fine to report a
+borderline case at low confidence rather than silently drop it -- but NEVER
+report a boundary you don't believe is a real paragraph change just to fill
+the list.
+
+BE CONSERVATIVE. When in doubt, do NOT mark a break. A missed transition
+opportunity costs nothing; a false paragraph break chopped into the middle
+of one continuous idea is a real mistake for the editor to clean up later.
+
+WORKED EXAMPLES:
+
+Example 1 -- genuine topic change, explicit marker (Spanish):
+Input:
+1: "Lo primero que tenéis que hacer es calentar bien antes de entrenar piernas."
+2: "Un buen calentamiento incluye movilidad articular y algo de cardio suave."
+3: "Ahora, cambiando de tema, quiero hablaros de la alimentación post-entreno."
+4: "Después de entrenar es clave comer proteína en la siguiente hora."
+Expected: breaks=[{after_id: 2, confidence: 5, reason: "pasa de calentamiento a
+alimentación post-entreno, con marcador explícito"}]
+(sentences 1-2 are one idea -- warm-up; sentence 3 explicitly signals a new
+subject -- post-workout nutrition -- so the break falls after #2, before #3;
+sentences 3-4 continue that new idea together, so there is NO break between
+3 and 4.)
+
+Example 2 -- plain sentence ends within the SAME idea, no break at all:
+Input:
+1: "El primer paso para bajar de peso es controlar las calorías que comes."
+2: "No hace falta contarlas al gramo, pero sí tener una idea aproximada."
+3: "Con el tiempo aprendes a estimarlo solo con mirar el plato."
+Expected: breaks=[]
+(all three sentences elaborate the SAME point about counting calories --
+none of these are a paragraph change, just normal sentence rhythm within
+one idea.)
+
+Example 3 -- implicit topic change, no explicit marker phrase (English):
+Input:
+1: "That wraps up how I set up my lighting for these videos."
+2: "It took me a while to get the white balance right, but it's stable now."
+3: "My camera bag is actually something people ask about a lot."
+4: "I switched to a sling bag last year and it's been so much easier to carry."
+Expected: breaks=[{after_id: 2, confidence: 4, reason: "moves from lighting
+setup to an unrelated topic, the camera bag"}]
+(1-2 are the same idea -- lighting; 3 starts a clearly different, unrelated
+subject -- the camera bag -- even without an explicit "moving on" phrase.)
+
+Example 4 -- borderline continuation, still the same idea, no break:
+Input:
+1: "So that's the basic squat form you want to aim for."
+2: "A common mistake is letting the knees cave inward on the way up."
+3: "Another one is not going deep enough to actually engage the glutes."
+Expected: breaks=[]
+(sentences 2-3 are both still about squat FORM MISTAKES, directly continuing
+sentence 1's subject -- listing related mistakes is elaboration, not a new
+paragraph.)
+"""
+
 CLIP_ORDER_SYSTEM_PROMPT = """
 You are a video editor. Given transcripts of separately recorded clips, decide
 the order in which they should be assembled so the speech flows as one coherent

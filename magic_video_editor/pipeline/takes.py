@@ -739,6 +739,11 @@ def run(log, project: dict) -> None:
 
     project["sentences"] = sentences
     project["edl"] = None  # re-analyzed takes invalidate any previously computed EDL
+    # Sentence ids are regenerated every run (uuid4 in _sentences_from_clip) --
+    # any previously-recorded paragraph-break ids can no longer match anything,
+    # so drop them rather than leave dangling ids sitting in the project. The
+    # "paragraphs" stage naturally needs a re-run after this anyway.
+    project["paragraph_break_after_ids"] = []
     kept = sum(1 for s in sentences if s["kept"])
     store.save(project)
     log(f"Kept {kept}/{len(sentences)} sentences.")

@@ -1313,3 +1313,65 @@ collapsed to one; two reels from different source windows sharing only a topic a
 NOT flagged and both survive; the returned count is the number of distinct reels,
 never padded to the ceiling; the structural pre-filter keys on source-window
 overlap/text similarity, not topic keywords.
+
+# vNext — Paragraph-break suggestions (owner feature, 2026-07-25): NON-DESTRUCTIVE
+cuts at "punto y aparte"
+
+Besides removing bloopers, the pipeline now marks (never removes) the spots where
+the conversation changes topic/paragraph — a genuine "punto y aparte" (new
+paragraph), never every "punto y seguido" (plain sentence end within the same
+idea). These are the places an editor would naturally drop a transition, an
+intro, or an effect.
+
+**Detection.** New `paragraph_break` agent (`agents/agents.py`, prompt in
+`agents/prompts.py`, schema `ParagraphBreaks`/`ParagraphBreakPoint` in
+`agents/schemas.py`, flat and small-model friendly): given a numbered window of
+consecutive KEPT sentences from one clip, in order, it returns `breaks` — boundary
+points (`after_id`, `confidence` 1-5, `reason`) where a clear new topic begins.
+The prompt hammers conservatism (worked examples of both a real topic shift and a
+plain same-idea sentence continuation) — when in doubt, it returns nothing.
+
+**Pass** (`pipeline/paragraphs.py`, new stage `"paragraphs"` in
+`api/pipeline.py::STAGES`, inserted between `"order"` and `"review"`): slides a
+`config.PARAGRAPH_BREAK_WINDOW_SIZE`/`_OVERLAP` window (same shape as
+`take_sequencer`) over each clip's kept sentences, keeps only boundaries strictly
+interior to a window (never the last sentence — the overlap lets a later window
+judge it as interior instead) and at or above
+`config.PARAGRAPH_BREAK_MIN_CONFIDENCE`, and stores the resulting sentence ids as
+`project["paragraph_break_after_ids"]`. Gated by `config.PARAGRAPH_BREAK_ENABLED`
+and fails open (ollama down / disabled → empty list, today's EDL unchanged).
+
+**Non-destructive application** (`pipeline/ordering.py::build_edl`, new
+`paragraph_break_after` parameter defaulting to reading
+`project["paragraph_break_after_ids"]` — every existing caller, `api/edl.py` and
+`pipeline/render.py`, picks it up automatically): when the sentence right before a
+would-be merge is a recorded break, the merge is suppressed and a segment boundary
+is forced there instead. Content, order, and timestamps are otherwise identical —
+this only ever SPLITS an already-merged segment, never re-merges or reorders
+anything, so the intra-clip chronological invariant
+(`scripts/test_intra_clip_order.py`) still holds. The segment right after the
+break is tagged `paragraph_break: true` (round-tripped through
+`api/edl.py::EdlSegment`, cleared on a manual mid-clip split since that's a
+different, user-driven cut); its `transition` is untouched (still `"none"` by
+default) — a suggestion, never auto-applied.
+
+**Frontend** (`ui/editor/timeline.js`): the junction chip at a paragraph-break
+segment gets a subtle dashed accent ring (`.tl-chip-parabreak`, `--accent2`, no
+fill unless a real transition is also set) and a `¶ cambio de párrafo — buen punto
+para transición` hint appended to its tooltip. Purely additive — the existing
+click-to-open-FX-browser / drag-a-transition-here behavior on that same chip is
+unchanged.
+
+New config (`config.py`): `PARAGRAPH_BREAK_ENABLED` (True),
+`PARAGRAPH_BREAK_WINDOW_SIZE` (12), `PARAGRAPH_BREAK_WINDOW_OVERLAP` (3),
+`PARAGRAPH_BREAK_MIN_CONFIDENCE` (4).
+
+Covered by `scripts/test_paragraph_cuts.py` (mocked `paragraph_break` agent,
+scratch `MVE_DATA`): a flagged break forces an extra segment boundary with no
+sentence text lost (space-joined text across the split matches the unsplit
+baseline byte-for-byte) and tags the right segment; no break leaves the EDL
+byte-identical to today's; a flagged break never auto-applies a transition
+(`EdlSegment.transition.type` stays `"none"`); intra-clip chronology survives the
+split; a below-threshold flag and the `PARAGRAPH_BREAK_ENABLED=False` toggle both
+skip detection entirely. Also re-verified `scripts/test_intra_clip_order.py`
+still passes unmodified.

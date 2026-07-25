@@ -87,7 +87,7 @@
   font-size: 11px; padding: 4px 8px; border-radius: 999px;
   background: var(--panel2); border: 1px solid var(--border); color: var(--text);
 }
-.home-delete { flex-shrink: 0; }
+.home-duplicate, .home-delete { flex-shrink: 0; }
 
 /* ---- new-project card ---- */
 

@@ -164,6 +164,13 @@ const Timeline = {
          off the left edge of the scroll area, clipping a named label. Keep
          it vertically centered but left-anchored instead. */
       .tl-chip.tl-chip-named.tl-chip-first { transform: translateY(-50%); left: 2px !important; }
+      /* Paragraph-break suggestion (owner feature, 2026-07-25): a subtle
+         dashed accent ring on the junction chip where takes/order detected a
+         genuine topic change -- a hint, not a transition, so it stays quiet
+         (no fill/color change) unless the chip is ALSO carrying a real named
+         transition, in which case just the ring survives underneath it. */
+      .tl-chip.tl-chip-parabreak { box-shadow: 0 0 0 2px var(--accent2); }
+      .tl-chip.tl-chip-parabreak:not(.tl-chip-named) { border: 1px dashed var(--accent2); background: transparent; }
       .tl-history-pop { position: absolute; bottom: 100%; right: 0; margin-bottom: 6px; width: 260px;
         max-height: 320px; overflow-y: auto; background: var(--panel); border: 1px solid var(--border);
         border-radius: 12px; padding: 8px; backdrop-filter: blur(16px); box-shadow: 0 8px 24px rgba(0,0,0,.4);
@@ -1070,6 +1077,14 @@ const Timeline = {
       // the exact wipe/circle/pixelize/etc. shape is baked on export only
       // (spec v7.5 §7.5). Surface that as a subtle "≈" cue on the chip.
       const isApproxOnly = trType !== "none" && trType !== "fade" && trType !== "crossfade";
+      // Paragraph-break suggestion (owner feature, 2026-07-25): pipeline/
+      // paragraphs.py + ordering.build_edl tag the segment right after a
+      // detected topic/paragraph change with paragraph_break=true. Purely
+      // additive/non-intrusive — reuses this same junction chip, never
+      // overrides an actual transition the user already picked, and never
+      // auto-applies one (transition.type stays whatever it already was,
+      // "none" by default).
+      const isParaBreak = !!s.paragraph_break;
 
       const thumbs = this._getThumbEntry(s.clip_id);
       let filmHtml = "";
@@ -1084,10 +1099,18 @@ const Timeline = {
         ? `<canvas class="tl-wave" data-wave="${i}" width="${Math.max(1, Math.round(widthPx))}" height="16"></canvas>`
         : "";
 
-      html += `<div class="tl-chip ${trType}${trLabel ? " tl-chip-named" : ""}${i === 0 ? " tl-chip-first" : ""}" data-chip="${i}"
+      const chipTitleParts = [trLabel ? esc(trLabel) : "No transition"];
+      if (isApproxOnly) chipTitleParts.push("preview shows a dissolve; exact effect renders on export");
+      if (isParaBreak) chipTitleParts.push("¶ cambio de párrafo — buen punto para transición");
+      chipTitleParts.push("click to edit, or drag a transition here");
+      const chipText = trLabel
+        ? esc(trLabel) + (isApproxOnly ? " ≈" : "")
+        : (isParaBreak ? "¶" : "·");
+
+      html += `<div class="tl-chip ${trType}${trLabel ? " tl-chip-named" : ""}${i === 0 ? " tl-chip-first" : ""}${isParaBreak ? " tl-chip-parabreak" : ""}" data-chip="${i}"
         style="left:${leftPx.toFixed(1)}px"
-        title="${trLabel ? esc(trLabel) : "No transition"}${isApproxOnly ? " — preview shows a dissolve; exact effect renders on export" : ""} — click to edit, or drag a transition here"
-        >${trLabel ? esc(trLabel) + (isApproxOnly ? " ≈" : "") : "·"}</div>
+        title="${chipTitleParts.join(" — ")}"
+        >${chipText}</div>
       <div class="tl-block" data-idx="${i}" style="left:${leftPx.toFixed(1)}px;width:${widthPx.toFixed(1)}px">
         ${filmHtml}
         <div class="tl-edge tl-edge-l" data-idx="${i}" data-edge="start"></div>

@@ -57,6 +57,13 @@ class EdlSegment(BaseModel):
     end: float
     text: str | None = ""
     transition: Transition = Field(default_factory=Transition)
+    # Owner feature (2026-07-25): set by pipeline/paragraphs.py + ordering.
+    # build_edl when this segment starts right after a detected paragraph/
+    # topic-change boundary -- a SUGGESTED transition spot for the UI, never
+    # auto-applied (transition.type is untouched, still "none" by default).
+    # Round-tripped here so a manual edl PUT/split doesn't silently drop the
+    # tag off segments the user didn't touch.
+    paragraph_break: bool = False
 
 
 class EdlUpdate(BaseModel):
@@ -143,14 +150,16 @@ def edl_split(pid: str, body: EdlSplit):
             400, f"split point {body.at} must be strictly inside {seg['start']}-{seg['end']}"
         )
     text = seg.get("text", "") or ""
-    # The transition INTO seg belongs to the first half (same junction before
-    # it); the new mid-clip cut has no transition of its own.
+    # The transition INTO seg (and its paragraph_break tag, if any) belongs to
+    # the first half (same junction before it); the new mid-clip cut is a
+    # manual split, not a detected paragraph boundary, so it gets neither.
     first = {**seg, "end": body.at}
     second = {
         **seg,
         "start": body.at,
         "text": text,
         "transition": {"type": "none", "duration": 0.5},
+        "paragraph_break": False,
     }
     segments = segments[: body.index] + [first, second] + segments[body.index + 1 :]
     project["edl"] = segments

@@ -4,6 +4,8 @@
 
 import json
 import logging
+import os
+import shutil
 import threading
 import time
 import uuid
@@ -208,6 +210,81 @@ def delete_project(project_id: str) -> None:
 
 def project_dir(project_id: str) -> Path:
     return _pdir(project_id)
+
+
+def _next_copy_name(base_name: str, existing_names: set) -> str:
+    """"<base_name> (copy)" if free, else "<base_name> (copy 2)", "(copy 3)", ..."""
+    candidate = f"{base_name} (copy)"
+    if candidate not in existing_names:
+        return candidate
+    n = 2
+    while True:
+        candidate = f"{base_name} (copy {n})"
+        if candidate not in existing_names:
+            return candidate
+        n += 1
+
+
+def _hardlink_or_copy(src: str, dst: str) -> None:
+    """copytree copy_function: hardlink when possible (cheap, same-volume --
+    project dirs always are), falling back to a real copy (e.g. across
+    filesystems, or if the source is itself a symlink target on a volume
+    that doesn't support hardlinks)."""
+    try:
+        os.link(src, dst)
+    except OSError:
+        shutil.copy2(src, dst)
+
+
+def duplicate_project(project_id: str) -> dict:
+    """Deep-copy project `project_id` into a brand-new project: a fresh id,
+    a whole-directory copy of everything under the source project's dir
+    (project.json plus media/ clips, proxies, wavs, thumbs, previews,
+    renders, reels, audio_assets -- whatever the project references inside
+    its own dir, copied wholesale rather than hand-enumerated), a
+    "<name> (copy)"-style name (bumping to "(copy 2)", "(copy 3)", ... if
+    taken), and every absolute path baked into the COPIED project.json that
+    pointed at the old project dir rewritten to the new one.
+
+    Keeps all edit content (edl/sentences/clips/reels/color/subtitles/
+    audio_track/stage badges) as-is; resets per-run transient state that
+    must never carry over -- project["queue"] (and therefore any in-flight
+    job_id, which only ever lives inside a queue item, see queue.py) comes
+    back empty on the copy.
+
+    Mirrors config.rewrite_project_json_paths' text-level prefix-replace
+    approach but scoped to just the ONE new project.json, not reused
+    directly: that helper walks every projects/*/project.json under a given
+    root and rewrites any file containing `old_prefix` -- since the
+    ORIGINAL project's own project.json also contains its own dir as a
+    prefix, calling it project-dir-wide here would rewrite the SOURCE
+    project's paths too (self, not just the copy), corrupting the original.
+
+    Raises ProjectNotFound (via load()) if `project_id` has no project.json.
+    """
+    source = load(project_id)  # 404s (as ProjectNotFound) if missing
+    src_dir = _pdir(project_id)
+
+    new_id = uuid.uuid4().hex[:12]
+    dst_dir = _pdir(new_id)
+
+    shutil.copytree(src_dir, dst_dir, copy_function=_hardlink_or_copy)
+
+    new_project = json.loads((dst_dir / "project.json").read_text())
+
+    old_prefix = str(src_dir)
+    new_prefix = str(dst_dir)
+    text = json.dumps(new_project)
+    if old_prefix in text:
+        new_project = json.loads(text.replace(old_prefix, new_prefix))
+
+    existing_names = {p["name"] for p in list_projects()}
+    new_project["id"] = new_id
+    new_project["name"] = _next_copy_name(source["name"], existing_names)
+    new_project["queue"] = []
+
+    save(new_project, preserve_queue=False)
+    return new_project
 
 
 def mark_stage(project: dict, stage: str, status: str, detail: str = "") -> None:

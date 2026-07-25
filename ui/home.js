@@ -142,6 +142,7 @@
             <option value="uploaded" ${status === "uploaded" ? "selected" : ""}>Uploaded</option>
           </select>
           <span class="grow"></span>
+          <button class="icon-btn home-duplicate" data-pid="${p.id}" title="Duplicate project">${icon("copy", 15)}</button>
           <button class="icon-btn danger home-delete" data-pid="${p.id}" title="Delete project">${icon("trash-2", 15)}</button>
         </div>
       </div>
@@ -230,6 +231,10 @@
     root.querySelectorAll(".home-delete").forEach((el) => {
       el.onclick = (e) => { e.stopPropagation(); onDelete(el.dataset.pid); };
     });
+
+    root.querySelectorAll(".home-duplicate").forEach((el) => {
+      el.onclick = (e) => { e.stopPropagation(); onDuplicate(el.dataset.pid); };
+    });
   }
 
   async function commitRename(pid, value) {
@@ -272,6 +277,15 @@
       await api(`/projects/${pid}`, { method: "DELETE" });
       projects = projects.filter((p) => p.id !== pid);
       render();
+    } catch (e) {
+      showToast(e.message);
+    }
+  }
+
+  async function onDuplicate(pid) {
+    try {
+      await api(`/projects/${pid}/duplicate`, { method: "POST" });
+      await refresh();
     } catch (e) {
       showToast(e.message);
     }
