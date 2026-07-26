@@ -122,10 +122,59 @@ async function _reelsCopyToClipboard(text) {
   }
 }
 
+/* Explicit "Generate shorts" trigger (owner's mental model: shorts are a
+   SEPARATE step run AFTER the main edit is finished, using that final cut as
+   the base -- never auto-generated on project open or as part of run-all,
+   see magic_video_editor/api/pipeline.py's STAGE_ORDER comment). Reuses the
+   existing generic runStage() helper (ui/core.js) which POSTs
+   {"kind":"stage:reels"} to the queue -- exactly what a per-stage re-run
+   button already does elsewhere -- so this needs no new endpoint. Progress
+   while it runs is read off state.queue via the pollQueue() hook added in
+   ui/core.js (`if (state.tab === "reels") window.TABS.reels()`), since this
+   tab has no rendered file/job to watchJob() against until the item starts. */
+function _reelsRunningQueueItem() {
+  return state.queue.find((i) => i.kind === "stage:reels" && (i.status === "running" || i.status === "pending"));
+}
+
+function _renderReelsEmptyState() {
+  const running = _reelsRunningQueueItem();
+  if (running) {
+    const pct = Math.round((running.progress || 0) * 100);
+    $("#tab-reels").innerHTML = `
+      <div class="empty"><div class="empty-inner" style="text-align:center">
+        <div class="dim" style="margin-bottom:10px">Generando shorts a partir del vídeo final…</div>
+        <div class="run-all-bar" style="max-width:280px;margin:0 auto">
+          <div class="run-all-fill running" style="width:${pct}%"></div>
+        </div>
+        <div class="dim" style="margin-top:6px;font-size:12px">${pct}%</div>
+      </div></div>`;
+    return;
+  }
+  const errored = state.queue.find((i) => i.kind === "stage:reels" && i.status === "error");
+  $("#tab-reels").innerHTML = `
+    <div class="empty"><div class="empty-inner" style="text-align:center">
+      <div class="dim" style="margin-bottom:14px">Todavía no hay shorts. Termina de editar el vídeo final y genera los shorts a partir de ese corte.</div>
+      ${errored ? `<div class="dim" style="margin-bottom:10px;color:var(--accent-hover)">Falló la última generación${errored.error ? `: ${esc(errored.error)}` : ""}</div>` : ""}
+      <button class="btn primary" id="reels-generate-btn"><i data-lucide="sparkles"></i> Generar shorts a partir del vídeo final</button>
+    </div></div>`;
+  const btn = document.getElementById("reels-generate-btn");
+  if (btn) btn.onclick = async () => {
+    btn.disabled = true;
+    try {
+      await runStage("reels");
+      renderReels();
+    } catch (e) {
+      showToast(e.message);
+      btn.disabled = false;
+    }
+  };
+  refreshIcons();
+}
+
 function renderReels() {
   const p = state.project;
   if (!p.reels?.length) {
-    $("#tab-reels").innerHTML = '<div class="dim">Run the Reels stage to get ~20 scored suggestions.</div>';
+    _renderReelsEmptyState();
     return;
   }
   $("#tab-reels").innerHTML = `<div class="reel-grid">` + p.reels.map((r) => {

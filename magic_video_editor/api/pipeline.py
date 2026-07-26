@@ -29,7 +29,17 @@ STAGES = {
     "render": render.run,
     "reels": reels.suggest,
 }
-STAGE_ORDER = list(STAGES.keys())
+
+# Shorts (spec vNext "shorts are a separate, explicit step"): the reels stage
+# is no longer part of run-all -- the main cut (render) is the last run-all
+# step, and "reels" is only ever run standalone via POST
+# /projects/{pid}/run/reels (or the generic .../queue {"kind":"stage:reels"}
+# endpoint), typically triggered by the Reels tab's "Generar shorts a partir
+# del vídeo final" button once the user is happy with the final cut. STAGES
+# above still lists "reels" (run_stage()'s validation and _run_stage_kind
+# both key off STAGES, not STAGE_ORDER) -- only run-all's own STAGE_ORDER
+# excludes it.
+STAGE_ORDER = [s for s in STAGES if s != "reels"]
 
 # Friendly labels for the run-all progress panel (spec: Pipeline orchestration UX).
 STAGE_LABELS = {
@@ -131,9 +141,11 @@ class _StageLogProxy:
 
 
 def _run_all_kind(log, project: dict, payload: dict) -> None:
-    """Runner for queue kind "run-all": every stage in order. A failure in
-    the final (reels) stage is reported but does not fail the item — any
-    earlier failure stops the run and errors it, same as a single stage."""
+    """Runner for queue kind "run-all": every stage in STAGE_ORDER, which ends
+    at "render" (the finished main cut) -- "reels"/shorts generation is a
+    separate, explicit, standalone step (see STAGE_ORDER's comment above) and
+    is never run as part of this. Any stage failure stops the run and errors
+    it."""
     total = len(STAGE_ORDER)
     for name in STAGE_ORDER:
         log.stage(name, status="pending", progress=0.0)
@@ -156,11 +168,6 @@ def _run_all_kind(log, project: dict, payload: dict) -> None:
             store.mark_stage(project, stage, "error", str(e)[:300])
             log.stage(stage, status="error", progress=1.0)
             log(f"{stage} failed: {e}")
-            if stage == "reels":
-                # Last stage, non-critical: finish the run-all item as
-                # successful even though reels errored.
-                log.progress(1.0)
-                return
             raise
 
 

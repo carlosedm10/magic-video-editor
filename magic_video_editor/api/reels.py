@@ -26,9 +26,13 @@ router = APIRouter(prefix="/api", tags=["reels"])
 
 
 class SubtitleStyleOverride(BaseModel):
-    """Partial override of project["subtitles"] scoped to one reel — every
-    field optional; unset fields fall back to the project's own subtitles
-    config (merged in magic_video_editor.pipeline.reels._effective_subtitle_cfg)."""
+    """A reel's own subtitle STYLE config — every field optional; unset
+    fields fall back to subtitles.DEFAULTS (magic_video_editor.pipeline.reels.
+    _effective_subtitle_cfg), NOT to project["subtitles"] (spec vNext "shorts
+    don't inherit the main subtitles" — decoupled on purpose, since social
+    format/sizing differs from the main landscape edit). Whether a reel burns
+    subtitles at all is the separate `subtitles_enabled` field on ReelPatch
+    below, default False."""
 
     style: Literal["clean", "bold", "karaoke"] | None = None
     font: str | None = None
@@ -78,6 +82,11 @@ class ReelPatch(BaseModel):
     out_override: float | None = None
     cue_overrides: dict[str, str] | None = None
     subtitle_style: SubtitleStyleOverride | None = None
+    # Subtitle decoupling (spec vNext): explicit per-reel on/off switch,
+    # independent of project["subtitles"]["enabled"] — see reels.py's
+    # _compose_reel. Omitted -> reel keeps whatever it already has (default
+    # False, from suggest()/ensure_segments).
+    subtitles_enabled: bool | None = None
     title: str | None = None
     description: str | None = None
     # Multi-segment reels (spec v5.8b) — see magic_video_editor/pipeline/reels.py's
@@ -247,6 +256,9 @@ def reel_patch(pid: str, rid: str, body: ReelPatch):
         }
         merged_style.update(incoming_style)
         reel["subtitle_style"] = merged_style
+
+    if "subtitles_enabled" in fields and fields["subtitles_enabled"] is not None:
+        reel["subtitles_enabled"] = bool(fields["subtitles_enabled"])
 
     if "title" in fields and fields["title"] is not None:
         reel["title"] = str(fields["title"])[:80]

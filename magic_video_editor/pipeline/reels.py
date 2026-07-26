@@ -88,6 +88,22 @@ pool sorted and truncated to config.REEL_SUGGESTIONS, so `project["reels"]`
 may end up with far fewer than the ceiling when that's all the distinct
 content supports.
 
+Final-cut sourcing + subtitle decoupling (spec vNext "shorts are a separate
+step, based on the final video"): the owner's mental model is edit-the-main-
+video-to-completion FIRST, then generate shorts as an explicit second step
+FROM that finished cut -- reflected in two ways here. (1) `_candidate_windows`
+constrains its sliding windows to project["edl"]'s kept ranges (via
+`_edl_ranges_by_clip`/`_edl_range_index`) when an EDL exists, so a reel can
+never include a moment the user trimmed out of the main video, even if that
+moment's sentences are still marked `kept`; falls back to sentence-level
+`kept` alone (pre-existing behavior) only when there's no EDL yet. (2) a
+reel's subtitles are fully independent of project["subtitles"] --
+`_effective_subtitle_cfg` no longer merges reel["subtitle_style"] over the
+project's config, and `_compose_reel`/`render_reel` only burn subtitles when
+reel["subtitles_enabled"] (new field, default False -- see `ensure_segments`)
+is explicitly True, since the main video's subtitle sizing/style is built for
+landscape and must never silently carry into a 9:16 short.
+
 Preview render (spec v7.14 "Reel preview render"): the drawer used to have
 nothing decodable to point a <video> at for a suggestion (no rendered file)
 and the full render is too expensive to run eagerly for all ~20 candidates.
@@ -155,9 +171,60 @@ PREVIEW_CRF = 30
 PREVIEW_PRESET = "ultrafast"
 
 
+def _edl_ranges_by_clip(project: dict) -> dict[str, list[tuple[float, float]]] | None:
+    """{clip_id: [(start, end), ...]} of the FINAL cut's kept ranges, sourced
+    from project["edl"] (pipeline/ordering.py's build_edl output, persisted by
+    the render stage -- reflects the user's manual trims/splits on top of
+    whatever take-selection produced it, i.e. the actual approved cut, not
+    just the sentence-level `kept` flags). Returns None when the project has
+    no EDL yet at all (project.get("edl") is None) so callers can fall back
+    to sentence-level `kept` alone; returns (possibly empty) per-clip range
+    lists otherwise -- an EDL that exists but omits a clip/range means that
+    content was cut and must never be considered."""
+    edl = project.get("edl")
+    if edl is None:
+        return None
+    ranges: dict[str, list[tuple[float, float]]] = {}
+    for seg in edl:
+        ranges.setdefault(seg["clip_id"], []).append((seg["start"], seg["end"]))
+    for cid in ranges:
+        ranges[cid].sort()
+    return ranges
+
+
+# Tolerance for treating a sentence as "inside" an EDL range: build_edl pads
+# every segment by config.SEGMENT_PAD (plus pacing's head/tail pad on the
+# very first/last segment) beyond the sentences it was built from, so a
+# sentence that produced the segment always fits comfortably within it; this
+# only guards against float rounding, not a meaningful amount of drift.
+_EDL_CONTAINMENT_TOLERANCE = 0.1
+
+
+def _edl_range_index(ranges: list[tuple[float, float]], start: float, end: float) -> int | None:
+    """Index of the EDL range in `ranges` that fully contains [start, end],
+    or None if the sentence falls outside every kept range (i.e. it's part of
+    footage the user cut out of the final video) -- see _edl_ranges_by_clip."""
+    for i, (rs, re_) in enumerate(ranges):
+        if start >= rs - _EDL_CONTAINMENT_TOLERANCE and end <= re_ + _EDL_CONTAINMENT_TOLERANCE:
+            return i
+    return None
+
+
 def _candidate_windows(project: dict) -> list[dict]:
-    """Sliding windows of consecutive kept sentences within one clip,
-    bounded to REEL_MIN_S..REEL_MAX_S."""
+    """Sliding windows of consecutive kept sentences within one clip, bounded
+    to REEL_MIN_S..REEL_MAX_S.
+
+    Shorts source from the FINAL APPROVED CUT (owner's mental model: edit the
+    main video first, THEN generate shorts from that finished result), never
+    from raw footage the user trimmed out. When project["edl"] exists, a
+    sentence only enters the sliding window if it falls fully inside one of
+    the EDL's own kept ranges for that clip (see _edl_ranges_by_clip); the
+    window is additionally never allowed to bridge across a boundary between
+    two DIFFERENT kept ranges on the same clip, even if the ranges happen to
+    sit close together in time, since the gap between them is exactly content
+    the user cut. Falls back to sentence-level `kept` alone (the old
+    behavior, no EDL-boundary awareness) only when there's no EDL yet."""
+    edl_ranges = _edl_ranges_by_clip(project)
     out = []
     for clip in project["clips"]:
         if clip["role"] != "camera":
@@ -166,13 +233,27 @@ def _candidate_windows(project: dict) -> list[dict]:
             (s for s in project["sentences"] if s["clip_id"] == clip["id"] and s["kept"]),
             key=lambda s: s["start"],
         )
-        for i in range(len(sents)):
+        if edl_ranges is not None:
+            clip_ranges = edl_ranges.get(clip["id"], [])
+            tagged = []
+            for s in sents:
+                idx = _edl_range_index(clip_ranges, s["start"], s["end"])
+                if idx is not None:
+                    tagged.append((s, idx))
+        else:
+            tagged = [(s, 0) for s in sents]
+
+        for i in range(len(tagged)):
             acc, texts = [], []
-            for j in range(i, len(sents)):
-                if acc and sents[j]["start"] - acc[-1]["end"] > 4.0:
+            range_idx0 = tagged[i][1]
+            for j in range(i, len(tagged)):
+                s, idx = tagged[j]
+                if idx != range_idx0:
+                    break  # crossed into a different kept EDL range — content between was cut
+                if acc and s["start"] - acc[-1]["end"] > 4.0:
                     break  # big content hole — not one continuous thought
-                acc.append(sents[j])
-                texts.append(sents[j]["text"])
+                acc.append(s)
+                texts.append(s["text"])
                 dur = acc[-1]["end"] - acc[0]["start"]
                 if dur > config.REEL_MAX_S:
                     break
@@ -532,6 +613,12 @@ def suggest(log, project: dict) -> None:
             "crop_x": None,
             "cue_overrides": {},
             "subtitle_style": {},
+            # Subtitle decoupling (spec vNext "shorts don't inherit the main
+            # subtitles"): DEFAULT OFF, independent of project["subtitles"].
+            # The Reel Editor can flip this + set subtitle_style per reel;
+            # nothing auto-carries the main video's subtitle config/sizing
+            # into a short. See _effective_subtitle_cfg/_compose_reel.
+            "subtitles_enabled": False,
             # Framing transform (spec v7.11) — see module constants above.
             "transform": dict(DEFAULT_TRANSFORM),
             # Multi-segment reels (spec v5.8b) — see module docstring.
@@ -752,6 +839,11 @@ def ensure_segments(reel: dict) -> None:
     reel.setdefault("preview_ready", False)
     reel.setdefault("preview_hash", None)
     reel.setdefault("dedup_flag", None)
+    # Subtitle decoupling (spec vNext): shorts default OFF regardless of the
+    # main project's subtitle config -- migrates any pre-existing reel (which
+    # never had this key) to the same "off until explicitly turned on"
+    # default a freshly suggested reel gets (see suggest() below).
+    reel.setdefault("subtitles_enabled", False)
     _normalize_transitions(reel)
     _sync_legacy_fields(reel)
     _normalize_transform(reel)
@@ -800,13 +892,17 @@ def _effective_crop_center(log, clip: dict, reel: dict, start: float, end: float
     return center
 
 
-def _effective_subtitle_cfg(project: dict, reel: dict) -> dict:
-    """project["subtitles"] normalized, then partially overridden by
-    reel["subtitle_style"] (spec: "partial override of project['subtitles']"
-    scoped to just this reel -- shared across all of the reel's segments)."""
-    base = subtitles.normalize_config(project.get("subtitles"))
-    override = reel.get("subtitle_style") or {}
-    return subtitles.normalize_config({**base, **override})
+def _effective_subtitle_cfg(reel: dict) -> dict:
+    """reel["subtitle_style"] normalized against subtitles.DEFAULTS -- NOT
+    merged over project["subtitles"] (spec vNext "shorts don't inherit the
+    main's subtitles": the main video's subtitle config/sizing is for
+    landscape, social format/size differs, so nothing about a short's
+    subtitles should default from the main edit). A reel's subtitle STYLE
+    (font/color/position/...) is entirely its own, independent config, scoped
+    to just this reel; whether it burns at all is controlled separately by
+    reel["subtitles_enabled"] (see _compose_reel), which also does not read
+    project["subtitles"]["enabled"]."""
+    return subtitles.normalize_config(reel.get("subtitle_style") or {})
 
 
 def _segment_cue_overrides(
@@ -868,9 +964,18 @@ def _compose_reel(
     log.progress(progress_lo)
 
     color_vf = filters.build_vf(project.get("color"))
-    sub_cfg = _effective_subtitle_cfg(project, reel)
-    burn_subs = ffmpeg_utils.supports_subtitles()
-    if not burn_subs:
+    # Subtitle decoupling (spec vNext "shorts don't inherit the main
+    # subtitles"): a reel burns subtitles ONLY if the reel ITSELF has them
+    # explicitly enabled (reel["subtitles_enabled"], default False -- see
+    # ensure_segments/suggest) -- project["subtitles"]["enabled"] is never
+    # consulted here, so a main video with subtitles on never bakes them into
+    # a short by default. The Reel Editor can still turn this on per-reel
+    # with its own subtitle_style (_effective_subtitle_cfg, also fully
+    # decoupled from the project's subtitle config).
+    reel_subs_enabled = bool(reel.get("subtitles_enabled"))
+    sub_cfg = _effective_subtitle_cfg(reel)
+    burn_subs = reel_subs_enabled and ffmpeg_utils.supports_subtitles()
+    if reel_subs_enabled and not ffmpeg_utils.supports_subtitles():
         log("ffmpeg has no libass — rendering without burned subtitles")
     cue_overrides = reel.get("cue_overrides") or {}
     fps = min(first_clip["info"]["fps"] or 30.0, 60.0)

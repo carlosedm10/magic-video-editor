@@ -209,13 +209,23 @@ const fmtT = (t) => {
   return `${Math.floor(t / 60)}:${String(Math.floor(t % 60)).padStart(2, "0")}`;
 };
 
+// Shorts (spec vNext "shorts are a separate, explicit step"): "reels" is no
+// longer a run-all stage -- run-all's own STAGE_ORDER (magic_video_editor/api/
+// pipeline.py) now ends at "render" (the finished main cut). This client-side
+// STAGES list drives ONLY the run-all chip/popover/progress strip
+// (_derivePipelineStages/renderStageBar/renderRunAllPanel below), so it stays
+// in lockstep with the backend's run-all STAGE_ORDER, not with STAGES (the
+// full runnable-stage registry, which still includes "reels" for the
+// standalone "stage:reels" run triggered from the Reels tab).
 const STAGES = [
   ["ingest", "1 Ingest"], ["sync", "2 Sync"], ["transcribe", "3 Transcribe"],
   ["takes", "4 Takes"], ["order", "5 Order"], ["review", "6 Review"],
-  ["render", "7 Render"], ["reels", "8 Reels"],
+  ["render", "7 Render"],
 ];
 // Friendly labels for the run-all progress panel (spec: Pipeline orchestration UX).
-// Mirrors magic_video_editor/api/pipeline.py's STAGES/STAGE_LABELS — keep in lockstep.
+// Mirrors magic_video_editor/api/pipeline.py's STAGE_LABELS — keep in lockstep.
+// "reels" stays here (used by the Reels tab's own "Generando shorts…"
+// progress copy) even though it's no longer in STAGES above.
 const STAGE_LABELS = {
   ingest: "Reading files", sync: "Syncing cameras", transcribe: "Transcribing",
   takes: "Analyzing takes", order: "Ordering the story", review: "Checking for suggestions",
@@ -689,6 +699,12 @@ async function pollQueue() {
   renderRunAllPanel();
   _maybeToastPipelineFailure(prevRunAllItem);
   if (window.ActivityPopover?.isOpen()) window.ActivityPopover.render();
+  // Shorts trigger (ui/tabs/reels.js "Generar shorts a partir del vídeo
+  // final"): the standalone "stage:reels" run has no rendered file/job to
+  // watchJob() until it starts, and (unlike run-all) nothing else re-renders
+  // the Reels tab while it's in flight -- piggyback on this existing 2s
+  // queue poll for live progress rather than adding a second polling loop.
+  if (state.tab === "reels" && window.TABS.reels) window.TABS.reels();
   if (state.project && (!state.runAllItem || state.runAllItem.status !== "running")) {
     // A run-all (or any stage) that just finished may have changed
     // stages/reels/etc -- pick that up without waiting for a manual action.

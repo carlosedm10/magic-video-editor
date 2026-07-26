@@ -1375,3 +1375,74 @@ byte-identical to today's; a flagged break never auto-applies a transition
 split; a below-threshold flag and the `PARAGRAPH_BREAK_ENABLED=False` toggle both
 skip detection entirely. Also re-verified `scripts/test_intra_clip_order.py`
 still passes unmodified.
+
+## vNext — Shorts are a separate, explicit step (owner mental model)
+
+The AI-first-pass line at the top of this doc ("transcribe → sync → best takes
+→ order → render → reels") and the "Pipeline orchestration UX" section's
+run-all stage list/labels above are now stale on one point: **reels/shorts
+generation is no longer part of run-all.** The owner's model is sequential in
+two clearly separated phases: (1) edit the main video — pipeline stages +
+manual Studio edits — until the FINAL cut is right; (2) only THEN, as a
+separate explicit action, generate shorts FROM that finished cut.
+
+- **run-all** (`magic_video_editor/api/pipeline.py`): `STAGE_ORDER` (the
+  run-all sequence) now ends at `"render"` and no longer includes `"reels"` —
+  the old "reels stage failure must not kill the pipeline (it's last)"
+  carve-out is gone along with it, since reels no longer runs inside run-all
+  at all. `STAGES` (the full runnable-stage registry `run_stage()`/
+  `_run_stage_kind` validate against) still lists `"reels"` unchanged, so
+  `POST /projects/{pid}/run/reels` (queue kind `"stage:reels"`) keeps working
+  exactly as any other standalone per-stage re-run always has. The existing
+  `reel_previews` auto-enqueue hook (`magic_video_editor/queue.py`'s
+  `_run_auto_enqueue_hooks`) is unaffected — it already keyed off the queue
+  item's own kind (`"stage:reels"` done, or `"run-all"` done with reels
+  present), not off "last stage of run-all", so it still fires for a manual
+  reels run.
+- **UI** (`ui/core.js`'s `STAGES`/run-all progress list, `ui/tabs/reels.js`):
+  the run-all chip/popover/progress strip no longer show a "Making shorts"
+  row. The Reels tab now shows an explicit empty state when
+  `project["reels"]` is empty — "Generar shorts a partir del vídeo final" — 
+  that POSTs the standalone reels stage (reusing the existing generic
+  `runStage()` helper, same queue endpoint every other per-stage re-run
+  uses) and shows progress inline while it runs. Nothing auto-generates reels
+  on project open or as part of run-all.
+- **Sourcing from the final cut** (`magic_video_editor/pipeline/reels.py`'s
+  `_candidate_windows`): sliding reel-candidate windows are now constrained to
+  `project["edl"]` (the persisted final-cut segment list, `pipeline/
+  ordering.py::build_edl`'s output) when it exists — a sentence only enters a
+  window if it falls fully inside one of the EDL's own kept ranges for that
+  clip, and a window may never bridge across a boundary between two different
+  kept ranges even when they sit close together in time (that gap is exactly
+  content the user cut). This means a moment trimmed out of the main video by
+  a manual EDL edit can never surface in a short, even if its sentences are
+  still flagged `kept: true` at the sentence-analysis level. Falls back to the
+  old sentence-`kept`-only behavior only when there's no EDL yet (a project
+  that hasn't reached the render stage).
+- **Subtitles don't carry over** (`_effective_subtitle_cfg`/`_compose_reel` in
+  the same file): a reel's subtitle burn-in is no longer merged over
+  `project["subtitles"]` — reels gain their own `reel["subtitles_enabled"]`
+  flag (new field, **default `False`**), and `_compose_reel` only writes/burns
+  a segment's `.ass` file when that flag is explicitly `True` on the reel
+  itself. `reel["subtitle_style"]` (already existed) is now normalized against
+  `subtitles.DEFAULTS` directly rather than layered over the project's config,
+  so an unset style field never silently inherits the main video's
+  size/font/position — social format and sizing genuinely differ from the
+  landscape main edit. `ensure_segments` migrates any pre-existing reel
+  missing the field to `subtitles_enabled: False` (never inheriting whatever
+  the main project's subtitles happened to be). `magic_video_editor/api/
+  reels.py`'s `ReelPatch` gained a matching optional `subtitles_enabled: bool`
+  field so the Reel Editor can turn a reel's own subtitles on per-reel.
+
+Covered by `scripts/test_shorts_pipeline.py` (LLM mocked, scratch `MVE_DATA`,
+one real tiny ffmpeg clip for the subtitle-burn assertions): run-all's
+`STAGE_ORDER` excludes `"reels"` and ends at `"render"`; `_run_all_kind` never
+invokes the reels stage even though it's still in `STAGES`; a standalone
+`"stage:reels"` run through the real queue still produces suggestions and
+still auto-enqueues `reel_previews`; `_candidate_windows` never returns a
+window spanning a range excluded from `project["edl"]` (and does span it when
+there's no EDL yet, proving the fallback); and `_compose_reel` writes zero
+`.ass` files for a reel with `subtitles_enabled` unset/False (even with the
+project's own subtitles enabled) but does write one once the reel opts in.
+Re-verified `scripts/test_reel_dedup.py`, `test_reel_previews.py`, and
+`test_reel_transform.py` all still pass unmodified.

@@ -176,6 +176,13 @@ const Player = {
   _intendPlaying: false,
   _lastEdlTime: 0,      // last successfully-computed currentEdlTime(); see currentEdlTime()'s
                           // fallback and onSegmentsChanged's EDL-mutation continuity logic below.
+  _lastEdlIndex: undefined,  // _currentIndex the last time currentEdlTime() actually recomputed
+  _lastEdlVt: undefined,     // active <video>.currentTime the last time currentEdlTime() actually
+                              // recomputed — see currentEdlTime()'s frozen-video guard below.
+  _recoverIdx: undefined,    // segment index the last _recoverStall() escalation targeted
+  _recoverAttempts: 0,       // consecutive _recoverStall() calls at that same index with no
+                              // real progress — escalates from a plain seek+play to a full
+                              // src reload once plain retries prove the element is wedged
 
   mode: "draft",         // "draft" | "preview"
   _cues: [],
@@ -896,15 +903,69 @@ const Player = {
      rejection (the old `.catch(() => {})` everywhere) leaves `this.playing`
      true while the element itself is actually paused, with nothing left to
      ever resume it. Retry a few times on a short backoff; give up quietly
-     if the user paused in the meantime (don't fight their intent). */
+     if the user paused in the meantime (don't fight their intent).
+
+     ---------- real-WKWebView hardening: verify, don't just hope ----------
+     The rejection-only retry above is not enough: in real WKWebView (NOT the
+     mock <video> harness used to "verify" earlier fixes), `play()` can
+     resolve — or simply never reject — while the element is still, in
+     fact, paused (most often right after a same-element seek at a segment
+     boundary, before the seek has actually settled). Nothing about a
+     resolved promise proves playback actually resumed. So every attempt is
+     now followed by an explicit `.paused` check a beat later: if it's still
+     paused and we still intend to be playing, that counts as a failed
+     attempt exactly like a rejection would, and retries the same way. Once
+     attempts are exhausted and the element STILL won't stick, this escalates
+     past "try play() again" to `_escalateStuckPlayback`, which forces a real
+     segment reload (a fresh src/seek/play sequence resets WebKit's decode
+     pipeline far more reliably than hammering play() on an already-wedged
+     element). */
   _playWithRetry(video, attempt = 0) {
     if (!video) return;
     const result = video.play();
-    if (!result || typeof result.catch !== "function") return;
-    result.catch((err) => {
-      if (attempt >= 4 || !this.playing) return;
-      setTimeout(() => this._playWithRetry(video, attempt + 1), 100 + attempt * 100);
+    if (result && typeof result.catch === "function") result.catch(() => { /* verified below regardless */ });
+    setTimeout(() => {
+      const wantPlaying = this.playing || this._intendPlaying;
+      if (!wantPlaying) return; // user paused meanwhile — don't fight their intent
+      if (!video.paused) return; // it actually took (whether or not the promise ever settled)
+      if (attempt >= 4) { this._escalateStuckPlayback(video); return; }
+      this._playWithRetry(video, attempt + 1);
+    }, 120 + attempt * 100);
+  },
+
+  // Reached only once `_playWithRetry` has proven, by direct observation of
+  // `.paused`, that play() will not stick on this element no matter how many
+  // times it's reissued in place. Only meaningful for the active draft video
+  // (source/preview modes don't advance through segments); a bare
+  // fire-and-forget reload here mirrors what `_recoverStall`'s escalation
+  // does for the exact same underlying symptom.
+  _escalateStuckPlayback(video) {
+    if (this.mode !== "draft" || this.sourceClipId || video !== this._active()) return;
+    if (!(this.playing || this._intendPlaying)) return;
+    console.warn("[player] play() would not stick after retries on the active video — forcing a segment reload", video.dataset.clipId);
+    this._forceReloadSegment(this._currentIndex);
+  },
+
+  // Escalation beyond a plain seek+play: force a genuine <video>.src
+  // reassignment even when `dataset.clipId` already matches the target
+  // segment's clip (the normal `_loadSegment` short-circuits straight to a
+  // seek in that case). A bare currentTime seek + play() can fail to clear
+  // whatever wedged WebKit's internal decode/seek state at a boundary; a
+  // fresh src load resets that pipeline outright.
+  _forceReloadSegment(index) {
+    const seg = Editor.segments?.[index];
+    if (!seg) return;
+    const video = this._active();
+    this._currentIndex = index;
+    video.dataset.clipId = ""; // force the normal same-clip fast path below to reload for real
+    video.src = `/api/projects/${Editor.pid}/media/preview/${seg.clip_id}`;
+    video.dataset.clipId = seg.clip_id;
+    this._whenSeekable(video, () => {
+      try { video.currentTime = seg.start; } catch (_e) { /* metadata not ready */ }
+      video.playbackRate = this._rate;
+      this._playWithRetry(video);
     });
+    this._preloadNext(index);
   },
 
   _loadSegment(index, atClipTime, { andPlay }) {
@@ -1120,8 +1181,22 @@ const Player = {
     const seg = segs[this._currentIndex];
     const row = cum[this._currentIndex];
     if (!seg || !row) return this._lastEdlTime || 0;
-    const local = this._active().currentTime - seg.start;
+    const vt = this._active().currentTime;
+    // Real-WKWebView hardening: if the segment index AND the active
+    // element's own currentTime are byte-identical to the last time this
+    // actually recomputed, the video has made NO real progress since — the
+    // only truthful thing to do is hand back the exact same cached value,
+    // never a freshly-recomputed one. This is what guarantees currentEdlTime
+    // (and therefore anything sampling it, like a watchdog) can never appear
+    // to advance while the real, active <video> element is frozen — no
+    // matter what `Editor.cumulative()`/segment lookups do underneath.
+    if (this._lastEdlIndex === this._currentIndex && this._lastEdlVt === vt) {
+      return this._lastEdlTime || 0;
+    }
+    const local = vt - seg.start;
     const t = row.start + Math.max(0, local);
+    this._lastEdlIndex = this._currentIndex;
+    this._lastEdlVt = vt;
     this._lastEdlTime = t;
     return t;
   },
@@ -1258,11 +1333,22 @@ const Player = {
     // the re-entrancy guard stuck `true` forever (hypothesis 2).
     const doSwap = () => {
       try {
-        this._active().pause();
-        this._active().ontimeupdate = null;
+        const wasActive = this._active();
+        wasActive.pause();
+        wasActive.ontimeupdate = null;
         this.activeIdx = 1 - this.activeIdx;
         this._currentIndex = nextIndex;
         const nowActive = this._active();
+        // Real-WKWebView hardening: this was the actual root cause of "the
+        // hidden buffer plays [is the one that resumes] while the visible
+        // one stays frozen" — `activeIdx` flipped LOGICALLY but the CSS
+        // `.active` class (the only thing that controls which stacked
+        // <video> is actually visible, see .player-video.active { opacity:
+        // 1 } in style.css) never moved with it. `_crossfadeSwap` always
+        // toggled this correctly; this hard-cut path never did. Keep the
+        // visible element and the one we're about to seek/play in lockstep.
+        wasActive.classList.remove("active");
+        nowActive.classList.add("active");
         try { nowActive.currentTime = next.start; } catch (_e) { /* ignore */ }
         nowActive.playbackRate = this._rate;
         nowActive.ontimeupdate = () => this._onTimeUpdate();
@@ -1403,6 +1489,7 @@ const Player = {
       this._wdLastT = t;
       this._wdIndex = this._currentIndex;
       this._wdSince = performance.now();
+      this._recoverAttempts = 0; // real progress happened — the element isn't wedged (any more)
       return;
     }
     if (performance.now() - this._wdSince > STALL_MS) {
@@ -1429,9 +1516,23 @@ const Player = {
       return;
     }
     const idx = Math.min(Math.max(this._currentIndex, 0), segs.length - 1);
+    // Real-WKWebView hardening: track consecutive recoveries AT THE SAME
+    // INDEX with no real progress in between (`_checkStallWatchdog` zeroes
+    // this out the instant currentTime actually moves). A plain seek+play
+    // (`_loadSegment`) is the cheap first response, but if it's already
+    // failed to unstick this exact element more than a couple of times in a
+    // row, keep reissuing it is just repeating the thing that already
+    // didn't work — escalate to a full src reload instead, same as
+    // `_escalateStuckPlayback` does for the play()-retry path.
+    if (this._recoverIdx === idx) this._recoverAttempts = (this._recoverAttempts || 0) + 1;
+    else { this._recoverIdx = idx; this._recoverAttempts = 1; }
     this._currentIndex = idx;
     const seg = segs[idx];
-    this._loadSegment(idx, seg.start, { andPlay: true });
+    if (this._recoverAttempts > 2) {
+      this._forceReloadSegment(idx);
+    } else {
+      this._loadSegment(idx, seg.start, { andPlay: true });
+    }
     // Defensive re-assert (hypothesis-3 hardening): _loadSegment reuses
     // whichever element is currently "active" and never touches its
     // ontimeupdate, which is correct because doSwap()/_crossfadeSwap() are
