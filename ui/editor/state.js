@@ -676,6 +676,7 @@ window.EditorUI.onProjectSelected = async function (project) {
   try { window.EditorUI.overlaybox?.mount(); } catch (e) { console.error(e); }
   try { _mountSpeakerSelect(project); } catch (e) { console.error(e); }
   try { _mountLanguageSelect(project); } catch (e) { console.error(e); }
+  try { _mountPacingSelect(project); } catch (e) { console.error(e); }
 };
 
 window.EditorUI.onProjectRefreshed = function (project) {
@@ -692,6 +693,7 @@ window.EditorUI.onProjectRefreshed = function (project) {
   try { window.EditorUI.player?.onProjectRefreshed?.(); } catch (e) { console.error(e); }
   try { _mountSpeakerSelect(project); } catch (e) { console.error(e); }
   try { _mountLanguageSelect(project); } catch (e) { console.error(e); }
+  try { _mountPacingSelect(project); } catch (e) { console.error(e); }
 };
 
 /* ---------- "Locutores" speaker-count field (spec v5.8c UI) ----------
@@ -797,5 +799,60 @@ function _mountLanguageSelect(project) {
     head.appendChild(wrap);
   }
   const cur = project?.language_override || "auto";
+  if (document.activeElement !== sel) sel.value = cur;
+}
+
+/* ---------- "Ritmo" per-project cutting-rhythm field ----------
+   Owner feature (2026-07-26): a manual-vs-auto comparison found the auto cut
+   too aggressive on head lead-in / mid-paragraph micro-breaths / tail vs. a
+   human editor. "Ritmo" lets the user dial that in per project --
+   tight/natural/airy (Spanish UI: ceñido/natural/con aire), default natural.
+   Sits right next to "Locutores"/"Idioma" in the same media-bin header, same
+   fair-game DOM-injection pattern -- PATCHes project.pacing via
+   magic_video_editor/api/projects.py (ProjectUpdate.pacing, values shared
+   with config.PACING_PRESETS' keys). See pipeline/ordering.py's
+   resolve_pacing_preset for how each value maps to head_pad_s/merge_gap_s/
+   tail_pad_s. An unset value shows as "natural" (config.DEFAULT_PACING) even
+   though the project itself has no pacing field yet -- mirrors "Idioma"'s
+   own unset-shows-as-auto convention. */
+const _PACING_OPTIONS = [
+  ["tight", "Ceñido"],
+  ["natural", "Natural"],
+  ["airy", "Con aire"],
+];
+
+function _mountPacingSelect(project) {
+  const head = document.querySelector("#media-bin .bin-head");
+  if (!head) return;
+  let sel = document.getElementById("pacing-select");
+  if (!sel) {
+    const wrap = document.createElement("label");
+    wrap.className = "row";
+    wrap.style.cssText = "gap:4px; font-size:12px;";
+    wrap.title = "Ritmo de corte: qué tan pegado o respirado queda el resultado -- \"Ceñido\" "
+      + "corta lo más posible (menos aire, más riesgo de cortar una micro-pausa a mitad de "
+      + "frase); \"Con aire\" deja más aire antes/después y no corta las respiraciones cortas "
+      + "dentro de un mismo párrafo; \"Natural\" es el punto intermedio recomendado.";
+    const span = document.createElement("span");
+    span.className = "dim";
+    span.textContent = "Ritmo";
+    sel = document.createElement("select");
+    sel.id = "pacing-select";
+    sel.innerHTML = _PACING_OPTIONS.map(([v, label]) => `<option value="${v}">${label}</option>`).join("");
+    sel.onchange = async () => {
+      const value = sel.value;
+      try {
+        await api(`/projects/${state.pid}`, { method: "PATCH", body: { pacing: value } });
+        if (state.project) state.project.pacing = value;
+      } catch (e) {
+        showToast(`Couldn't update pacing: ${e.message}`);
+        sel.value = project.pacing || "natural";
+      }
+    };
+    wrap.appendChild(span);
+    wrap.appendChild(sel);
+    head.appendChild(wrap);
+  }
+  const cur = project?.pacing || "natural";
   if (document.activeElement !== sel) sel.value = cur;
 }

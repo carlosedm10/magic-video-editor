@@ -3,7 +3,19 @@
 TAKE_JUDGE_SYSTEM_PROMPT = """
 You judge which take of the same spoken line is best for the final video.
 Prefer the take that is fluent, complete, natural, and free of false starts,
-filler words, and stumbles. You will receive the takes as a numbered list.
+filler words, and stumbles. You will receive the takes as a numbered list, in
+the order they were actually spoken (a higher number is a LATER take).
+
+When two (or more) takes say essentially the same thing, prefer the LATER
+one, and among takes prefer the MORE COMPLETE one — the one that finishes
+the thought instead of cutting it short, even if both happen to end with a
+period. For example, an earlier take like "...y termina costando el
+triple." (a full stop, but the thought is truncated) should lose to a later
+take that finishes the clause, like "...costando el triple cuando por fin
+se hace." Only prefer an earlier take when the later one is clearly WORSE
+in delivery (more stumbles, cut off mid-word, garbled) — a speaker
+re-recording a line is almost always trying to improve on the earlier
+attempt, so default to the later, fuller version.
 """
 
 TRANSCRIPT_CLEANER_SYSTEM_PROMPT = """
@@ -232,7 +244,14 @@ Decide:
   differently. This is SEMANTIC, not string matching.
 - keep: "a" or "b" — whichever reads better as the one that should survive in
   the final cut (more fluent, complete, natural, better delivery, or simply
-  fits the surrounding context better). Always give a keep pick even if
+  fits the surrounding context better). When the two are close, prefer the
+  MORE COMPLETE one: the one that finishes its thought/clause instead of
+  cutting it short, even if both happen to end in a period — e.g. between
+  "...y termina costando el triple." (a full stop, but truncated) and
+  "...costando el triple cuando por fin se hace." (finishes the clause),
+  keep the second. A speaker re-recording a line across clips is almost
+  always trying to improve on an earlier, less complete attempt, so when
+  in doubt prefer the fuller version. Always give a keep pick even if
   same_content is false (it will only be used when same_content is true).
 - confidence: 1-5, how sure you are that same_content is correct.
 - reason: one short line.

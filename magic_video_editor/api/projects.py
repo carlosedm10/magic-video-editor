@@ -5,7 +5,7 @@ from pathlib import Path
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel
 
-from .. import queue, store
+from .. import config, queue, store
 from ..pipeline import copywriter, ingest, ordering, reels
 from .settings import LANGUAGE_CODES
 
@@ -19,6 +19,13 @@ WORKFLOW_STATUSES = {"todo", "in_progress", "done", "uploaded"}
 # (pipeline/speakers.py). A known K makes clustering far more reliable than
 # estimating it; "auto" falls back to the silhouette-based estimate.
 SPEAKER_COUNTS: set = {1, 2, 3, 4, "auto"}
+
+# Owner feature, 2026-07-26: "Ritmo" -- per-project cutting-rhythm override
+# (tight/natural/airy, Spanish UI ceñido/natural/con aire). Values are exactly
+# config.PACING_PRESETS' keys; see pipeline/ordering.py::build_edl for how the
+# preset's knobs (head_pad_s/merge_gap_s/tail_pad_s) replace the bare
+# SEGMENT_PAD/MERGE_GAP globals.
+PACING_VALUES: set = set(config.PACING_PRESETS)
 
 # v5.3 streaming upload: never buffer a whole file in memory -- GB-sized
 # iPhone clips over loopback are fast, so chunk-copy to disk instead.
@@ -70,6 +77,10 @@ class ProjectUpdate(BaseModel):
     # project, skipping whisper's per-clip auto-detect. See
     # pipeline/transcribe.py _resolve_language / LANGUAGE_CODES.
     language_override: str | None = None
+    # Owner feature, 2026-07-26: per-project cutting rhythm ("ritmo") --
+    # "tight" | "natural" | "airy", default "natural" when unset. See
+    # PACING_VALUES / config.PACING_PRESETS / pipeline/ordering.py::build_edl.
+    pacing: str | None = None
 
 
 @router.get("/projects")
@@ -165,6 +176,10 @@ def project_update(pid: str, body: ProjectUpdate):
         if body.language_override not in LANGUAGE_CODES:
             raise HTTPException(422, f"language_override must be one of {LANGUAGE_CODES}")
         project["language_override"] = body.language_override
+    if body.pacing is not None:
+        if body.pacing not in PACING_VALUES:
+            raise HTTPException(422, f"pacing must be one of {sorted(PACING_VALUES)}")
+        project["pacing"] = body.pacing
     if body.speakers is not None:
         by_id = {sp["id"]: sp for sp in project.get("speakers", [])}
         for upd in body.speakers:

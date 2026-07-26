@@ -76,8 +76,16 @@ def _normalize_exact(text: str) -> str:
     return re.sub(r"\s+", " ", t).strip()
 
 
-def _cut_exact_repeat_run(log, run: list[dict], key: str, cut_ids: set[str]) -> None:
+def _cut_exact_repeat_run(
+    log,
+    run: list[dict],
+    key: str,
+    cut_ids: set[str],
+    keeper_ids: set[str] | None = None,
+) -> None:
     keeper = run[-1]
+    if keeper_ids is not None:
+        keeper_ids.add(keeper["id"])
     for s in run[:-1]:
         cut_ids.add(s["id"])
     log(
@@ -87,7 +95,9 @@ def _cut_exact_repeat_run(log, run: list[dict], key: str, cut_ids: set[str]) -> 
     )
 
 
-def _exact_repeat_dedup_clip(log, clip_sentences: list[dict]) -> set[str]:
+def _exact_repeat_dedup_clip(
+    log, clip_sentences: list[dict], keeper_ids: set[str] | None = None
+) -> set[str]:
     """Deterministic, LLM-free pre-pass (owner heuristic, 2026-07-25): "si se
     ha dicho EXACTAMENTE lo mismo DOS VECES SEGUIDAS, quedate con la ULTIMA."
     Walks one clip's sentences in time order (never crosses clip boundaries —
@@ -97,7 +107,13 @@ def _exact_repeat_dedup_clip(log, clip_sentences: list[dict]) -> set[str]:
     no fuzzy matching, and this intentionally does NOT reach past a single
     adjacent gap (that's the near-duplicate fuzzy grouping further down in
     `run()`), so a different sentence between two identical ones breaks the
-    run and both survive this pass untouched."""
+    run and both survive this pass untouched.
+
+    `keeper_ids`, if given, is populated (in place) with the id of the
+    surviving (last) sentence of every cut run -- Fix 1 (2026-07-26): callers
+    use this to protect that survivor from ever being cut by a LATER pass
+    (transcript_cleaner/take_sequencer/context_check/dedup_judge), which was
+    the root cause of a duplicated CTA line losing every delivery."""
     cut_ids: set[str] = set()
     if len(clip_sentences) < 2:
         return cut_ids
@@ -110,11 +126,11 @@ def _exact_repeat_dedup_clip(log, clip_sentences: list[dict]) -> set[str]:
             run.append(s)
             continue
         if len(run) > 1:
-            _cut_exact_repeat_run(log, run, run_key, cut_ids)
+            _cut_exact_repeat_run(log, run, run_key, cut_ids, keeper_ids)
         run = [s]
         run_key = key
     if len(run) > 1:
-        _cut_exact_repeat_run(log, run, run_key, cut_ids)
+        _cut_exact_repeat_run(log, run, run_key, cut_ids, keeper_ids)
     return cut_ids
 
 
@@ -511,6 +527,37 @@ def _llm_tiebreak(candidates: list[dict]) -> str | None:
     return None
 
 
+def _take_completeness(sent: dict) -> float:
+    """Proxy for how COMPLETE/finished a take reads (Fix 2, 2026-07-26):
+    word count plus a bonus for actually ending on sentence-final
+    punctuation. Needed because `SENT_END` alone can't tell a full thought
+    from a truncated one that still happens to end in a period -- e.g. an
+    earlier take "...y termina costando el triple." (ends in ".", but cuts
+    the sentence off) versus the later, more complete retake "...costando el
+    triple cuando por fin se hace." (also ends in ".", but actually finishes
+    the clause). Longer + properly terminated wins as "more complete"."""
+    n_words = len(sent["words"]) if sent.get("words") else len(sent["text"].split())
+    ends_full = 1.0 if SENT_END.search(sent["text"].strip()) else 0.0
+    return n_words + config.TAKE_COMPLETENESS_END_BONUS * ends_full
+
+
+def _select_cluster_winner(cluster: list[dict]) -> dict:
+    """Pick the survivor of a duplicate/near-duplicate cluster (Fix 2,
+    2026-07-26 -- owner heuristic: "si dicen la misma linea, quedate con la
+    ultima"). `_score` (with its `take_index` recency term) is still the
+    base quality signal -- a mumbled/garbled later take shouldn't
+    automatically beat a clean earlier one -- but a real manual-vs-auto
+    comparison found it can favor a shorter/earlier take over a later, more
+    complete retake purely on the heuristic disfluency/rate/stability terms.
+    Fix: among takes whose score is within TAKE_WINNER_SCORE_MARGIN of the
+    best, prefer the chronologically LATER one, then the more COMPLETE one
+    (longer / fuller ending), instead of just the highest raw score. Assumes
+    every sentence already has `take_index` set (scoring loop in `run()`)."""
+    top_score = max(s["score"] for s in cluster)
+    close = [s for s in cluster if top_score - s["score"] <= config.TAKE_WINNER_SCORE_MARGIN]
+    return max(close, key=lambda s: (s["take_index"], _take_completeness(s), s["score"]))
+
+
 def run(log, project: dict) -> None:
     clips = [c for c in project["clips"] if c.get("transcript") and c["role"] == "camera"]
     if not clips:
@@ -543,6 +590,16 @@ def run(log, project: dict) -> None:
     for s in sentences:
         by_clip.setdefault(s["clip_id"], []).append(s)
 
+    # Duplicate-cluster survivor guard (Fix 1, 2026-07-26): every duplicate/
+    # near-duplicate cluster (exact-repeat run, or fuzzy-dedup group further
+    # below) designates exactly ONE survivor. Collected as we go and enforced
+    # at the very end of run() -- no later pass (cleaner/sequencer/
+    # context_check/cross-clip dedup_judge/fragment-drop) may ever leave a
+    # cluster with zero kept=True members. Real bug this closes: a CTA line
+    # delivered twice had BOTH deliveries independently cut by different
+    # passes, and the final cut lost the line entirely.
+    protected_survivor_ids: set[str] = set()
+
     # Deterministic, LLM-free pre-pass (owner heuristic): the same line said
     # EXACTLY twice (or more) in a row within one clip is an unambiguous
     # flub-then-redo -- keep only the LAST occurrence. Runs FIRST (before the
@@ -553,7 +610,9 @@ def run(log, project: dict) -> None:
     if config.EXACT_REPEAT_DEDUP_ENABLED:
         log("Checking for exact consecutive repeats (blooper -> redo)...")
         for clip_sentences in by_clip.values():
-            exact_repeat_cut_ids |= _exact_repeat_dedup_clip(log, clip_sentences)
+            exact_repeat_cut_ids |= _exact_repeat_dedup_clip(
+                log, clip_sentences, protected_survivor_ids
+            )
         if exact_repeat_cut_ids:
             log(f"exact-repeat pre-pass cut {len(exact_repeat_cut_ids)} sentence(s)")
 
@@ -653,18 +712,25 @@ def run(log, project: dict) -> None:
         idx = take_counter.get(root, 0)
         take_counter[root] = idx + 1
         s["score"], s["why"] = _score(s, wavs.get(s["clip_id"]), idx)
+        s["take_index"] = idx
         s["kept"] = True
         s["dup_group"] = None
         s["reason"] = ""
 
     for gi, cluster in enumerate(groups):
-        best = max(cluster, key=lambda s: s["score"])
+        # Fix 2 (2026-07-26): winner-selection tie-break is "later + more
+        # complete", not just the highest raw heuristic score -- see
+        # _select_cluster_winner. The LLM tiebreak (take_judge) still gets a
+        # say on genuinely close calls, but only when it disagrees with a
+        # score close enough to be worth asking.
+        best = _select_cluster_winner(cluster)
         if use_llm and len(cluster) <= 6:
             top = sorted(cluster, key=lambda s: -s["score"])[:3]
-            if len(top) > 1 and top[0]["score"] - top[1]["score"] < 1.5:
+            if len(top) > 1 and top[0]["score"] - top[1]["score"] < config.TAKE_WINNER_SCORE_MARGIN:
                 pick = _llm_tiebreak(top)
                 if pick:
                     best = next(s for s in cluster if s["id"] == pick)
+        protected_survivor_ids.add(best["id"])
         for s in cluster:
             s["dup_group"] = f"d{gi}"
             if s["id"] != best["id"]:
@@ -686,10 +752,15 @@ def run(log, project: dict) -> None:
 
     # Apply the transcript-cleaner verdicts (restart markers / abandoned
     # takes / bloopers, then stuck take runs, then out-of-context asides) —
-    # after scoring/dedup so nothing re-flips them.
+    # after scoring/dedup so nothing re-flips them. Fix 1 guard: never let
+    # any of these cut a duplicate cluster's protected survivor (the final
+    # catch-all pass below would restore it anyway, but skipping here avoids
+    # a spurious AI reason ever being recorded for it).
     for s in sentences:
         if s["id"] in exact_repeat_cut_ids:
             continue  # already resolved above; don't let AI passes overwrite the reason
+        if s["id"] in protected_survivor_ids:
+            continue  # duplicate-cluster survivor guard (Fix 1)
         if s["id"] in cleaner_cut_ids:
             s["kept"] = False
             s["reason"] = "restart/abandoned take (AI)"
@@ -716,6 +787,8 @@ def run(log, project: dict) -> None:
         if dedup_autocut:
             for s in sentences:
                 if s["id"] in dedup_autocut and s["kept"]:
+                    if s["id"] in protected_survivor_ids:
+                        continue  # duplicate-cluster survivor guard (Fix 1)
                     s["kept"] = False
                     s["reason"] = "duplicate content across clips (AI)"
             log(f"cross-clip dedup auto-cut {len(dedup_autocut)} sentence(s)")
@@ -723,6 +796,21 @@ def run(log, project: dict) -> None:
             log(f"cross-clip dedup added {len(dedup_suggestions)} suggestion(s)")
     else:
         log("cross-clip dedup skipped (ollama unavailable)")
+
+    # Duplicate-cluster survivor guard, final catch-all (Fix 1, 2026-07-26):
+    # belt-and-suspenders on top of the inline skips above -- whichever pass
+    # cut a protected survivor (including the tiny-fragment drop, or any
+    # future pass added here), restore it now. This is the single place that
+    # GUARANTEES every duplicate/near-duplicate cluster keeps at least one
+    # kept=True member; nothing after this point may cut it again.
+    for s in sentences:
+        if s["id"] in protected_survivor_ids and not s["kept"]:
+            log(
+                f'duplicate-cluster guard: restoring protected survivor '
+                f'{s["id"]} (was cut: {s["reason"]!r})'
+            )
+            s["kept"] = True
+            s["reason"] = ""
 
     if new_suggestions:
         existing = project.get("suggestions", [])

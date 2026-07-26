@@ -38,6 +38,11 @@ DEFAULTS: dict = {
     # majority-vote self-heal); any other code pins every clip to it,
     # skipping auto-detect. See pipeline/transcribe.py LANGUAGE_CODES.
     "transcription_language": "auto",
+    # Global default cutting rhythm ("ritmo") for new/unset projects (owner
+    # feature, 2026-07-26): "tight"/"natural"/"airy" (Spanish UI: "ceñido"/
+    # "natural"/"con aire"). project["pacing"] overrides this per project; see
+    # config.PACING_PRESETS / config.DEFAULT_PACING and pipeline/ordering.py.
+    "pacing": config.DEFAULT_PACING,
     "performance": {
         "max_parallel_ffmpeg": 2,
         "ffmpeg_threads": None,

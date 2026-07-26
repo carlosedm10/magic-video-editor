@@ -142,6 +142,16 @@ SYNC_MIN_CORR = 0.55  # normalized correlation to consider two clips simultaneou
 DUP_SIMILARITY = 82  # rapidfuzz token_sort_ratio threshold (0-100)
 DUP_MIN_WORDS = 4
 
+# Duplicate-cluster winner selection (Fix 2, 2026-07-26 -- owner heuristic
+# "quedate con la ultima"): a real manual-vs-auto comparison found the
+# heuristic score alone kept an earlier, truncated take over a later, more
+# complete retake ("...costando el triple." vs "...costando el triple cuando
+# por fin se hace."). takes.py:_select_cluster_winner uses these two knobs to
+# prefer LATER + more COMPLETE takes among near-tied candidates instead of
+# just the highest raw `_score`.
+TAKE_WINNER_SCORE_MARGIN = 1.5  # score gap (same units as _score) still considered "close"
+TAKE_COMPLETENESS_END_BONUS = 3.0  # word-count-equivalent bonus for ending on real punctuation
+
 # Exact consecutive-repeat pre-pass (owner heuristic, deterministic, no LLM,
 # 2026-07-25): "si se ha dicho EXACTAMENTE lo mismo DOS VECES SEGUIDAS,
 # quedate con la ULTIMA." Runs in takes.py BEFORE the fuzzy/LLM passes below
@@ -201,8 +211,84 @@ TOPIC_INPUT_CHARS = 3000  # truncate full transcript to ~this many chars for vid
 # Rendering
 RENDER_CRF = 18
 RENDER_PRESET = "veryfast"
-SEGMENT_PAD = 0.12  # seconds of padding around kept sentences
-MERGE_GAP = 1.2  # merge adjacent kept sentences closer than this (same clip)
+SEGMENT_PAD = 0.12  # seconds of padding around kept sentences (fallback w/o a pacing preset)
+MERGE_GAP = 1.2  # merge adjacent kept sentences closer than this, same clip (fallback; see below)
+
+# Cutting-rhythm ("ritmo") presets (owner feature, 2026-07-26 -- manual-vs-auto
+# comparison found the auto cut too aggressive on three PACING dimensions: head
+# lead-in, micro-breaths mid-paragraph, and tail). Per-project setting
+# project["pacing"] in {"tight", "natural", "airy"} (Spanish UI: "ceñido" /
+# "natural" / "con aire"), default "natural" -- chosen to match the human
+# reference cut (keep some breathing room, don't split a 1-2s breath mid-
+# paragraph). pipeline/ordering.py::build_edl resolves the project's preset and
+# uses its knobs instead of the bare SEGMENT_PAD/MERGE_GAP globals above (which
+# remain as the fallback for an unrecognized/missing pacing value).
+#   - head_pad_s: lead-in kept before the first kept segment (clamped >= 0).
+#   - tail_pad_s: trailing room kept after the last kept segment (clamped to
+#     clip duration) -- same idea as head_pad_s, applied at the tail instead.
+#   - merge_gap_s: adjacent kept sentences (same clip) with a gap <= this stay
+#     ONE continuous segment instead of being split into two -- this is the
+#     knob that stops the "micro-cut a 1-2s breath mid-paragraph" behavior a
+#     human editor wouldn't do. A paragraph break (paragraph_break_after) still
+#     forces a split regardless of merge_gap_s.
+PACING_PRESETS: dict = {
+    "tight": {"head_pad_s": 0.1, "merge_gap_s": 0.8, "tail_pad_s": 0.1},
+    "natural": {"head_pad_s": 0.6, "merge_gap_s": 1.8, "tail_pad_s": 0.6},
+    "airy": {"head_pad_s": 1.2, "merge_gap_s": 2.8, "tail_pad_s": 1.2},
+}
+DEFAULT_PACING = "natural"
+
+# Tail trim ("cortar en la ultima frase con sentido", owner feature,
+# 2026-07-26): after build_edl assembles the kept segments, drop trailing
+# segments whose text is a low-content sign-off/goodbye (or empty/garbage --
+# e.g. a whisper end-of-clip hallucination loop) so the final segment ends on
+# the last sentence with real content, regardless of `pacing`. Conservative by
+# design: only strips segments matching the closer list below (case/accent/
+# punctuation-insensitive whole-text match) or the repeated-token hallucination
+# check in pipeline/ordering.py; a segment with any other content is never
+# touched, and the LAST remaining segment (even if it matches) is never
+# stripped -- there must always be at least one segment left standing (unless
+# there were none to begin with).
+TAIL_TRIM_ENABLED = True
+# Low-content trailing closers/sign-offs (Spanish-first -- this pipeline's
+# primary language), matched against a whole segment's normalized text (lower,
+# accents stripped, punctuation stripped). Deliberately short phrases only --
+# matching a substring of a real sentence would risk trimming into content.
+TAIL_TRIM_CLOSERS: tuple = (
+    "gracias",
+    "muchas gracias",
+    "gracias a todos",
+    "gracias por ver",
+    "gracias por vernos",
+    "gracias por escuchar",
+    "muchas gracias por escuchar",
+    "muchas gracias por ver",
+    "muchas gracias por vernos",
+    "nos vemos",
+    "nos vemos en el siguiente",
+    "nos vemos en el proximo",
+    "nos vemos en el proximo video",
+    "nos vemos la proxima",
+    "hasta la proxima",
+    "hasta luego",
+    "hasta pronto",
+    "adios",
+    "chau",
+    "chao",
+    "eso es todo",
+    "eso es todo por hoy",
+    "esto es todo",
+    "suscribete",
+    "suscribete al canal",
+    "dale like",
+    "dale like y suscribete",
+    "nos vemos en el siguiente video",
+    "bye",
+    "see you next time",
+    "thanks for watching",
+    "thank you for watching",
+    "subscribe",
+)
 
 # Reels
 REEL_MIN_S = 15.0

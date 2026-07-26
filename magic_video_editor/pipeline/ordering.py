@@ -136,6 +136,123 @@ def run(log, project: dict) -> None:
     store.save(project)
 
 
+def _globals_fallback_preset() -> dict:
+    from .. import config
+
+    return {
+        "head_pad_s": config.SEGMENT_PAD,
+        "merge_gap_s": config.MERGE_GAP,
+        "tail_pad_s": config.SEGMENT_PAD,
+    }
+
+
+def resolve_pacing_preset(project: dict) -> dict:
+    """Resolve the effective cutting-rhythm ("ritmo") knobs for `project`
+    (owner feature, 2026-07-26 -- manual-vs-auto comparison found the auto
+    cut too aggressive on head lead-in, mid-paragraph micro-breaths, and
+    tail). `project["pacing"]` is one of config.PACING_PRESETS' keys
+    ("tight"/"natural"/"airy" -- config.DEFAULT_PACING is "natural", tuned to
+    match the human reference cut: keep some breathing room, don't split a
+    1-2s breath mid-paragraph). Returns a dict with head_pad_s/merge_gap_s/
+    tail_pad_s.
+
+    A project with NO pacing set at all (the common case for every project
+    that existed before this feature, and any caller/test that builds a
+    project dict without the field -- e.g. scripts/test_intra_clip_order.py)
+    falls back to a preset built from the bare config.SEGMENT_PAD/MERGE_GAP
+    globals, i.e. IDENTICAL numeric behavior to before this feature existed --
+    "fall back to globals if pacing unset", verbatim. `config.DEFAULT_PACING`
+    ("natural") is the label a fresh project/the Settings UI defaults to
+    going forward (see settings.py's "pacing" default) for an EXPLICIT
+    selection; it is deliberately NOT silently substituted for a project that
+    has no pacing field, so existing padding/merge behavior never shifts out
+    from under a project that never opted in. An explicit but unrecognized
+    value also falls back to the bare globals (never raises -- this is a pure
+    read path, validation lives in api/projects.py's PATCH handler)."""
+    key = project.get("pacing")
+    if key is None:
+        return _globals_fallback_preset()
+    from .. import config
+
+    preset = config.PACING_PRESETS.get(key)
+    return preset if preset is not None else _globals_fallback_preset()
+
+
+def _normalize_for_closer_match(text: str) -> str:
+    """Lower + strip accents + strip everything but letters/digits/spaces,
+    collapse whitespace -- for matching a segment's full text against
+    config.TAIL_TRIM_CLOSERS. Deliberately whole-text (not substring): a
+    closer phrase embedded inside a longer, substantive sentence must NOT
+    trigger a trim."""
+    import re
+    import unicodedata
+
+    t = unicodedata.normalize("NFKD", text.lower())
+    t = "".join(c for c in t if not unicodedata.combining(c))
+    t = re.sub(r"[^a-z0-9 ]+", " ", t)
+    return " ".join(t.split())
+
+
+def _is_low_content_closer(text: str) -> bool:
+    """True if `text` normalizes to (or ends in, after stripping a leading
+    filler like "bueno"/"vale") one of config.TAIL_TRIM_CLOSERS, or is empty
+    after normalization. Conservative: exact whole-string match against the
+    closer list, not a substring/fuzzy match, so a real sentence that merely
+    mentions e.g. "gracias" mid-content is never caught."""
+    from .. import config
+
+    norm = _normalize_for_closer_match(text)
+    if not norm:
+        return True
+    return norm in config.TAIL_TRIM_CLOSERS
+
+
+def _is_hallucination_loop(text: str) -> bool:
+    """True if `text` looks like a whisper end-of-clip hallucination: the
+    same single short token repeated over and over (e.g. "gracias gracias
+    gracias gracias" or "si si si si si si"), with little else. Requires at
+    least 4 repeats of one token and that token accounting for essentially
+    the whole segment, so a legitimate sentence that merely repeats a word
+    once or twice for emphasis is never caught."""
+    norm = _normalize_for_closer_match(text)
+    words = norm.split()
+    if len(words) < 4:
+        return False
+    distinct = set(words)
+    if len(distinct) > 2:
+        return False
+    from collections import Counter
+
+    counts = Counter(words)
+    most_common_word, most_common_n = counts.most_common(1)[0]
+    return most_common_n >= 4 and most_common_n / len(words) >= 0.8
+
+
+def _trim_trailing_low_content(segments: list[dict]) -> list[dict]:
+    """TAIL = "cortar en la ultima frase con sentido" (owner feature,
+    2026-07-26): drop trailing segments whose text is a low-content sign-off/
+    goodbye, empty/garbage, or a repeated-token whisper hallucination, so the
+    final EDL ends on the last sentence with real content -- regardless of
+    `pacing`. Conservative by construction: only pops segments matching
+    _is_low_content_closer/_is_hallucination_loop, working backwards from the
+    end, and ALWAYS leaves at least one segment standing (never trims a
+    project down to nothing, and never inspects/trims anything but a
+    contiguous trailing run). No-ops entirely when config.TAIL_TRIM_ENABLED
+    is False."""
+    from .. import config
+
+    if not config.TAIL_TRIM_ENABLED or not segments:
+        return segments
+    kept = list(segments)
+    while len(kept) > 1:
+        text = kept[-1].get("text", "")
+        if _is_low_content_closer(text) or _is_hallucination_loop(text):
+            kept.pop()
+        else:
+            break
+    return kept
+
+
 def build_edl(project: dict, paragraph_break_after: set[str] | None = None) -> list[dict]:
     """Ordered render plan: kept sentences grouped into contiguous segments
     (per clip, merging small gaps), following clip_order.
@@ -154,11 +271,26 @@ def build_edl(project: dict, paragraph_break_after: set[str] | None = None) -> l
     (e.g. in tests) to bypass the project entirely. The resulting segment
     that starts right after such a boundary is tagged `paragraph_break: True`
     -- a hint for the UI/render, never auto-applied (the segment's own
-    `transition` stays whatever it already was / defaults to "none")."""
+    `transition` stays whatever it already was / defaults to "none").
+
+    Cutting rhythm ("ritmo", owner feature, 2026-07-26): `project["pacing"]`
+    (see resolve_pacing_preset) supplies merge_gap_s (used for the
+    adjacent-merge decision below, in place of the old flat config.MERGE_GAP)
+    and head_pad_s/tail_pad_s (used ONLY for the padding of the very first and
+    very last segment of the whole EDL -- the "head lead-in" and "tail"
+    dimensions the owner tuned; every other segment's padding is still the
+    original config.SEGMENT_PAD, unchanged). A paragraph break still forces a
+    split regardless of merge_gap_s -- checked exactly as before. After
+    assembly, a conservative tail-trim pass (_trim_trailing_low_content) drops
+    trailing low-content sign-off/hallucination segments so the cut ends on
+    the last MEANINGFUL sentence, independent of pacing."""
     from .. import config
 
     if paragraph_break_after is None:
         paragraph_break_after = set(project.get("paragraph_break_after_ids") or [])
+
+    pacing = resolve_pacing_preset(project)
+    merge_gap = pacing["merge_gap_s"]
 
     order = reconcile_clip_order(project)
     segments = []
@@ -172,7 +304,7 @@ def build_edl(project: dict, paragraph_break_after: set[str] | None = None) -> l
         for s in sents:
             if (
                 cur
-                and s["start"] - cur["end"] <= config.MERGE_GAP
+                and s["start"] - cur["end"] <= merge_gap
                 and cur_last_id not in paragraph_break_after
             ):
                 cur["end"] = s["end"]
@@ -193,9 +325,12 @@ def build_edl(project: dict, paragraph_break_after: set[str] | None = None) -> l
         if cur:
             segments.append(cur)
 
-    dur = store.get_clip  # noqa: F841  (clip lookup used below)
-    for seg in segments:
+    last_idx = len(segments) - 1
+    for i, seg in enumerate(segments):
         clip = store.get_clip(project, seg["clip_id"])
-        seg["start"] = max(0.0, seg["start"] - config.SEGMENT_PAD)
-        seg["end"] = min(clip["info"]["duration"], seg["end"] + config.SEGMENT_PAD)
-    return segments
+        pad_start = pacing["head_pad_s"] if i == 0 else config.SEGMENT_PAD
+        pad_end = pacing["tail_pad_s"] if i == last_idx else config.SEGMENT_PAD
+        seg["start"] = max(0.0, seg["start"] - pad_start)
+        seg["end"] = min(clip["info"]["duration"], seg["end"] + pad_end)
+
+    return _trim_trailing_low_content(segments)
