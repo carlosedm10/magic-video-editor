@@ -88,6 +88,55 @@ class ContextCheck(BaseModel):
     )
 
 
+class BlooperFlag(BaseModel):
+    """One sentence (by its number in the numbered full-clip transcript)
+    that is an abandoned/bad take of something said better LATER in the
+    SAME clip -- a repeat far enough apart that the chunked windowed passes
+    (transcript_cleaner/take_sequencer/context_check) can miss it. Flat
+    object, mirrors ContextFlag -- small-model friendly.
+
+    `superseded_by` (required, 2026-07-26 precision fix): a live-verification
+    run found the model auto-cutting topic-setup/transition sentences with
+    no genuine later restatement -- structurally forcing it to NAME the
+    specific later sentence it claims says the same thing better makes the
+    pass's actual job ("catch far-apart repeats the windowed passes missed")
+    explicit in the schema, not just the prompt; takes.py's
+    _full_clip_review then code-verifies this claim (real, later, kept, and
+    textually similar) before trusting it, rather than acting on confidence
+    alone."""
+
+    sentence_number: int = Field(
+        ..., description="Sentence number (from the numbered clip transcript)"
+    )
+    superseded_by: int = Field(
+        ...,
+        description="Sentence number (same numbered clip transcript) of the LATER "
+        "sentence that says essentially the same content better -- the specific "
+        "restatement this flag claims supersedes `sentence_number`. Never the same "
+        "number as sentence_number, never earlier, never invented.",
+    )
+    confidence: int = Field(
+        ..., ge=1, le=5, description="Confidence this is a superseded take, 1-5"
+    )
+    reason: str = Field(default="", description="One-line rationale")
+
+
+class BlooperReview(BaseModel):
+    """Whole-clip verdict (WS-C, "full-clip blooper-review pass"): given the
+    ENTIRE not-yet-cut, numbered sentence list of ONE clip, which sentences
+    are abandoned/bad takes of something said better later in this SAME
+    clip -- repeats far enough apart that the chunked 12/15/40-sentence
+    windowed passes can miss them? Flat, capped list -- same "small model,
+    small job" pattern as ContextCheck/TakeSequencer."""
+
+    flags: list[BlooperFlag] = Field(
+        default_factory=list,
+        max_length=20,
+        description="Sentences that are superseded/abandoned takes of a later, better "
+        "delivery in this same clip. Empty list if nothing qualifies.",
+    )
+
+
 class DedupJudge(BaseModel):
     """Judges whether two sentences from DIFFERENT clips say the same thing,
     and if so which one to keep. Flat schema, small-model friendly."""
@@ -145,6 +194,21 @@ class ClipOrder(BaseModel):
     notes: str = Field(default="", description="One-line rationale for the ordering")
 
 
+class ClipDigest(BaseModel):
+    """Cheap ~400-character digest of ONE clip's kept transcript, used by
+    pipeline/ordering.py's hierarchical clip listing when the full transcripts
+    of every clip together would not fit the clip_order model's context
+    window (see pipeline/token_budget.fits_context). Flat and single-clip on
+    purpose -- same "small model, small job" pattern as VideoTopic."""
+
+    summary: str = Field(
+        ...,
+        description="Concise summary of what this clip covers, ~400 characters, "
+        "in the transcript's own language -- enough for a narrative-ordering "
+        "judgement without the full text",
+    )
+
+
 class ReviewFinding(BaseModel):
     """One suggested issue in the full kept transcript (redundancy, repeated
     idea, off-topic tangent, or incoherent transition). Report-only — never
@@ -172,6 +236,33 @@ class ReviewFindings(BaseModel):
     itself."""
 
     findings: list[ReviewFinding] = Field(default_factory=list, max_length=8)
+
+
+class EditJudgeFinding(BaseModel):
+    """One finding from comparing the EDITED transcript against the
+    ORDERED-BUT-UNCUT originals (pipeline/judge.py, spec point 6). Report
+    only -- the judge never reorders and, outside the kept_blooper autocut
+    gate in judge.py itself, never cuts anything either."""
+
+    kind: Literal["lost_content", "kept_blooper", "order_issue", "incoherent_transition"] = Field(
+        ..., description="lost_content, kept_blooper, order_issue, or incoherent_transition"
+    )
+    sentence_ids: list[int] = Field(
+        default_factory=list,
+        description="Global sentence numbers (from the numbered input) this finding is about",
+    )
+    message: str = Field(
+        default="",
+        description="Short, concrete one-line explanation, in the transcript's own language",
+    )
+    severity: int = Field(..., ge=1, le=5, description="How serious this finding is, 1-5")
+
+
+class EditJudgeVerdict(BaseModel):
+    """Up to 10 conservative findings from one edit_judge pass. Aggregated
+    across several runs by pipeline/judge.py before anything is acted on."""
+
+    findings: list[EditJudgeFinding] = Field(default_factory=list, max_length=10)
 
 
 class CopywriterOutput(BaseModel):

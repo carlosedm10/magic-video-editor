@@ -260,6 +260,16 @@ class GithubLookupFallbackTests(unittest.TestCase):
 class EnsureOllamaRecoveryTests(unittest.TestCase):
     def setUp(self):
         ollama_manager.terminate()
+        # Force past the system-binary path regardless of whether this
+        # machine happens to have a system `ollama` install (e.g. a
+        # Homebrew-installed Ollama.app on /usr/local/bin/ollama) -- these
+        # tests are specifically about the bundled/download/retry state
+        # machine, and must never spawn a real system `ollama serve`.
+        self._system_binary_patch = mock.patch.object(
+            ollama_manager, "_system_binary_path", return_value=None
+        )
+        self._system_binary_patch.start()
+        self.addCleanup(self._system_binary_patch.stop)
 
     def tearDown(self):
         ollama_manager.terminate()

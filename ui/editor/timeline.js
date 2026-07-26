@@ -1258,8 +1258,12 @@ const Timeline = {
       el.classList.remove("dragging");
       window.removeEventListener("pointermove", onMove);
       window.removeEventListener("pointerup", onUp);
-      if (targetIndex !== startIndex) Editor.reorder(startIndex, targetIndex);
-      else Editor.select(startIndex);
+      if (targetIndex !== startIndex) {
+        const ok = Editor.reorder(startIndex, targetIndex);
+        if (!ok) showToast("Can't reorder: segments within a clip must stay chronological.");
+      } else {
+        Editor.select(startIndex);
+      }
     };
     window.addEventListener("pointermove", onMove);
     window.addEventListener("pointerup", onUp);

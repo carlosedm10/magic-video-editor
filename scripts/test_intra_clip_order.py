@@ -37,6 +37,7 @@ Usage:
 
 from __future__ import annotations
 
+import copy
 import os
 import random
 import shutil
@@ -44,6 +45,10 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest import mock
+
+from fastapi import HTTPException
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
@@ -52,7 +57,8 @@ _SCRATCH = Path(tempfile.mkdtemp(prefix="mve_intra_clip_order_test_"))
 os.environ["MVE_DATA"] = str(_SCRATCH)  # MUST happen before any magic_video_editor import
 
 from magic_video_editor import config, store  # noqa: E402
-from magic_video_editor.pipeline import ordering  # noqa: E402
+from magic_video_editor.api import edl as edl_api  # noqa: E402
+from magic_video_editor.pipeline import judge, ordering  # noqa: E402
 
 assert str(config.DATA_DIR) == str(_SCRATCH), (
     f"config.DATA_DIR ({config.DATA_DIR}) did not pick up MVE_DATA ({_SCRATCH}) -- "
@@ -122,6 +128,18 @@ def _build_project(sentence_order: list[dict], clip_order: list[str]) -> dict:
     ]
     project["sentences"] = sentence_order
     project["clip_order"] = clip_order
+    # Live-verification fix (2026-07-26): judge.run()'s concurrency-safe save
+    # (pipeline/judge.py's _save_judge_deltas) reloads the project FROM DISK
+    # at the end and reapplies only its own deltas onto that fresh copy (see
+    # that module's docstring, "Concurrency") -- by design, so a concurrent
+    # HTTP write during judge's long run never gets silently clobbered. That
+    # means any test that calls judge.run() against a project built here MUST
+    # have this mutated state actually persisted first, or judge reloads the
+    # stale, pre-mutation new_project() skeleton (empty clips/sentences/
+    # clip_order) and overwrites the in-memory project with THAT -- exactly
+    # what caused JudgeAutocutOnlyFlipsKeptTests to see an emptied
+    # project["sentences"] after judge.run() until this fix.
+    store.save(project)
     return project
 
 
@@ -268,6 +286,151 @@ class IntraClipChronologyIsNeverReordered(unittest.TestCase):
         all_text = " ".join(seg["text"] for seg in segments)
         for cut_id in ("a-cut", "b-cut", "c-cut"):
             self.assertNotIn(cut_id, all_text, f"cut sentence {cut_id} leaked into the EDL")
+
+
+class EdlSameClipGuardTests(unittest.TestCase):
+    """api/edl.py's `_validate_segments` chronology guardrail: a manual PUT
+    /edl may move a whole clip's block of segments elsewhere in the
+    timeline, but the segments belonging to any ONE clip_id must never come
+    out of chronological (start-ascending) order relative to each other."""
+
+    def _project(self) -> dict:
+        return _build_project(list(_RAW_SENTENCES), [CLIP_A, CLIP_B, CLIP_C])
+
+    def _seg(self, clip_id: str, start: float, end: float) -> edl_api.EdlSegment:
+        return edl_api.EdlSegment(clip_id=clip_id, start=start, end=end, text="")
+
+    def test_whole_clip_block_reorder_is_allowed(self):
+        """Moving clip B's entire (still-chronological) segment block ahead
+        of clip A's is a legitimate between-clips reorder -- must not raise."""
+        project = self._project()
+        segments = [
+            self._seg(CLIP_B, 0.5, 1.0),
+            self._seg(CLIP_B, 2.0, 2.5),
+            self._seg(CLIP_A, 1.0, 2.0),
+            self._seg(CLIP_A, 10.0, 11.0),
+        ]
+        edl_api._validate_segments(project, segments)  # must not raise
+
+    def test_within_clip_reorder_is_rejected(self):
+        """Two segments of the SAME clip_id submitted out of start order
+        (the sacred invariant) must be rejected with a 400, even though each
+        segment individually is a valid, in-bounds range."""
+        project = self._project()
+        segments = [
+            self._seg(CLIP_A, 10.0, 11.0),  # a2 (start=10) BEFORE a1 (start=1) -- illegal
+            self._seg(CLIP_A, 1.0, 2.0),
+        ]
+        with self.assertRaises(HTTPException) as ctx:
+            edl_api._validate_segments(project, segments)
+        self.assertEqual(ctx.exception.status_code, 400)
+        self.assertIn("out of chronological order", ctx.exception.detail)
+
+    def test_within_clip_reorder_rejected_even_amid_other_valid_clips(self):
+        """The guard is scoped per clip_id -- clip C being perfectly
+        chronological must not mask clip A's own segments being flipped."""
+        project = self._project()
+        segments = [
+            self._seg(CLIP_C, 0.05, 0.4),
+            self._seg(CLIP_C, 20.0, 21.0),
+            self._seg(CLIP_A, 30.0, 31.0),  # a3 (start=30) BEFORE a2 (start=10) -- illegal
+            self._seg(CLIP_A, 10.0, 11.0),
+        ]
+        with self.assertRaises(HTTPException) as ctx:
+            edl_api._validate_segments(project, segments)
+        self.assertEqual(ctx.exception.status_code, 400)
+        self.assertIn(CLIP_A, ctx.exception.detail)
+
+
+class JudgeAutocutOnlyFlipsKeptTests(unittest.TestCase):
+    """pipeline/judge.py's one auto-apply exception (a majority, every-run
+    high-severity kept_blooper finding) must ONLY ever flip a sentence's
+    `kept` flag -- start/end/clip_id and the sentences list's own order must
+    survive byte-for-byte identical."""
+
+    def _make_fake_agent(self, target_number: int):
+        """First JUDGE_RUNS calls (pass 1) all agree on one high-severity
+        kept_blooper finding pointing at `target_number` (majority + every
+        contributing run >= JUDGE_AUTOCUT_SEVERITY -> eligible_autocut);
+        every subsequent call (pass 2+) reports nothing, so the judge
+        converges and stops."""
+        fake_agent = mock.Mock()
+        calls = {"n": 0}
+
+        def _run_sync(prompt: str):
+            calls["n"] += 1
+            if calls["n"] <= config.JUDGE_RUNS:
+                finding = SimpleNamespace(
+                    kind="kept_blooper",
+                    sentence_ids=[target_number],
+                    message="camera check blooper, cut it",
+                    severity=config.JUDGE_AUTOCUT_SEVERITY,
+                )
+                return SimpleNamespace(output=SimpleNamespace(findings=[finding]))
+            return SimpleNamespace(output=SimpleNamespace(findings=[]))
+
+        fake_agent.run_sync.side_effect = _run_sync
+        return fake_agent
+
+    def test_autocut_flips_only_kept_never_start_end_clip_id_or_order(self):
+        project = _build_project(list(_RAW_SENTENCES), [CLIP_A, CLIP_B, CLIP_C])
+        # "a2" (clip A, start=10.0) is the 3rd sentence in the shared
+        # clip_order numbering built by judge._numbered_transcripts (see
+        # module docstring's per-clip start-sorted numbering): a1=1,
+        # a-cut=2, a2=3, ...
+        target_number = 3
+        _, _, id_map = judge._numbered_transcripts(project)
+        self.assertEqual(id_map[target_number], "a2")
+
+        before = copy.deepcopy(project["sentences"])
+        before_order = [s["id"] for s in project["sentences"]]
+
+        fake_agent = self._make_fake_agent(target_number)
+        with (
+            mock.patch("magic_video_editor.llm.available", return_value=True),
+            mock.patch(
+                "magic_video_editor.agents.agents.get_agent", return_value=fake_agent
+            ),
+        ):
+            judge.run(_no_log, project)
+
+        after = project["sentences"]
+        after_order = [s["id"] for s in after]
+
+        # List identity/order untouched -- no reorder, no insert/delete.
+        self.assertEqual(after_order, before_order)
+
+        by_id_before = {s["id"]: s for s in before}
+        for s in after:
+            b = by_id_before[s["id"]]
+            self.assertEqual(s["start"], b["start"], f"{s['id']}: start must never change")
+            self.assertEqual(s["end"], b["end"], f"{s['id']}: end must never change")
+            self.assertEqual(
+                s["clip_id"], b["clip_id"], f"{s['id']}: clip_id must never change"
+            )
+            if s["id"] == "a2":
+                self.assertFalse(s["kept"], "targeted kept_blooper sentence must be auto-cut")
+            else:
+                self.assertEqual(
+                    s["kept"],
+                    b["kept"],
+                    f"{s['id']}: kept must be untouched by an unrelated finding",
+                )
+
+        # The auto-cut invalidates the cached EDL (same convention as a
+        # manual reorder) so the next read recomputes it from the new
+        # kept-flags -- but build_edl itself must still honor chronology.
+        self.assertIsNone(project.get("edl"))
+        segments = ordering.build_edl(project)
+        by_clip = _segments_by_clip(segments)
+        clip_a_starts = [s["start"] for s in by_clip[CLIP_A]]
+        self.assertEqual(clip_a_starts, sorted(clip_a_starts))
+        # a2 (start=10.0) must no longer surface as its own segment.
+        self.assertNotIn("a2", " ".join(seg["text"] for seg in segments))
+
+
+def _no_log(msg: str) -> None:
+    pass
 
 
 if __name__ == "__main__":

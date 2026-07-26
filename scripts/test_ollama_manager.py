@@ -225,6 +225,15 @@ class LiveBundledSpawnTest(unittest.TestCase):
         config.OLLAMA_URL = "http://127.0.0.1:8848"  # dead port, in the 8846-8848 test range
         self.om.terminate()
 
+        # Force the bundled path regardless of whether this machine happens
+        # to have a system `ollama` install (shutil.which OR one of the
+        # _EXTRA_SYSTEM_OLLAMA_PATHS, e.g. a Homebrew-installed Ollama.app --
+        # this test is specifically about the bundled-binary spawn, not the
+        # system one.
+        self._which_patch = mock.patch.object(self.om, "_system_binary_path", return_value=None)
+        self._which_patch.start()
+        self.addCleanup(self._which_patch.stop)
+
     def tearDown(self):
         self.om.terminate()
         self.config.DATA_DIR = self._orig_data_dir
@@ -279,6 +288,15 @@ class DownloadFallbackTest(unittest.TestCase):
         config.DATA_DIR = Path(self.tmp.name)
         config.OLLAMA_URL = "http://127.0.0.1:8847"  # dead port
         self.om.terminate()
+
+        # Force past the system-binary path regardless of whether this
+        # machine happens to have a system `ollama` install (shutil.which OR
+        # one of the _EXTRA_SYSTEM_OLLAMA_PATHS, e.g. a Homebrew-installed
+        # Ollama.app) -- this test is specifically about the
+        # self-provisioning download fallback.
+        self._which_patch = mock.patch.object(self.om, "_system_binary_path", return_value=None)
+        self._which_patch.start()
+        self.addCleanup(self._which_patch.stop)
 
         # Rename the real vendor binary out of the way for the duration of
         # this test so bundled_binary_path() really returns None.

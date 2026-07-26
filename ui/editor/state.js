@@ -28,6 +28,21 @@ function _withClientId(s) {
 function _cloneSegments(segs) {
   return segs.map((s) => ({ ...s, transition: { ...(s.transition || { type: "none", duration: 0.5 }) } }));
 }
+/* Manual-edit chronology guardrail (mirrors api/edl.py's _validate_segments):
+   within one original clip, segment order is chronological and immutable.
+   A whole contiguous block of a clip's segments may be moved elsewhere in
+   the timeline, but segments sharing a clip_id must never appear out of
+   chronological order relative to each other -- that would mean a drag
+   reordered segments WITHIN a clip rather than moving a whole clip block. */
+function _clipOrderValid(segs) {
+  const lastStartByClip = new Map();
+  for (const s of segs) {
+    const prev = lastStartByClip.get(s.clip_id);
+    if (prev !== undefined && s.start < prev) return false;
+    lastStartByClip.set(s.clip_id, s.start);
+  }
+  return true;
+}
 function _setSaveState(text, isError) {
   const el = document.getElementById("tl-save-state");
   if (!el) return;
@@ -523,7 +538,38 @@ const Editor = {
     v = Math.max(0, Math.min(v, dur));
     if (field === "start") v = Math.min(v, s.end - 0.1);
     else v = Math.max(v, s.start + 0.1);
-    s[field] = Math.round(v * 1000) / 1000;
+    v = Math.round(v * 1000) / 1000;
+
+    if (field === "start") {
+      /* Same-clip chronology guard (mirrors _clipOrderValid, the same check
+         reorder() uses): when a clip appears in more than one block on the
+         timeline, trimming one block's start against only its own end/clip
+         duration isn't enough -- it can cross a sibling block's start and
+         put same-clip segments out of chronological array order, which the
+         backend PUT then rejects with no rollback. Clamp to the tightest
+         legal bound instead of rejecting outright -- trimming should still
+         feel smooth, and clamping-at-bound is standard editor behavior. The
+         feasible range for s.start is a contiguous interval (bounded below
+         by the previous same-clip segment's start, if any, and above by the
+         next one's), so a binary search between the untouched original
+         value (known valid) and the requested v converges on the tightest
+         legal value using the exact same validity check reorder() uses. */
+      const original = s.start;
+      s.start = v;
+      if (!_clipOrderValid(segs)) {
+        let lo = original;
+        let hi = v;
+        for (let iter = 0; iter < 30; iter++) {
+          const mid = Math.round(((lo + hi) / 2) * 1000) / 1000;
+          s.start = mid;
+          if (_clipOrderValid(segs)) lo = mid; else hi = mid;
+        }
+        s.start = lo;
+      }
+    } else {
+      s.end = v;
+    }
+
     const name = this.clip(s.clip_id)?.filename || s.clip_id;
     this.commit(segs, { select: i, label: `Trim ${name} ${field}` });
   },
@@ -544,11 +590,13 @@ const Editor = {
   },
 
   reorder(fromIndex, toIndex) {
-    if (fromIndex === toIndex) return;
+    if (fromIndex === toIndex) return true;
     const segs = _cloneSegments(this.segments);
     const [moved] = segs.splice(fromIndex, 1);
     segs.splice(toIndex, 0, moved);
+    if (!_clipOrderValid(segs)) return false;
     this.commit(segs, { select: toIndex, label: "Reorder" });
+    return true;
   },
 
   deleteSelected() {

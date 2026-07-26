@@ -29,6 +29,16 @@ DEFAULTS: dict = {
         "reel_scorer": None,
         "reviewer": None,
         "dedup_judge": None,
+        "edit_judge": None,
+        # Root-cause fix (2026-07-26): clip_digest (pipeline/ordering.py) and
+        # blooper_reviewer (pipeline/takes.py) are real LLM tasks that were
+        # missing here entirely -- model_for() would still fall back to
+        # default_model for them via dict.get, but users had no way to set a
+        # per-task override for either. See api/settings.py's TASKS tuple and
+        # api/pipeline.py's LLM_TASKS_BY_STAGE (RAM/installed preflight guard)
+        # for the other two places this same gap needed fixing.
+        "clip_digest": None,
+        "blooper_reviewer": None,
     },
     "whisper_model": config.WHISPER_MODEL,
     # Field bug follow-up (2026-07-25): whisper's per-clip auto language

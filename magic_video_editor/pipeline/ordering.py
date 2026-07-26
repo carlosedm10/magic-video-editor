@@ -2,17 +2,147 @@
 reads each clip's (kept) transcript and proposes the order that makes the
 dialog flow. v1 orders at CLIP granularity and keeps in-clip chronology —
 much more robust with local models than sentence-level shuffling.
-The result is editable in the UI."""
+The result is editable in the UI.
 
-from .. import llm, store
+v6 (2026-07-26, "full-context clip ordering"): the listing sent to the
+clip_order agent used to blindly truncate each clip's text to 1200 chars.
+Replaced with a hierarchical strategy (see _build_clip_listing): if every
+clip's FULL kept text fits the resolved model's context window
+(token_budget.fits_context), send it all verbatim; otherwise compress each
+clip to a cheap ~400-char digest (the clip_digest agent) instead of a naive
+substring cut. Also tries a hardware-appropriate "thinking"/reasoning model
+first, degrading to the task's normal model + forced digests if that isn't
+installed/doesn't fit this machine (see _resolve_ordering_model)."""
+
+import datetime
+
+from .. import llm, settings, store
+from . import token_budget
+
+
+def _clip_kept_text(project: dict, clip_id: str) -> str:
+    """FULL kept-sentence text for one clip, no truncation -- see
+    _build_clip_listing for how (and whether) this gets sent verbatim."""
+    kept = [s for s in project["sentences"] if s["clip_id"] == clip_id and s["kept"]]
+    return " ".join(s["text"] for s in kept)
 
 
 def _clip_summary_text(project: dict, clip_id: str, max_chars: int = 1200) -> str:
-    kept = [s for s in project["sentences"] if s["clip_id"] == clip_id and s["kept"]]
-    text = " ".join(s["text"] for s in kept)
+    """Truncated single-clip summary -- kept for pipeline/placement.py's
+    one-line-per-existing-clip listing (a much smaller prompt than the full
+    clip_order listing, so the old blind truncation is still appropriate
+    there). The clip_order listing itself no longer calls this -- see
+    _build_clip_listing's hierarchical full-text/digest strategy."""
+    text = _clip_kept_text(project, clip_id)
     if len(text) > max_chars:
         text = text[: max_chars // 2] + " [...] " + text[-max_chars // 2 :]
     return text
+
+
+def _format_recorded_at(recorded_at: float | None) -> str | None:
+    """Human-readable local timestamp for a clip's `recorded_at` epoch
+    float, or None when there's nothing to show (the CLIP_ORDER line is
+    simply omitted in that case -- see _build_clip_listing)."""
+    if recorded_at is None:
+        return None
+    try:
+        return datetime.datetime.fromtimestamp(recorded_at).strftime("%Y-%m-%d %H:%M:%S")
+    except (OSError, OverflowError, ValueError, TypeError):
+        return None
+
+
+def _digest_clip_text(log, clip_id: str, text: str) -> str:
+    """Compress one clip's full kept text to a cheap ~400-char digest via the
+    clip_digest agent. Fail-open (per new-LLM-call convention): any failure
+    here is logged and falls back to the OLD blind-truncation behavior for
+    just this one clip, so one bad ollama call never breaks the whole
+    ordering stage."""
+    from ..agents.agents import get_agent
+
+    try:
+        result = get_agent("clip_digest").run_sync(text).output
+        return result.summary
+    except Exception as e:
+        log(f"clip_digest failed for clip {clip_id} ({e}); using truncated text instead")
+        max_chars = 1200
+        if len(text) > max_chars:
+            return text[: max_chars // 2] + " [...] " + text[-max_chars // 2 :]
+        return text
+
+
+def _resolve_ordering_model(task_model: str) -> tuple[str, bool]:
+    """Degrade ladder for the clip_order call's model (thinking-model tiers,
+    2026-07-26; widened 2026-07-26 live-verification, gate 3c): prefer a
+    hardware-appropriate "thinking"/reasoning model for the extra narrative-
+    reasoning quality on a full-context listing.
+
+    Originally this only ever tried THIS machine's own tier's "best" pick
+    (api.ollama.recommended_thinking_model()) and gave up the instant that
+    one name wasn't installed -- verified live on a real 48GB machine with
+    deepseek-r1:14b installed but no qwen3:* models installed: the ladder
+    fell all the way back to the plain task model + forced digests, never
+    considering deepseek-r1:14b even though it's the 24GB tier's "optimal"
+    pick and comfortably fits. Now uses
+    api.ollama.recommended_installed_thinking_model(), which scans every
+    tier at or BELOW this machine's own tier (best, then optimal, at each)
+    for the first candidate that's actually installed and fits -- reusing
+    the same installed+RAM checks as preflight_check_models via the
+    non-raising model_installed_and_fits() helper under the hood, so a
+    fully-empty ladder (nothing installed) still degrades gracefully instead
+    of blowing up this stage.
+
+    Returns (model_name, force_digest):
+      - a thinking model is installed -> (thinking_model, force_digest=False)
+        -- full-text path is attempted (still gated by fits_context).
+      - none of the ladder is installed -> (task_model, force_digest=True) --
+        the task's normally configured model, with digests forced regardless
+        of fits_context (a smaller/less-capable model gets a smaller prompt).
+    The final safety net beyond this is run()'s own try/except around the
+    actual agent call, which keeps file order on any remaining failure."""
+    from ..api import ollama as ollama_api
+
+    try:
+        thinking_model = ollama_api.recommended_installed_thinking_model()
+        if thinking_model:
+            return thinking_model, False
+    except Exception:
+        pass  # never let a thinking-tier lookup crash/hang ordering
+    return task_model, True
+
+
+def _build_clip_listing(
+    log, project: dict, clip_ids: list[str], model_name: str, force_digest: bool = False
+) -> str:
+    """Hierarchical clip listing for the clip_order prompt: each clip's
+    FULL kept text if the whole listing fits `model_name`'s context window
+    (and `force_digest` isn't set -- see _resolve_ordering_model's degrade
+    ladder), otherwise a cheap per-clip digest (NEVER a naive substring
+    truncation). Each clip line also gets a human-readable RECORDED line
+    when the clip's recorded_at is known (omitted otherwise) -- see
+    CLIP_ORDER_SYSTEM_PROMPT for how the model is told to treat it (a soft
+    hint only)."""
+    full_texts = {cid: _clip_kept_text(project, cid) for cid in clip_ids}
+    total_tokens = sum(token_budget.estimate_tokens(t) for t in full_texts.values())
+
+    use_full_text = not force_digest and token_budget.fits_context(total_tokens, model_name)
+    if use_full_text:
+        texts = full_texts
+    else:
+        log(
+            f"Full clip text ({total_tokens} est. tokens) doesn't fit "
+            f"{model_name}'s context window -- digesting each clip first..."
+        )
+        texts = {cid: _digest_clip_text(log, cid, full_texts[cid]) for cid in clip_ids}
+
+    lines = []
+    for i, cid in enumerate(clip_ids):
+        clip = store.get_clip(project, cid)
+        header = f"CLIP {i} ({clip['filename']}):"
+        recorded = _format_recorded_at(clip.get("recorded_at"))
+        if recorded:
+            header += f"\nRECORDED: {recorded}"
+        lines.append(f"{header}\n{texts[cid]}")
+    return "\n\n".join(lines)
 
 
 def _clips_with_kept_sentences(project: dict) -> list[str]:
@@ -112,16 +242,46 @@ def run(log, project: dict) -> None:
         log("Ollama not reachable; kept file order. Reorder manually in the Edit tab.")
         return
 
-    listing = "\n\n".join(
-        f"CLIP {i} ({store.get_clip(project, cid)['filename']}):\n"
-        f"{_clip_summary_text(project, cid)}"
-        for i, cid in enumerate(clip_ids)
-    )
+    task_model = settings.model_for("clip_order")
+    model_name, force_digest = _resolve_ordering_model(task_model)
+    listing = _build_clip_listing(log, project, clip_ids, model_name, force_digest=force_digest)
+    listing_tokens = token_budget.estimate_tokens(listing)
+    num_ctx = token_budget.num_ctx_for(listing_tokens, model_name)
+
     from ..agents.agents import get_agent
 
-    log(f"Asking the clip-order agent to order {len(clip_ids)} clips by narrative flow...")
+    log(
+        f"Asking the clip-order agent ({model_name}) to order {len(clip_ids)} "
+        "clips by narrative flow..."
+    )
     try:
-        result = get_agent("clip_order").run_sync(listing).output
+        agent = get_agent("clip_order", model_override=model_name)
+        # LIVE-VERIFICATION FINDING (2026-07-26, see token_budget.py's module
+        # docstring for the full writeup): this `extra_body` passthrough is
+        # confirmed to be a NO-OP against a real Ollama daemon -- pydantic_ai's
+        # OllamaModel only ever talks to the OpenAI-compatible
+        # /v1/chat/completions endpoint, which silently drops
+        # `options`/`num_ctx` whether nested under `extra_body` or sent bare
+        # (verified live: `ollama ps`'s loaded CONTEXT never changed no
+        # matter what was sent here). Only Ollama's NATIVE /api/chat honors
+        # `options.num_ctx`, and nothing in this app's agent layer uses that
+        # endpoint. Kept anyway as harmless forward-compat (costs nothing,
+        # and a future Ollama/pydantic_ai release -- or a different
+        # OpenAI-compatible backend -- might start honoring it); it does NOT
+        # get dropped by pydantic_ai's own settings merge (merge_model_
+        # settings does a shallow dict `|`, so this survives alongside the
+        # Agent's own `temperature` from agents.py's _MODEL_SETTINGS -- both
+        # keys coexist, confirmed empirically, nothing here is lost). The
+        # REAL guards are `fits_context` (decides full-text vs. digest
+        # BEFORE this call, so the prompt itself never assumes a bigger
+        # window than the model has) and ollama_manager.py's
+        # OLLAMA_CONTEXT_LENGTH=32768 env var on any daemon this app spawns
+        # (never a user's already-running "system" daemon), which keeps the
+        # daemon's own default window matched to token_budget's assumptions.
+        result = agent.run_sync(
+            listing,
+            model_settings={"extra_body": {"options": {"num_ctx": num_ctx}}},
+        ).output
         order = [int(x) for x in result.order]
         if sorted(order) != list(range(len(clip_ids))):
             raise ValueError(f"not a permutation: {order}")

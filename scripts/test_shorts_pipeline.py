@@ -115,7 +115,17 @@ class RunAllExcludesReelsTests(unittest.TestCase):
         self.assertEqual(pipeline.STAGE_ORDER[-1], "render")
         self.assertEqual(
             pipeline.STAGE_ORDER,
-            ["ingest", "sync", "transcribe", "takes", "order", "paragraphs", "review", "render"],
+            [
+                "ingest",
+                "sync",
+                "transcribe",
+                "takes",
+                "order",
+                "paragraphs",
+                "review",
+                "judge",
+                "render",
+            ],
         )
 
     def test_reels_stage_still_registered_for_standalone_use(self):

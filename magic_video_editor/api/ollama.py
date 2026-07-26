@@ -431,6 +431,155 @@ _RECOMMENDATION_TIERS: list[dict] = [
 ]
 
 
+# "Thinking"/reasoning-tuned tier table (2026-07-26, workstream D --
+# pipeline/ordering.py's full-context clip ordering), mirroring
+# _RECOMMENDATION_TIERS' shape and RAM boundaries (48/24/16/0) exactly, but
+# curated for reasoning models that benefit narrative-ordering judgements:
+# qwen3's thinking variants and deepseek-r1's distills. Same "best"/"optimal"
+# one-tier-apart pairing convention as _RECOMMENDATION_TIERS.
+_THINKING_MODEL_TIERS: list[dict] = [
+    {
+        "min_ram_gb": 48,
+        "best": {
+            "model": "qwen3:32b",
+            "size_gb": 20.0,
+            "why": "Strongest thinking model that still fits comfortably on 48GB+.",
+        },
+        "optimal": {
+            "model": "qwen3:14b",
+            "size_gb": 9.0,
+            "why": "One tier down: faster, still a strong reasoner.",
+        },
+    },
+    {
+        "min_ram_gb": 24,
+        "best": {
+            "model": "qwen3:14b",
+            "size_gb": 9.0,
+            "why": "Best reasoning quality that comfortably fits 24-32GB of RAM.",
+        },
+        "optimal": {
+            "model": "deepseek-r1:14b",
+            "size_gb": 9.0,
+            "why": "Alternate reasoning-distill pick at the same size.",
+        },
+    },
+    {
+        "min_ram_gb": 16,
+        "best": {
+            "model": "qwen3:8b",
+            "size_gb": 5.2,
+            "why": "Solid reasoning quality that fits well within 16GB.",
+        },
+        "optimal": {
+            "model": "deepseek-r1:7b",
+            "size_gb": 4.7,
+            "why": "Lighter reasoning-distill alternative.",
+        },
+    },
+    {
+        "min_ram_gb": 0,
+        "best": {
+            "model": "qwen3:4b",
+            "size_gb": 2.6,
+            "why": "Small thinking model that fits safely on lower-RAM Macs.",
+        },
+        "optimal": {
+            "model": "llama3.2:3b",
+            "size_gb": 2.0,
+            "why": "Non-thinking fallback when even qwen3:4b is too tight.",
+        },
+    },
+]
+
+
+def _pick_thinking_tier(ram_gb: float) -> dict:
+    for tier in _THINKING_MODEL_TIERS:
+        if ram_gb >= tier["min_ram_gb"]:
+            return tier
+    return _THINKING_MODEL_TIERS[-1]
+
+
+def recommended_thinking_model() -> str:
+    """Hardware-aware "thinking"/reasoning model recommendation, mirroring
+    recommended_default_model() but against _THINKING_MODEL_TIERS. Falls back
+    to the bottom tier's pick only if psutil (or anything else here) blows
+    up, so this never raises."""
+    try:
+        ram_gb = psutil.virtual_memory().total / (1024**3)
+        tier = _pick_thinking_tier(ram_gb)
+        return tier["best"]["model"]
+    except Exception:
+        return "qwen3:4b"
+
+
+def model_installed_and_fits(model_name: str) -> bool:
+    """Non-raising twin of preflight_check_models() for a SINGLE model:
+    True only if Ollama is reachable, `model_name` is actually installed, and
+    its real installed size fits this machine's RAM (not "too_big" per
+    _compatibility). Reuses the exact same checks as preflight_check_models,
+    but returns False instead of raising on ANY failure (unreachable Ollama,
+    timeout, not installed, too big, or any unexpected error) -- meant for a
+    caller like pipeline/ordering.py's thinking-model degrade ladder that
+    wants to proactively probe availability and quietly fall back, never
+    hang or crash the calling stage just because a bigger reasoning model
+    isn't there."""
+    if not model_name:
+        return False
+    try:
+        preflight_check_models([model_name])
+        return True
+    except Exception:
+        return False
+
+
+# --------------------------------------------------------------------------
+# Live-verification fix (2026-07-26, gate 3c): recommended_thinking_model()
+# only ever proposes THIS machine's own tier's "best" pick (e.g. qwen3:32b on
+# a 48GB Mac) and pipeline/ordering.py's old degrade ladder gave up entirely
+# the instant that one name wasn't installed -- even when a perfectly good
+# thinking model from a LOWER tier (e.g. deepseek-r1:14b, the 24GB tier's
+# "optimal" pick) was already installed and would easily fit. Real machine
+# this was verified against: 48GB RAM, deepseek-r1:14b installed, qwen3:*
+# NOT installed -- the old ladder silently fell back to the plain task model
+# + forced digests, never trying deepseek-r1:14b at all.
+#
+# recommended_installed_thinking_model() fixes this by scanning every tier
+# at or BELOW this machine's own tier (top to bottom, "best" then "optimal"
+# at each), returning the first candidate that's actually installed and fits
+# -- never a tier ABOVE this machine's (that would defeat the RAM-fit
+# purpose of having tiers at all). Returns None (never raises, never hangs --
+# each candidate check is model_installed_and_fits()'s already-bounded,
+# non-raising single /api/tags round trip) if nothing in the whole ladder is
+# installed, so the caller can fall back to its own plain task model.
+# --------------------------------------------------------------------------
+
+
+def recommended_installed_thinking_model() -> str | None:
+    """Hardware-aware thinking-model pick that's actually INSTALLED: scans
+    _THINKING_MODEL_TIERS from this machine's own tier down to the smallest
+    (best pick, then optimal pick, at each tier), returning the first name
+    that model_installed_and_fits() confirms. None if nothing in the ladder
+    is installed/reachable -- never raises."""
+    try:
+        ram_gb = psutil.virtual_memory().total / (1024**3)
+    except Exception:
+        return None
+
+    start_idx = len(_THINKING_MODEL_TIERS) - 1
+    for i, tier in enumerate(_THINKING_MODEL_TIERS):
+        if ram_gb >= tier["min_ram_gb"]:
+            start_idx = i
+            break
+
+    for tier in _THINKING_MODEL_TIERS[start_idx:]:
+        for pick_key in ("best", "optimal"):
+            name = tier[pick_key]["model"]
+            if model_installed_and_fits(name):
+                return name
+    return None
+
+
 def _get_cpu_brand() -> str:
     try:
         import subprocess

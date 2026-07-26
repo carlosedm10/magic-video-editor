@@ -220,7 +220,7 @@ const fmtT = (t) => {
 const STAGES = [
   ["ingest", "1 Ingest"], ["sync", "2 Sync"], ["transcribe", "3 Transcribe"],
   ["takes", "4 Takes"], ["order", "5 Order"], ["review", "6 Review"],
-  ["render", "7 Render"],
+  ["judge", "7 Judge"], ["render", "8 Render"],
 ];
 // Friendly labels for the run-all progress panel (spec: Pipeline orchestration UX).
 // Mirrors magic_video_editor/api/pipeline.py's STAGE_LABELS — keep in lockstep.
@@ -229,7 +229,7 @@ const STAGES = [
 const STAGE_LABELS = {
   ingest: "Reading files", sync: "Syncing cameras", transcribe: "Transcribing",
   takes: "Analyzing takes", order: "Ordering the story", review: "Checking for suggestions",
-  render: "Editing the video", reels: "Making shorts",
+  judge: "Judging the edit", render: "Editing the video", reels: "Making shorts",
 };
 
 window.TABS = window.TABS || {};

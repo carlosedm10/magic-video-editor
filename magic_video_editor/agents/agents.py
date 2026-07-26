@@ -18,11 +18,14 @@ from pydantic_ai.providers.ollama import OllamaProvider
 
 from .. import config, settings
 from .prompts import (
+    CLIP_DIGEST_SYSTEM_PROMPT,
     CLIP_ORDER_SYSTEM_PROMPT,
     CLIP_PLACEMENT_SYSTEM_PROMPT,
     CONTEXT_CHECK_SYSTEM_PROMPT,
     COPYWRITER_SYSTEM_PROMPT,
     DEDUP_JUDGE_SYSTEM_PROMPT,
+    EDIT_JUDGE_SYSTEM_PROMPT,
+    FULL_CLIP_REVIEW_SYSTEM_PROMPT,
     PARAGRAPH_BREAK_SYSTEM_PROMPT,
     REEL_COMPOSER_SYSTEM_PROMPT,
     REEL_DEDUP_SYSTEM_PROMPT,
@@ -34,11 +37,14 @@ from .prompts import (
     VIDEO_TOPIC_SYSTEM_PROMPT,
 )
 from .schemas import (
+    BlooperReview,
+    ClipDigest,
     ClipOrder,
     ClipPlacement,
     ContextCheck,
     CopywriterOutput,
     DedupJudge,
+    EditJudgeVerdict,
     ParagraphBreaks,
     ReelComposer,
     ReelDedup,
@@ -85,6 +91,7 @@ _PROMPTED_OUTPUT_TASKS: set[str] = set()
 AGENT_SPECS: dict[str, dict] = {
     "take_judge": {"prompt": TAKE_JUDGE_SYSTEM_PROMPT, "output_type": TakePick},
     "clip_order": {"prompt": CLIP_ORDER_SYSTEM_PROMPT, "output_type": ClipOrder},
+    "clip_digest": {"prompt": CLIP_DIGEST_SYSTEM_PROMPT, "output_type": ClipDigest},
     "paragraph_break": {"prompt": PARAGRAPH_BREAK_SYSTEM_PROMPT, "output_type": ParagraphBreaks},
     "reel_scorer": {"prompt": REEL_SCORER_SYSTEM_PROMPT, "output_type": ReelScore},
     "reel_composer": {"prompt": REEL_COMPOSER_SYSTEM_PROMPT, "output_type": ReelComposer},
@@ -98,8 +105,13 @@ AGENT_SPECS: dict[str, dict] = {
         "output_type": TakeSequencer,
     },
     "reviewer": {"prompt": REVIEWER_SYSTEM_PROMPT, "output_type": ReviewFindings},
+    "edit_judge": {"prompt": EDIT_JUDGE_SYSTEM_PROMPT, "output_type": EditJudgeVerdict},
     "video_topic": {"prompt": VIDEO_TOPIC_SYSTEM_PROMPT, "output_type": VideoTopic},
     "context_check": {"prompt": CONTEXT_CHECK_SYSTEM_PROMPT, "output_type": ContextCheck},
+    "blooper_reviewer": {
+        "prompt": FULL_CLIP_REVIEW_SYSTEM_PROMPT,
+        "output_type": BlooperReview,
+    },
     "dedup_judge": {"prompt": DEDUP_JUDGE_SYSTEM_PROMPT, "output_type": DedupJudge},
     "copywriter": {"prompt": COPYWRITER_SYSTEM_PROMPT, "output_type": CopywriterOutput},
     "clip_placement": {"prompt": CLIP_PLACEMENT_SYSTEM_PROMPT, "output_type": ClipPlacement},
@@ -126,13 +138,20 @@ def _model(model_name: str) -> OllamaModel:
     )
 
 
-def get_agent(task: str) -> Agent:
+def get_agent(task: str, model_override: str | None = None) -> Agent:
     """Resolve the model for `task` from settings (task_models[task] or
     default_model) and return a cached Agent for that (task, model) pair,
-    constructing it lazily on first use."""
+    constructing it lazily on first use.
+
+    `model_override` (additive, optional): when given, bypasses the settings
+    resolution and uses this exact model name instead -- e.g.
+    pipeline/ordering.py's thinking-model-tier degrade ladder, which decides
+    the model for a single clip_order call based on hardware fit rather than
+    the task's configured default. Still cached per (task, model) pair like
+    any other resolution."""
     if task not in AGENT_SPECS:
         raise KeyError(f"unknown agent task {task!r}")
-    model_name = settings.model_for(task) or config.OLLAMA_MODEL
+    model_name = model_override or settings.model_for(task) or config.OLLAMA_MODEL
     key = (task, model_name)
     agent = _cache.get(key)
     if agent is None:

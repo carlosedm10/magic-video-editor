@@ -9,6 +9,7 @@ the source afterwards."""
 import os
 import shutil
 import uuid
+from datetime import datetime
 from pathlib import Path
 
 from .. import ffmpeg_utils, queue, store
@@ -90,6 +91,36 @@ def _probe_info_for_import(path: Path) -> dict | None:
         return None
 
 
+def _parse_creation_time(raw: str) -> float | None:
+    """Parse ffprobe's format.tags.creation_time (typically ISO8601 UTC with a
+    trailing 'Z', e.g. "2026-07-20T14:32:10.000000Z") into an epoch float.
+    datetime.fromisoformat() (even on 3.12) doesn't accept a bare 'Z' suffix,
+    so normalize it to "+00:00" first. Never raises -- returns None on any
+    unparseable value."""
+    try:
+        return datetime.fromisoformat(raw.replace("Z", "+00:00")).timestamp()
+    except (ValueError, AttributeError, TypeError):
+        return None
+
+
+def _resolve_recorded_at(info: dict | None, source: Path) -> tuple[float | None, str]:
+    """Best-effort original-recording timestamp, in resolution order:
+    (1) info["creation_time_raw"] parsed as ISO8601 -- source="metadata";
+    (2) os.path.getmtime() of the SOURCE path (pre-import, not the project's
+    imported hardlink/copy) -- source="mtime";
+    (3) None -- source="unknown".
+    Never raises -- mirrors _probe_info_for_import's try/except fall-through."""
+    raw = (info or {}).get("creation_time_raw")
+    if raw:
+        parsed = _parse_creation_time(raw)
+        if parsed is not None:
+            return parsed, "metadata"
+    try:
+        return os.path.getmtime(source), "mtime"
+    except OSError:
+        return None, "unknown"
+
+
 def _new_clip_record(imported: Path, source: Path, group: str) -> dict:
     """The one clip-dict shape, shared by add_clips (path-based import) and
     register_uploaded_clips (bytes already streamed onto disk by the v5.3
@@ -97,6 +128,8 @@ def _new_clip_record(imported: Path, source: Path, group: str) -> dict:
     right here at import time (see _probe_info_for_import) rather than left
     for the pipeline's "ingest" stage to fill in later -- see that function's
     docstring for why."""
+    info = _probe_info_for_import(imported)
+    recorded_at, recorded_at_source = _resolve_recorded_at(info, source)
     return {
         "id": uuid.uuid4().hex[:8],
         "path": str(imported),
@@ -105,10 +138,12 @@ def _new_clip_record(imported: Path, source: Path, group: str) -> dict:
         "role": "audio" if imported.suffix.lower() in AUDIO_EXTS else "camera",
         "camera_group": group,
         "is_main": False,
-        "info": _probe_info_for_import(imported),
+        "info": info,
         "wav": None,
         "transcript": None,
         "language": None,
+        "recorded_at": recorded_at,
+        "recorded_at_source": recorded_at_source,
     }
 
 

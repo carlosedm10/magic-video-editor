@@ -13,7 +13,18 @@ from pydantic import BaseModel
 
 from .. import jobs, queue, settings, store
 from ..jobs import JobCancelled
-from ..pipeline import ingest, ordering, paragraphs, reels, render, review, sync, takes, transcribe
+from ..pipeline import (
+    ingest,
+    judge,
+    ordering,
+    paragraphs,
+    reels,
+    render,
+    review,
+    sync,
+    takes,
+    transcribe,
+)
 from . import ollama as ollama_api
 
 router = APIRouter(prefix="/api", tags=["pipeline"])
@@ -26,6 +37,7 @@ STAGES = {
     "order": ordering.run,
     "paragraphs": paragraphs.run,
     "review": review.run,
+    "judge": judge.run,
     "render": render.run,
     "reels": reels.suggest,
 }
@@ -50,6 +62,7 @@ STAGE_LABELS = {
     "order": "Ordering the story",
     "paragraphs": "Marking paragraph breaks",
     "review": "Checking for suggestions",
+    "judge": "Judging the edit",
     "render": "Editing the video",
     "reels": "Making shorts",
 }
@@ -75,11 +88,35 @@ LLM_TASKS_BY_STAGE: dict[str, list[str]] = {
         "context_check",
         "dedup_judge",
         "take_judge",
+        # Root-cause fix (2026-07-26): blooper_reviewer (pipeline/takes.py's
+        # full-clip review pass) was calling get_agent() without ever going
+        # through this preflight -- an oversized/uninstalled model for this
+        # task could attempt a real Ollama load (and swap an 8GB Mac) before
+        # its own try/except ever got a chance to fail open.
+        "blooper_reviewer",
     ],
-    "order": ["clip_order"],
+    "order": [
+        "clip_order",
+        # Root-cause fix (2026-07-26): clip_digest (pipeline/ordering.py's
+        # per-clip compression for oversized projects) had the same gap as
+        # blooper_reviewer above -- same fix. Note this preflights the
+        # *configured* clip_digest/clip_order models only; the opportunistic
+        # "thinking model" upgrade in ordering._resolve_ordering_model is
+        # separately gated by its own non-raising model_installed_and_fits()
+        # check right before use, so it never contradicts this hard guard.
+        "clip_digest",
+    ],
     "paragraphs": ["paragraph_break"],
     "review": ["reviewer"],
-    "reels": ["reel_composer", "reel_scorer"],
+    "judge": ["edit_judge"],
+    "reels": [
+        "reel_composer",
+        "reel_scorer",
+        # Same bug class as clip_digest/blooper_reviewer above, found during
+        # the 2026-07-26 audit: reel_dedup (pipeline/reels.py's dedup pass)
+        # runs inside this stage but was never preflighted either.
+        "reel_dedup",
+    ],
 }
 
 

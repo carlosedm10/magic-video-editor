@@ -176,6 +176,11 @@ class CrossClipDedupPrefilterTests(unittest.TestCase):
     def test_prefilter_reduces_comparisons_and_keeps_top_pair(self):
         n_clips, n_per_clip = 4, 60  # 240 filler + 2 planted = 242 kept sentences
         sentences = self._synthetic_sentences(n_clips, n_per_clip)
+        # Cross-clip recency hint (sibling workstream) looks up clips by id
+        # via store.get_clip(project, clip_id) -- give it a minimal project
+        # with real clip stubs (no recorded_at) so the hint is a no-op
+        # instead of a KeyError on a bare {}.
+        project = {"clips": [{"id": f"clip{c}"} for c in range(n_clips)]}
 
         # dedup_judge is mocked too -- keep "a" every time, moderate
         # confidence, doesn't matter for this test (we only check pair
@@ -196,7 +201,7 @@ class CrossClipDedupPrefilterTests(unittest.TestCase):
             mock.patch("magic_video_editor.agents.agents.get_agent", return_value=fake_agent),
             mock.patch.object(takes.fuzz, "token_set_ratio", side_effect=counting_ratio),
         ):
-            autocut, suggestions = takes._cross_clip_dedup(_no_log, sentences, "engines", {})
+            autocut, suggestions = takes._cross_clip_dedup(_no_log, sentences, "engines", project)
 
         prefiltered_calls = call_counter["n"]
 

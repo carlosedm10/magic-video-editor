@@ -176,6 +176,14 @@ CROSS_DEDUP_SUGGEST_CONFIDENCE = 2  # >= this (and < autocut) -> open suggestion
 CROSS_DEDUP_KEYWORD_MIN_LEN = 5  # chars; short words are rarely a useful bucket key
 CROSS_DEDUP_KEYWORD_MAX_DF = 6  # a word used in more than this many sentences is too common
 
+# Cross-clip RECENCY hint (spec point 5's cross-file clause, 2026-07-26):
+# re-recording shortly after stopping a clip is often a redo fixing a
+# mistake, so when both clips in a candidate pair have recorded_at set and
+# clip B started within this many seconds of clip A finishing, dedup_judge's
+# per-pair user message gets a one-line hint -- judged by content first, this
+# is just a nudge, never a schema field.
+CROSS_CLIP_RECENCY_WINDOW_S = 900
+
 # Context check (out-of-context / meta-aside pass, v4 section 1 point 2).
 # Chunked+capped the same way as CLEANER_CHUNK_SIZE/SEQUENCER_WINDOW_SIZE
 # (was one LLM call PER SENTENCE -- O(sentences); now O(sentences/chunk)).
@@ -187,6 +195,46 @@ CONTEXT_CHECK_MAX_SENTENCES = 300  # hard cap on sentences fed to context_check 
 # silent cut. Same shape/naming as CROSS_DEDUP_AUTOCUT_CONFIDENCE/SUGGEST_CONFIDENCE.
 CONTEXT_CHECK_AUTOCUT_CONFIDENCE = 4
 CONTEXT_CHECK_SUGGEST_CONFIDENCE = 2
+
+# Full-clip blooper-review pass (WS-C, spec point 3, take-keeping half,
+# 2026-07-26): the chunked windows above (CLEANER_CHUNK_SIZE=40,
+# SEQUENCER_WINDOW_SIZE=12, CONTEXT_CHECK_CHUNK_SIZE=15) can each only see a
+# small slice of one clip at a time, so a bad take whose better retake lands
+# far outside every window slips through all three. takes.py's
+# _full_clip_review sends the clip's ENTIRE not-yet-cut, numbered sentence
+# list to the blooper_reviewer agent in ONE prompt (per clip, never across
+# clips) -- falling back to a few large overlapping chunks, never the tiny
+# windows above, only when the full text doesn't fit the resolved model's
+# context window (see pipeline/token_budget.fits_context).
+# Confidence gate ("suggest, don't delete"), same shape/naming as
+# CONTEXT_CHECK_AUTOCUT_CONFIDENCE/SUGGEST_CONFIDENCE above.
+FULL_CLIP_REVIEW_AUTOCUT_CONFIDENCE = 4
+FULL_CLIP_REVIEW_SUGGEST_CONFIDENCE = 2
+# Fallback chunk count when a clip's full transcript doesn't fit the
+# resolved model's context window -- large overlapping chunks (each roughly
+# 1/this-many of the clip), deliberately NOT the tiny 12/15/40-sentence
+# windows the passes above use, so cross-window blind spots stay closed even
+# on a small/short-context model.
+FULL_CLIP_REVIEW_FALLBACK_CHUNKS = 3
+
+# Precision fix (2026-07-26, live-verification follow-up): a real run against
+# deepseek-r1:14b auto-cut two topic-setup/transition sentences that had NO
+# actual later restatement -- the model's `superseded_by` claim was either
+# hallucinated or pointed at a sentence that doesn't really say the same
+# thing. `superseded_by` is now a REQUIRED field on BlooperFlag (see
+# agents/schemas.py), and takes.py's _full_clip_review code-verifies it
+# (real sentence, later, kept, AND textually similar) before trusting it at
+# all -- same rapidfuzz token_set_ratio measure _cross_clip_dedup already
+# uses for cross-clip candidate pairs (see CROSS_DEDUP_MIN_SIM above), just
+# applied here as a verification gate instead of a candidate pre-filter.
+# >= this -> the claimed supersession is real enough to trust (autocut still
+# also needs confidence >= FULL_CLIP_REVIEW_AUTOCUT_CONFIDENCE); below this
+# but >= FULL_CLIP_REVIEW_SUPERSEDE_DROP_SIMILARITY -> downgrade to a
+# suggestion rather than trust it outright; below THAT -> drop the flag
+# entirely (the claimed superseded_by is unrelated enough that even a human
+# suggestion would be noise).
+FULL_CLIP_REVIEW_SUPERSEDE_SIMILARITY = 55
+FULL_CLIP_REVIEW_SUPERSEDE_DROP_SIMILARITY = 35
 
 # Paragraph-break detection (owner feature, 2026-07-25): NON-DESTRUCTIVE
 # suggested cut points where the conversation changes topic/paragraph
@@ -204,6 +252,26 @@ PARAGRAPH_BREAK_WINDOW_OVERLAP = 3  # sentence overlap between consecutive windo
 # the applied junction, since it's non-destructive): only breaks reported
 # at or above this confidence actually force a segment boundary in the EDL.
 PARAGRAPH_BREAK_MIN_CONFIDENCE = 4
+
+# Pre-render judge (spec point 6, owner feature): a last, text-only editorial
+# pass that runs AFTER review and BEFORE render, comparing the EDITED
+# transcript against the ORDERED-BUT-UNCUT originals (see pipeline/judge.py).
+# Multi-run majority consensus instead of a single call -- a lone run's
+# hallucinated finding is discarded outright rather than acted on or even
+# surfaced.
+JUDGE_RUNS = 3  # edit_judge calls per pass
+JUDGE_MAJORITY = 2  # a finding needs to recur in at least this many runs to count at all
+# Majority "kept_blooper" findings at/above this severity in EVERY
+# contributing run (MIN severity across those runs) auto-cut the sentence --
+# still gated by JUDGE_MAJORITY first. Every other kind, and any
+# kept_blooper below the bar, becomes an open suggestion instead (never
+# auto-applied) -- "suggest, don't delete" as elsewhere, except this one
+# narrow, conservative case.
+JUDGE_AUTOCUT_SEVERITY = 4
+# If an auto-cut happened, run one more full JUDGE_RUNS-run pass over the
+# now-changed transcript (new cuts can surface new issues); stop
+# unconditionally after this many total passes either way.
+MAX_JUDGE_ITERATIONS = 2
 
 # Video topic summary (v4)
 TOPIC_INPUT_CHARS = 3000  # truncate full transcript to ~this many chars for video_topic

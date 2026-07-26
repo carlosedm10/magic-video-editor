@@ -11,7 +11,8 @@ import uuid
 import numpy as np
 from rapidfuzz import fuzz
 
-from .. import config, ffmpeg_utils, llm, store
+from .. import config, ffmpeg_utils, llm, settings, store
+from . import token_budget
 from .speakers import speaker_prefix
 
 FILLERS = re.compile(
@@ -389,6 +390,234 @@ def _context_check_clip(
     return autocut, suggestions
 
 
+def _large_overlapping_chunks(sentences: list[dict], n_chunks: int) -> list[list[dict]]:
+    """Split `sentences` into EXACTLY `n_chunks` large, overlapping pieces
+    covering the whole clip -- the full-clip review's fallback path when the
+    entire clip doesn't fit the resolved model's context window.
+    Deliberately NOT the tiny 12/15/40-sentence sliding windows the other
+    passes use (a sliding window with a small step produces far MORE than
+    `n_chunks` pieces): this divides the clip into `n_chunks` roughly equal,
+    non-overlapping base slices first, then grows each slice's boundary
+    into its neighbor's territory so adjacent chunks actually overlap --
+    a pair of takes split across two base slices still shows up together in
+    at least one chunk. Degenerates to a single chunk (the whole list) when
+    there's nothing meaningful to split."""
+    n = len(sentences)
+    if n_chunks <= 1 or n <= n_chunks:
+        return [sentences]
+    base_size = n // n_chunks
+    remainder = n % n_chunks
+    overlap = max(3, base_size // 5)
+    bounds = []
+    start = 0
+    for i in range(n_chunks):
+        size = base_size + (1 if i < remainder else 0)
+        end = n if i == n_chunks - 1 else start + size
+        bounds.append((start, end))
+        start = end
+    chunks = []
+    for i, (s, e) in enumerate(bounds):
+        lo = max(0, s - overlap) if i > 0 else s
+        hi = min(n, e + overlap) if i < n_chunks - 1 else e
+        chunks.append(sentences[lo:hi])
+    return chunks
+
+
+def _verify_superseded_by(
+    chunk: list[dict],
+    flagged_numbers: set[int],
+    sentence_number: int,
+    superseded_by_number: int,
+    sent: dict,
+) -> float | None:
+    """Code-verifies one BlooperFlag's `superseded_by` claim before it's
+    trusted at all (precision fix, 2026-07-26 -- a live-verification run
+    found the model auto-cutting topic-setup/transition sentences with NO
+    genuine later restatement; see BlooperFlag's docstring in
+    agents/schemas.py). The claimed later sentence must:
+      (a) resolve to a real sentence in this SAME numbered chunk,
+      (b) be strictly LATER than the flagged sentence,
+      (c) not itself be one of this call's OTHER flagged (about-to-be-cut)
+          sentence numbers, and still be `kept` -- it can't be "the kept,
+          better version" if it's itself on the chopping block, and
+      (d) have real textual similarity to the flagged sentence.
+
+    Returns the rapidfuzz token_set_ratio similarity (0-100, same _norm()
+    normalization `_cross_clip_dedup` already uses for its candidate pairs)
+    when (a)-(c) hold, or None when any of them fails outright -- there's
+    nothing meaningful to compare, so the caller treats None as "structurally
+    unverifiable" rather than a similarity score of 0."""
+    idx = superseded_by_number - 1
+    if not (0 <= idx < len(chunk)):
+        return None
+    if superseded_by_number <= sentence_number:
+        return None
+    if superseded_by_number in flagged_numbers:
+        return None
+    sup_sentence = chunk[idx]
+    if not sup_sentence.get("kept", True):
+        return None
+    return float(fuzz.token_set_ratio(_norm(sent["text"]), _norm(sup_sentence["text"])))
+
+
+def _full_clip_review_chunk(
+    log, chunk: list[dict], project: dict, protected_survivor_ids: set[str]
+) -> list[dict]:
+    """One blooper_reviewer call over `chunk` (either an entire clip's
+    not-yet-cut sentences, or one large fallback chunk of it -- see
+    `_full_clip_review`). Same numbered/flat pattern as
+    `_context_check_chunk`, plus an explicit "off-limits" line listing any
+    sentence in `protected_survivor_ids` that appears in this chunk, so the
+    prompt itself tells the model never to flag a protected duplicate-
+    cluster survivor. Hard guard in code (not just the prompt): any flag the
+    model returns for a protected id is dropped here before the caller ever
+    sees it.
+
+    Precision fix (2026-07-26): each flag's required `superseded_by` claim is
+    code-verified here via `_verify_superseded_by` (real, later, kept, not
+    itself flagged) and its rapidfuzz similarity to the flagged sentence is
+    attached (`similarity`: a 0-100 float, or None if the claim failed
+    verification outright) -- `_full_clip_review` uses this to decide
+    autocut vs. suggestion vs. drop; this function itself never decides
+    that. Fail-open: on any error, log and return no flags for this chunk
+    only."""
+    from ..agents.agents import get_agent
+
+    numbered = "\n".join(
+        f'{i + 1}: "{speaker_prefix(project, s)}{s["text"]}"' for i, s in enumerate(chunk)
+    )
+    protected_local = sorted(
+        i + 1 for i, s in enumerate(chunk) if s["id"] in protected_survivor_ids
+    )
+    protected_line = (
+        f"Off-limits sentence numbers (never flag these): {protected_local}\n\n"
+        if protected_local
+        else ""
+    )
+    prompt = f"{protected_line}Numbered sentences from one entire clip, in order:\n{numbered}"
+    try:
+        result = get_agent("blooper_reviewer").run_sync(prompt).output
+    except Exception as exc:
+        log(f"blooper_reviewer chunk failed, skipping: {exc}")
+        return []
+
+    flagged_numbers = {f.sentence_number for f in result.flags}
+    flags: list[dict] = []
+    for f in result.flags:
+        idx = f.sentence_number - 1
+        if not (0 <= idx < len(chunk)):
+            continue
+        sent = chunk[idx]
+        if sent["id"] in protected_survivor_ids:
+            continue  # hard guard: never trust the model on a protected id
+        similarity = _verify_superseded_by(
+            chunk, flagged_numbers, f.sentence_number, f.superseded_by, sent
+        )
+        flags.append(
+            {
+                "id": sent["id"],
+                "confidence": f.confidence,
+                "reason": f.reason,
+                "similarity": similarity,
+            }
+        )
+    return flags
+
+
+def _full_clip_review(
+    log, clip_sentences: list[dict], project: dict, protected_survivor_ids: set[str]
+) -> tuple[set[str], list[dict]]:
+    """Whole-clip single-prompt reasoning pass (WS-C, spec point 3): the
+    chunked windows above (transcript_cleaner <=40, take_sequencer ~12,
+    context_check <=15 sentences) each only ever see a small slice of one
+    clip, so a bad take whose better retake lands far outside every window
+    slips through all three. This sends `clip_sentences` -- the clip's
+    ENTIRE not-yet-cut sentence list, as left by those three passes -- to
+    the blooper_reviewer agent in ONE prompt, unless the full text doesn't
+    fit the resolved model's context window (token_budget.fits_context), in
+    which case it falls back to config.FULL_CLIP_REVIEW_FALLBACK_CHUNKS
+    large overlapping chunks (see `_large_overlapping_chunks`) -- NEVER the
+    tiny 12/15/40-sentence windows the other passes use.
+
+    Strictly per-clip: never called across clip boundaries, so the sacred
+    chronological-order invariant is trivially safe here (this pass never
+    reorders anything, only flags cut candidates).
+
+    Precision fix (2026-07-26): a live-verification run against
+    deepseek-r1:14b auto-cut two topic-setup/transition sentences that had NO
+    genuine later restatement -- the model's confidence alone wasn't a
+    reliable enough gate. Every flag's `superseded_by` claim is now
+    code-verified (`_verify_superseded_by`, real/later/kept/not-itself-
+    flagged/textually-similar via rapidfuzz token_set_ratio) before it's
+    trusted: verification passing AND confidence >= FULL_CLIP_REVIEW_
+    AUTOCUT_CONFIDENCE -> auto-cut (never a `protected_survivor_ids` id --
+    hard guard in code, on top of the chunk-level guard and the prompt's
+    off-limits list); verification failing (or passing at only suggest-level
+    confidence) -> an open suggestion instead, UNLESS the claimed
+    supersession is so dissimilar (similarity < FULL_CLIP_REVIEW_SUPERSEDE_
+    DROP_SIMILARITY) that even a suggestion would be noise, in which case the
+    flag is dropped outright. Fail-open throughout."""
+    if len(clip_sentences) < 2:
+        return set(), []
+
+    model_name = settings.model_for("blooper_reviewer") or config.OLLAMA_MODEL
+    numbered_all = "\n".join(
+        f'{i + 1}: "{speaker_prefix(project, s)}{s["text"]}"'
+        for i, s in enumerate(clip_sentences)
+    )
+    total_tokens = token_budget.estimate_tokens(numbered_all)
+
+    if token_budget.fits_context(total_tokens, model_name):
+        raw_flags = _full_clip_review_chunk(log, clip_sentences, project, protected_survivor_ids)
+    else:
+        n_chunks = max(1, config.FULL_CLIP_REVIEW_FALLBACK_CHUNKS)
+        log(
+            f"Full clip text ({total_tokens} est. tokens) doesn't fit "
+            f"{model_name}'s context window -- falling back to {n_chunks} "
+            "large overlapping chunk(s) instead of the tiny windows"
+        )
+        raw_flags = []
+        seen_ids: set[str] = set()
+        for chunk in _large_overlapping_chunks(clip_sentences, n_chunks):
+            for flag in _full_clip_review_chunk(log, chunk, project, protected_survivor_ids):
+                if flag["id"] in seen_ids:
+                    continue
+                seen_ids.add(flag["id"])
+                raw_flags.append(flag)
+
+    autocut: set[str] = set()
+    suggestions: list[dict] = []
+    for flag in raw_flags:
+        sid = flag["id"]
+        if sid in protected_survivor_ids:
+            continue  # belt-and-suspenders on top of the chunk-level guard
+
+        similarity = flag["similarity"]  # None (unverifiable) or a 0-100 float
+        drop_floor = config.FULL_CLIP_REVIEW_SUPERSEDE_DROP_SIMILARITY
+        if similarity is not None and similarity < drop_floor:
+            continue  # claimed supersession too dissimilar -- noise even as a suggestion
+        verified = (
+            similarity is not None and similarity >= config.FULL_CLIP_REVIEW_SUPERSEDE_SIMILARITY
+        )
+
+        if verified and flag["confidence"] >= config.FULL_CLIP_REVIEW_AUTOCUT_CONFIDENCE:
+            autocut.add(sid)
+        elif flag["confidence"] >= config.FULL_CLIP_REVIEW_SUGGEST_CONFIDENCE:
+            suggestions.append(
+                {
+                    "id": uuid.uuid4().hex[:8],
+                    "kind": "repeated_idea",
+                    "sentence_ids": [sid],
+                    "message": (flag["reason"] or "possibly a superseded take said better later")[
+                        :300
+                    ],
+                    "proposed_action": "cut",
+                    "status": "open",
+                }
+            )
+    return autocut, suggestions
+
+
 def _neighbor_context(clip_sentences: list[dict], idx: int) -> str:
     if idx > 0:
         return clip_sentences[idx - 1]["text"]
@@ -418,6 +647,31 @@ def _rare_keyword_buckets(kept: list[dict], norm: dict[str, str]) -> dict[str, s
             if w in rare_words:
                 buckets.setdefault(w, set()).add(s["id"])
     return buckets
+
+
+def _cross_clip_recency_hint(project: dict, a: dict, b: dict) -> str | None:
+    """Spec point 5's cross-file clause: re-recording shortly after stopping
+    a clip is often a redo fixing a mistake in the earlier one. If both
+    clip_a and clip_b have `recorded_at` set (optional -- added by another
+    workstream at ingest; never fabricated when missing), and clip_b started
+    within [0, CROSS_CLIP_RECENCY_WINDOW_S] seconds of clip_a finishing
+    (recorded_at + its info duration), return a one-line hint for the
+    dedup_judge user message. Judgment is still by content first -- this is
+    a nudge, not a verdict, and never touches the DedupJudge schema."""
+    clip_a = store.get_clip(project, a["clip_id"])
+    clip_b = store.get_clip(project, b["clip_id"])
+    recorded_a = clip_a.get("recorded_at")
+    recorded_b = clip_b.get("recorded_at")
+    if recorded_a is None or recorded_b is None:
+        return None
+    duration_a = (clip_a.get("info") or {}).get("duration") or 0.0
+    gap_s = recorded_b - (recorded_a + duration_a)
+    if 0 <= gap_s <= config.CROSS_CLIP_RECENCY_WINDOW_S:
+        return (
+            f"Clip B started recording ~{gap_s:.0f}s after clip A stopped -- "
+            "often a redo fixing a mistake in A, but judge by content first."
+        )
+    return None
 
 
 def _cross_clip_dedup(
@@ -481,6 +735,7 @@ def _cross_clip_dedup(
             continue
         a_ctx = _neighbor_context(by_clip[a["clip_id"]], idx_by_id[a["id"]])
         b_ctx = _neighbor_context(by_clip[b["clip_id"]], idx_by_id[b["id"]])
+        recency_hint = _cross_clip_recency_hint(project, a, b)
         prompt = (
             f'Video topic: "{topic}"\n\n'
             f'Context before A: "{a_ctx}"\n'
@@ -488,6 +743,8 @@ def _cross_clip_dedup(
             f'Context before B: "{b_ctx}"\n'
             f'B: "{speaker_prefix(project, b)}{b["text"]}"'
         )
+        if recency_hint:
+            prompt += f"\n\n{recency_hint}"
         try:
             result = agent.run_sync(prompt).output
         except Exception as exc:
@@ -625,6 +882,8 @@ def run(log, project: dict) -> None:
     sequencer_cut_ids: set[str] = set()
     context_cut_ids: set[str] = set()
     context_suggestions: list[dict] = []
+    full_review_cut_ids: set[str] = set()
+    full_review_suggestions: list[dict] = []
     if llm.available():
         log("Summarizing video topic...")
         topic = _compute_topic(log, sentences)
@@ -671,6 +930,25 @@ def run(log, project: dict) -> None:
                 log(f"context pass flagged {len(context_cut_ids)} sentence(s)")
             if context_suggestions:
                 log(f"context pass added {len(context_suggestions)} suggestion(s)")
+
+        # WS-C full-clip blooper-review pass: runs AFTER transcript_cleaner /
+        # take_sequencer / context_check above, over each clip's already-
+        # reduced (not-yet-cut) sentence list, so it only has to catch what
+        # those chunked/windowed passes structurally can't -- a repeat far
+        # enough apart that no single window ever held both takes together.
+        # Strictly per-clip, one entire clip's remaining sentences per call
+        # (see _full_clip_review for the context-window fallback).
+        log("Running full-clip blooper review (whole-clip single-prompt pass)...")
+        already_cut = cleaner_cut_ids | sequencer_cut_ids | context_cut_ids | exact_repeat_cut_ids
+        for clip_sentences in by_clip.values():
+            reduced = [s for s in clip_sentences if s["id"] not in already_cut]
+            cut_ids, sugg = _full_clip_review(log, reduced, project, protected_survivor_ids)
+            full_review_cut_ids |= cut_ids
+            full_review_suggestions.extend(sugg)
+        if full_review_cut_ids:
+            log(f"full-clip blooper review flagged {len(full_review_cut_ids)} sentence(s)")
+        if full_review_suggestions:
+            log(f"full-clip blooper review added {len(full_review_suggestions)} suggestion(s)")
     else:
         log("transcript cleaner skipped (ollama unavailable)")
     project["topic"] = topic
@@ -770,6 +1048,9 @@ def run(log, project: dict) -> None:
         elif s["id"] in context_cut_ids:
             s["kept"] = False
             s["reason"] = "out-of-context aside (AI)"
+        elif s["id"] in full_review_cut_ids:
+            s["kept"] = False
+            s["reason"] = "superseded take found in full-clip review (AI)"
 
     # Drop tiny fragments that survived (interjections, aborted starts).
     for s in sentences:
@@ -779,7 +1060,7 @@ def run(log, project: dict) -> None:
 
     # Cross-clip semantic dedup with auto-cut (v4 section 1): runs AFTER
     # per-clip cleaning, on top of whatever is still kept.
-    new_suggestions: list[dict] = list(context_suggestions)
+    new_suggestions: list[dict] = list(context_suggestions) + list(full_review_suggestions)
     if llm.available():
         log("Running cross-clip duplicate check...")
         dedup_autocut, dedup_suggestions = _cross_clip_dedup(log, sentences, topic, project)
@@ -811,6 +1092,30 @@ def run(log, project: dict) -> None:
             )
             s["kept"] = True
             s["reason"] = ""
+
+    # Duplicate-cluster survivor guard applies to SUGGESTIONS too (Fix 1
+    # follow-up, 2026-07-26): the autocut paths above are already safe --
+    # every autocut-application loop runs after `protected_survivor_ids` is
+    # fully populated (exact-repeat pre-pass ids PLUS the fuzzy-dedup cluster
+    # winner added per-cluster in the winner-selection loop above), and each
+    # checks membership before cutting. But context_check/_full_clip_review/
+    # dedup_judge SUGGESTIONS are collected into `new_suggestions` as they're
+    # produced -- before winner selection has run for full_review_suggestions
+    # in particular -- and were never re-filtered against the final protected
+    # set. That let a settled cluster winner (the take we just decided to
+    # KEEP) show up in the suggestions list proposing to cut it. Drop any
+    # suggestion that references a protected id now that the set is final.
+    if new_suggestions:
+        before = len(new_suggestions)
+        new_suggestions = [
+            x for x in new_suggestions if not (set(x["sentence_ids"]) & protected_survivor_ids)
+        ]
+        dropped = before - len(new_suggestions)
+        if dropped:
+            log(
+                f"dropped {dropped} suggestion(s) referencing a protected "
+                "duplicate-cluster survivor"
+            )
 
     if new_suggestions:
         existing = project.get("suggestions", [])

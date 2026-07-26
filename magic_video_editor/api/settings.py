@@ -19,6 +19,13 @@ TASKS = (
     "reel_scorer",
     "reviewer",
     "dedup_judge",
+    "edit_judge",
+    # Root-cause fix (2026-07-26): these two new LLM tasks were missing from
+    # TASKS, so PUT /api/settings rejected any attempt to set a per-task
+    # override for them (settings.py DEFAULTS['task_models'] carries the
+    # matching None entries -- see there for the fuller story).
+    "clip_digest",
+    "blooper_reviewer",
 )
 
 SUBTITLE_STYLES = ("clean", "bold", "karaoke")

@@ -824,6 +824,7 @@ def clip_info(path: str) -> dict:
         "size_bytes": int(data["format"].get("size", 0)),
         "codec_name": v.get("codec_name") if v else None,
         "pix_fmt": v.get("pix_fmt") if v else None,
+        "creation_time_raw": data["format"].get("tags", {}).get("creation_time"),
     }
 
 

@@ -270,6 +270,22 @@ def _spawn_binary(binary: Path, *, set_models_dir: bool = True) -> subprocess.Po
     # config.OLLAMA_URL already points at, so every other module (llm.py,
     # agents/agents.py) keeps talking to the same configured URL unchanged.
     env["OLLAMA_HOST"] = config.OLLAMA_URL.split("://", 1)[-1]
+    # Live-verification fix (2026-07-26): per-call num_ctx (pipeline/
+    # ordering.py's model_settings={"extra_body": {"options": {"num_ctx":
+    # n}}}) is silently DROPPED by Ollama's OpenAI-compatible
+    # /v1/chat/completions endpoint (verified empirically against a real
+    # v0.32.1 daemon -- see token_budget.py's module docstring), so the
+    # daemon's own default context window is what actually governs every
+    # agent call. Setting OLLAMA_CONTEXT_LENGTH here makes that default
+    # match token_budget._FAMILY_CONTEXT_TOKENS' 32_000-token assumption for
+    # every model this app targets (qwen2.5/qwen3/deepseek-r1), instead of
+    # leaving it at whatever Ollama's own built-in default happens to be.
+    # ONLY set in the env of a daemon WE spawn (this function is the single
+    # spawn path for "system-spawned"/"bundled"/"downloaded" modes -- see
+    # ensure_ollama()'s docstring); "system" mode (an already-running
+    # daemon answered) never calls this function at all, so a user's
+    # existing daemon and its own configuration are never touched.
+    env.setdefault("OLLAMA_CONTEXT_LENGTH", "32768")
 
     log_path = _serve_log_path()
     logger.info("ollama: spawning `%s serve` (log: %s)", binary, log_path)

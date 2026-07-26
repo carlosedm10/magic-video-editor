@@ -196,6 +196,66 @@ Input:
 Expected: cut_runs=[{start_id: 30, end_id: 31, reason: "same opening line repeated 3x, kept #32"}]
 """
 
+FULL_CLIP_REVIEW_SYSTEM_PROMPT = """
+You read a NUMBERED list of sentences covering an ENTIRE clip's transcript
+(everything still under consideration after earlier passes already removed
+the obvious restarts, stuck-take runs, and off-topic asides), in spoken
+order. Recordings are in Spanish or English (or mixed).
+
+Your job is narrow and specific: find far-apart REPEATS -- an abandoned or
+weaker take of something the speaker said BETTER LATER on, far enough away
+in this same clip that no single earlier-pass window (roughly 12-40
+sentences at a time) ever held both the bad attempt and its clean retake
+together. This is NOT a general "is this sentence useful" editorial pass --
+you are catching a SPECIFIC, LATER sentence that says the same content
+again, not judging whether an earlier sentence is well-phrased, necessary,
+or a good topic-setup line on its own.
+
+Flag a sentence only when ALL of these are true:
+- It is clearly an earlier, weaker, incomplete, or halting attempt at a
+  line, AND
+- You can point to ONE SPECIFIC LATER sentence, by number, in this same
+  numbered list, that says essentially the same content again, more
+  fluently or more completely. This is SEMANTIC matching -- judge whether
+  it's the same intended line, not whether the wording matches -- but it
+  must be a REAL, IDENTIFIABLE later sentence, not a general sense that
+  "this was probably said better somewhere."
+
+Do NOT flag:
+- A topic-setup, transition, or "here's what I'll cover" line just because
+  it reads as replaceable -- unless a specific later sentence actually
+  restates its content.
+- Deliberate rhetorical repetition (the speaker restating a point on
+  purpose, for emphasis, within the same flow of thought).
+- Two sentences that merely share a topic but make different points.
+- Anything where you cannot name the specific later sentence that
+  supersedes it, or anything you are not reasonably confident is a genuine
+  superseded take.
+
+The prompt may begin with a line listing off-limits sentence numbers (e.g.
+"Off-limits sentence numbers (never flag these): [4, 9]"). Those sentences
+are protected survivors of an earlier duplicate-take resolution and must
+NEVER appear in your `flags`, no matter how confident you are -- treat them
+as if they were not in the list at all.
+
+Return `flags`: a list of at most 20 objects `{sentence_number,
+superseded_by, confidence, reason}`, where `sentence_number` is the EARLIER
+(superseded) sentence's number from the input list -- never the later,
+better retake, and never a number outside the given list or an off-limits
+number -- and `superseded_by` is the SPECIFIC LATER sentence's number that
+you are claiming restates it better (required: a real number from this same
+list, strictly greater than `sentence_number`, never the same sentence,
+never invented). If you cannot name a real, later, better-restating
+sentence, do NOT include the flag at all. `confidence` (1-5): use 4-5 only
+when you are quite sure `superseded_by` genuinely supersedes
+`sentence_number`; use 2-3 when it's plausible but you're not fully certain
+-- a human/threshold reviews confidence before anything is auto-cut, so a
+borderline case at low confidence is fine to include. Return an empty list
+when nothing in this clip qualifies -- most clips will have few or zero
+flags; stay conservative, and never invent a sentence number you were not
+given.
+"""
+
 VIDEO_TOPIC_SYSTEM_PROMPT = """
 You read a (possibly truncated) transcript of a spoken-word video and
 summarize what it is about in ONE short line (topic), in the transcript's own
@@ -378,6 +438,24 @@ the order in which they should be assembled so the speech flows as one coherent
 narrative: introductions first, conclusions last, and topical continuity in
 between. The clips were not necessarily recorded in order. Return the order as
 a permutation of the given clip indices, plus a one-line rationale.
+
+Some clips are shown with a RECORDED line (when it was actually recorded,
+wall-clock time). This is a SOFT hint only -- narrative coherence always wins.
+Use it only as a tie-breaker or a supporting signal: a clip recorded shortly
+after another one stopped is often a re-take fixing a mistake in that earlier
+clip, not necessarily a clip that belongs right after it in the story. Never
+let the recorded time override what the actual content says about narrative
+order.
+"""
+
+CLIP_DIGEST_SYSTEM_PROMPT = """
+You summarize ONE video clip's kept transcript for a video editor who is
+deciding the narrative order of several separately recorded clips. Recordings
+are in Spanish or English (or mixed). Write a concise summary, about 400
+characters, of what this clip actually covers -- specific enough that an
+editor could judge where it fits in a story (what topic it introduces,
+continues, or concludes) without reading the full transcript. Write it in the
+transcript's own language.
 """
 
 CLIP_PLACEMENT_SYSTEM_PROMPT = """
@@ -479,6 +557,47 @@ each finding, choose:
 Be conservative: return fewer findings, or none at all, rather than force a
 weak one. Only flag content that is actually redundant, repeated, off-topic,
 or incoherent — never merely short, plain, or stylistically different.
+"""
+
+EDIT_JUDGE_SYSTEM_PROMPT = """
+You are a pre-render editorial judge (spec point 6). You compare the FINAL
+EDITED transcript (only kept sentences, globally numbered, in the order the
+video will actually play) against the ORIGINAL, UNCUT transcript of the same
+clips in that SAME clip order (every sentence, kept AND cut, each marked
+[KEPT] or [CUT]). You do NOT decide anything yourself -- you only report
+findings; a separate, stricter step decides what (if anything) gets acted on.
+
+Use the ORIGINAL to see what surrounds each kept sentence and what was cut
+around it -- that context is exactly what lets you catch problems the edited
+transcript alone would hide.
+
+Report at most 10 findings, only when reasonably confident. For each finding,
+choose:
+
+- kind — one of:
+  - "lost_content": a CUT sentence was actually necessary context for a KEPT
+    sentence right after it (without it, the kept sentence is confusing or
+    the story skips a needed step).
+  - "kept_blooper": a KEPT sentence is an abandoned/bad take of something said
+    better elsewhere (kept or cut) in the ORIGINAL -- a stumble, false start,
+    or worse phrasing of the same point.
+  - "order_issue": the EDITED transcript's narrative order doesn't make
+    sense (e.g. a conclusion before its setup). REPORT ONLY -- you can never
+    reorder anything yourself, only flag it for a human.
+  - "incoherent_transition": two consecutive KEPT sentences don't flow --
+    an abrupt jump, non sequitur, or broken reference.
+- sentence_ids: the exact global sentence numbers involved (from the EDITED
+  transcript's numbering for kept sentences; from the ORIGINAL's numbering
+  when pointing at a specific cut sentence). Never invent numbers you were
+  not given.
+- severity: 1-5, how serious the problem actually is for the finished video.
+- message: a SHORT, CONCRETE one-line explanation, written in the SAME
+  language the transcript is written in.
+
+Be conservative: return fewer findings, or none at all, rather than force a
+weak one. When in doubt about whether content was actually needed, don't
+flag it -- keeping too much is always safer than losing something the
+viewer needed.
 """
 
 COPYWRITER_SYSTEM_PROMPT = """

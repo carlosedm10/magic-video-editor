@@ -103,7 +103,7 @@ health:
 smoke:
 	uv run python -c "import magic_video_editor.server, magic_video_editor.app, magic_video_editor.settings, magic_video_editor.updater; \
 		from magic_video_editor.api import projects, pipeline, settings, audio, filters, edl, suggestions, reels as reels_api, subtitles as subtitles_api, thumbs, ollama, overlays, updater as updater_api, transitions as transitions_api, safety as safety_api; \
-		from magic_video_editor.pipeline import ingest, sync, transcribe, takes, ordering, render, reels, faces, filters as pfilters, audio_enhance, review, copywriter, subtitles, safezones; \
+		from magic_video_editor.pipeline import ingest, sync, transcribe, takes, ordering, render, reels, faces, filters as pfilters, audio_enhance, review, judge, copywriter, subtitles, safezones; \
 		from magic_video_editor.agents import agents; \
 		print('all modules import OK')"
 

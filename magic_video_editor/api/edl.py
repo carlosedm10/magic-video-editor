@@ -88,6 +88,25 @@ def _validate_segments(project: dict, segments: list[EdlSegment]) -> None:
             raise HTTPException(
                 400, f"segment end {seg.end} exceeds clip duration {duration}"
             )
+    # Manual-edit chronology guardrail: within one original clip, segment order
+    # is chronological and immutable (the SACRED INVARIANT). A whole
+    # contiguous block of a clip's segments may be moved elsewhere in the
+    # timeline, but the segments belonging to the same clip_id may never come
+    # out of chronological order relative to each other -- that would mean
+    # the drag/PUT reordered segments WITHIN a clip rather than moving a
+    # whole clip block.
+    by_clip: dict[str, list[float]] = {}
+    for seg in segments:
+        by_clip.setdefault(seg.clip_id, []).append(seg.start)
+    for clip_id, starts in by_clip.items():
+        if len(starts) < 2:
+            continue
+        if any(starts[i] > starts[i + 1] for i in range(len(starts) - 1)):
+            raise HTTPException(
+                400,
+                f"segments for clip {clip_id} are out of chronological order: "
+                "only whole clips may be reordered, never their internal segments",
+            )
 
 
 @router.get("/projects/{pid}/edl")
