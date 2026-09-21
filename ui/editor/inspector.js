@@ -142,7 +142,16 @@ const Inspector = {
     this._applyTabVisibility();
     try {
       if (leavingColor) window.EditorUI.compare?.deactivate();
-      if (tab === "color") window.EditorUI.compare?.activate(state.project);
+      if (tab === "color") {
+        window.EditorUI.compare?.activate(state.project);
+        // activate() paints the saved grade. Unsaved slider edits live on
+        // ColorPanel's draft and have to be pushed again or the divider
+        // shows the last Save.
+        const draft = window.ColorPanel?._draft;
+        if (draft && draft.pid === state.project?.id) {
+          window.EditorUI.compare?.setLiveConfig(draft.cfg);
+        }
+      }
     } catch (e) {
       console.error("Color comparison overlay failed to toggle", e);
     }

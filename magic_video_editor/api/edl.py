@@ -116,10 +116,15 @@ def edl_get(pid: str):
     except FileNotFoundError:
         raise HTTPException(404) from None
     segments = project.get("edl")
-    if segments is None:
-        segments = ordering.build_edl(project) if project.get("sentences") else []
+    # An empty list is not a finished cut when sentences still exist: render's
+    # _ensure_edl already rebuilds `[]`, and a Takes toggle that brings a
+    # sentence back used to leave GET /edl stuck on the cached empty list.
+    if not segments and project.get("sentences"):
+        segments = ordering.build_edl(project)
         project["edl"] = segments
         store.save(project)
+    elif segments is None:
+        segments = []
     return {"segments": segments}
 
 

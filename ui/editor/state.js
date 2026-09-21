@@ -892,6 +892,11 @@ function _mountPacingSelect(project) {
       try {
         await api(`/projects/${state.pid}`, { method: "PATCH", body: { pacing: value } });
         if (state.project) state.project.pacing = value;
+        // Pacing is baked into the EDL. The PATCH drops the cache; reload so
+        // the timeline shows the new rhythm immediately.
+        if (window.Editor && Editor.pid === state.pid) {
+          try { await Editor.load(state.pid); } catch (e) { console.error(e); }
+        }
       } catch (e) {
         showToast(`Couldn't update pacing: ${e.message}`);
         sel.value = project.pacing || "natural";

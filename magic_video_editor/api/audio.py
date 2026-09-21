@@ -31,7 +31,7 @@ from pydantic import BaseModel, field_validator
 
 from .. import config, store
 from ..ffmpeg_utils import FFmpegError, ffmpeg_bin, run
-from ..pipeline import audio_enhance, eq, ingest, sync
+from ..pipeline import audio_enhance, eq, ingest, ordering, sync
 
 router = APIRouter(prefix="/api", tags=["audio"])
 
@@ -236,6 +236,13 @@ def audio_preview_at_cursor(pid: str, body: AudioPreviewAtCursorRequest):
         raise HTTPException(404) from None
 
     segments = project.get("edl") or []
+    # Same fallback as GET /edl and render._ensure_edl: a cleared EDL (judge
+    # auto-cut, accepted suggestion, pacing change) still has sentences to
+    # preview. Don't 400 just because nobody has opened the timeline yet.
+    if not segments and project.get("sentences"):
+        segments = ordering.build_edl(project)
+        project["edl"] = segments
+        store.save(project)
     if not segments:
         raise HTTPException(
             400, "project has no EDL segments to preview yet — cut the project first"

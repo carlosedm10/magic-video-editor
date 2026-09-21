@@ -28,7 +28,13 @@ function renderTakes() {
   document.querySelectorAll(".sentence").forEach((el) => el.onclick = async () => {
     const s = p.sentences.find((x) => x.id === el.dataset.sid);
     await api(`/projects/${p.id}/sentences/${s.id}`, { method: "POST", body: { kept: !s.kept } });
-    refreshProject();
+    await refreshProject();
+    // The keep/cut toggle drops the cached EDL server-side. Reload it so the
+    // timeline drops (or brings back) that sentence instead of keeping the
+    // previous cut until the next full project open.
+    if (window.Editor && Editor.pid === p.id) {
+      try { await Editor.load(p.id); } catch (e) { console.error(e); }
+    }
   });
 }
 

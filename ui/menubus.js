@@ -40,6 +40,10 @@ window.MenuBus = {
 
     switch (action) {
       case "about":
+        // Land on the About section, not whatever Settings was showing last
+        // (the default is General). _sfs lives in ui/tabs/settings.js, which
+        // is a classic script loaded before this file.
+        if (typeof _sfs !== "undefined") _sfs.section = "about";
         if (typeof openSettings === "function") openSettings();
         break;
 

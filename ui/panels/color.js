@@ -101,7 +101,16 @@ window.ColorPanel = window.ColorPanel || {
     refresh = refresh || refreshProject;
     if (!container || !project) return;
 
-    const cfg = _colorDefaults(project);
+    // refreshProject() (queue poll, Takes toggle, upload) re-renders this
+    // panel from project.color and used to wipe slider moves that had not
+    // been saved yet. Keep the in-memory grade for this project until the
+    // user switches projects.
+    if (!this._draft || this._draft.pid !== project.id) {
+      const cfg0 = _colorDefaults(project);
+      if (!cfg0.lut) cfg0.lut = { name: null, intensity: 1.0 };
+      this._draft = { pid: project.id, cfg: cfg0 };
+    }
+    const cfg = this._draft.cfg;
     if (!cfg.lut) cfg.lut = { name: null, intensity: 1.0 };
 
     try {
