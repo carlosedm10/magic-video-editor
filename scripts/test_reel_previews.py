@@ -273,10 +273,17 @@ class ReelPreviewsE2ETest(unittest.TestCase):
         reel = next(r for r in project["reels"] if r["id"] == self.reel["id"])
         self.assertNotEqual(reel["preview_hash"], reels.reel_content_hash(reel))
 
-        job = jobs.run_sync(
-            "test:reel_previews3", lambda log: reels.render_all_reel_previews(log, project)
+        # The PATCH starts the real queue worker. Rendering again here races
+        # that worker on the same work dir and the later save can drop
+        # preview_ready. Wait for the job the product actually enqueued.
+        _wait_for_queue_kind_settled(self.pid, "reel_previews", timeout=30.0)
+        settled = store.load(self.pid)
+        preview_jobs = [i for i in settled.get("queue", []) if i["kind"] == "reel_previews"]
+        self.assertTrue(preview_jobs, "reel_previews job disappeared before it finished")
+        self.assertTrue(
+            all(i["status"] == "done" for i in preview_jobs),
+            preview_jobs[-1].get("error") or preview_jobs[-1].get("status"),
         )
-        self.assertEqual(job["status"], "done", job.get("error"))
 
         mtime_after = preview_path.stat().st_mtime_ns
         self.assertNotEqual(mtime_before, mtime_after, "an invalidated preview must re-render")
