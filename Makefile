@@ -78,7 +78,10 @@ dist-dmg:
 	bash packaging/make_dmg.sh
 
 # ----------------------------- Code Formatting ----------------------------- #
-.PHONY: lint-backend format-backend lint format
+.PHONY: lint-backend format-backend lint format test
+
+test:
+	uv run python scripts/run_ci_tests.py
 
 lint-backend:
 	uvx ruff check magic_video_editor/

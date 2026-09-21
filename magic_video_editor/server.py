@@ -142,9 +142,17 @@ def open_folder(body: OpenFolderRequest):
     if not (target == home or target.is_relative_to(home)):
         raise HTTPException(400, "path must be inside the user's home directory")
     target.mkdir(parents=True, exist_ok=True)
-    if sys.platform != "darwin":
-        raise HTTPException(400, "opening a folder is only supported on macOS")
-    subprocess.run(["open", str(target)], check=True)
+    try:
+        if sys.platform == "darwin":
+            subprocess.run(["open", str(target)], check=True)
+        elif sys.platform == "linux":
+            subprocess.run(["xdg-open", str(target)], check=True)
+        else:
+            raise HTTPException(400, "opening a folder is not supported on this platform")
+    except FileNotFoundError:
+        raise HTTPException(400, "folder opener not found on this system") from None
+    except subprocess.CalledProcessError as exc:
+        raise HTTPException(400, f"could not open folder ({exc.returncode})") from None
     return {"ok": True}
 
 

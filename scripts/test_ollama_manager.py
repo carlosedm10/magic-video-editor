@@ -89,8 +89,10 @@ class BundleRootResolutionTests(unittest.TestCase):
 
     def test_dev_checkout_layout_finds_real_vendored_binary(self):
         # No _MEIPASS, not frozen -- exactly a bare `uv run mve-server`
-        # checkout. The real repo already has packaging/vendor/ollama/ollama
-        # fetched (packaging/fetch_ollama.sh has been run in this repo).
+        # checkout. The binary is gitignored (packaging/fetch_ollama.sh),
+        # so a clean CI checkout does not have it.
+        if not REAL_VENDOR_BINARY.exists():
+            self.skipTest("packaging/vendor/ollama/ollama not fetched in this checkout")
         if hasattr(sys, "_MEIPASS"):
             del sys._MEIPASS
         if hasattr(sys, "frozen"):

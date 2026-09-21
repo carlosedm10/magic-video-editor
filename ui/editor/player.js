@@ -1167,6 +1167,20 @@ const Player = {
 
   currentEdlTime() {
     if (this.mode === "preview") return this._previewVideo?.currentTime || 0;
+    if (this.sourceClipId) {
+      const local = this._sourceVideo?.currentTime ?? 0;
+      const segs = Editor.segments;
+      if (!segs?.length) return this._lastEdlTime || 0;
+      const cum = Editor.cumulative();
+      for (let i = 0; i < segs.length; i++) {
+        const seg = segs[i];
+        if (seg.clip_id !== this.sourceClipId) continue;
+        if (local >= seg.start && local <= seg.end) {
+          return cum[i].start + (local - seg.start);
+        }
+      }
+      return this._lastEdlTime || 0;
+    }
     const segs = Editor.segments;
     // EDL-mutation hardening: `_currentIndex` can transiently point at a
     // segment slot that no longer means what it used to (a split/delete/

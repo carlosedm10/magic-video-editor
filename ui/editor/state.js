@@ -86,11 +86,27 @@ function _pyEdlJson(edl) {
     return "{"
       + `"clip_id": ${_pyStr(s.clip_id)}, `
       + `"end": ${_pyFloat(s.end)}, `
+      + `"paragraph_break": ${_pyBool(!!s.paragraph_break)}, `
       + `"start": ${_pyFloat(s.start)}, `
       + `"text": ${_pyStr(s.text || "")}, `
       + `"transition": {"duration": ${_pyFloat(tr.duration)}, "type": ${_pyStr(tr.type)}}`
       + "}";
   }).join(", ") + "]";
+}
+function _pyAudioEqJson(eq) {
+  if (eq === null || eq === undefined) return "null";
+  if (!Array.isArray(eq)) return "null";
+  return "[" + eq.map((v) => _pyFloat(v)).join(", ") + "]";
+}
+function _pyAudioTrackJson(track) {
+  if (track === null || track === undefined) return "null";
+  if (typeof track !== "object" || Array.isArray(track)) return "null";
+  return "{"
+    + `"asset_id": ${_pyStr(track.asset_id ?? "")}, `
+    + `"ducking": ${_pyBool(track.ducking ?? false)}, `
+    + `"gain_db": ${_pyFloat(track.gain_db ?? 0)}, `
+    + `"start_s": ${_pyFloat(track.start_s ?? 0)}`
+    + "}";
 }
 function _pyColorJson(c) {
   if (!c) return "null";
@@ -118,6 +134,8 @@ function _pySubtitlesJson(s) {
 function _manifestJson(payload) {
   return "{"
     + `"audio_enhance": ${_pyBool(payload.audio_enhance)}, `
+    + `"audio_eq": ${_pyAudioEqJson(payload.audio_eq)}, `
+    + `"audio_track": ${_pyAudioTrackJson(payload.audio_track)}, `
     + `"color": ${_pyColorJson(payload.color)}, `
     + `"edl": ${_pyEdlJson(payload.edl)}, `
     + `"subtitles": ${_pySubtitlesJson(payload.subtitles)}`
@@ -370,6 +388,7 @@ const Editor = {
       this._notifyOverlays();
     } catch (e) {
       console.error("Overlay save failed", e); // fail-soft: local edits stay visible, just unsaved
+      showToast(e.message);
     }
   },
 
@@ -443,13 +462,16 @@ const Editor = {
      that's the more correct "stale" signal than re-fetching project.edl. */
   async computeManifestHash() {
     const payload = {
+      audio_enhance: state.project?.audio_enhance ?? null,
+      audio_eq: state.project?.audio_eq ?? null,
+      audio_track: state.project?.audio_track ?? null,
+      color: state.project?.color ?? null,
       edl: (this.segments || []).map((s) => ({
         clip_id: s.clip_id, start: s.start, end: s.end, text: s.text || "",
+        paragraph_break: !!s.paragraph_break,
         transition: s.transition || { type: "none", duration: 0.5 },
       })),
-      color: state.project?.color ?? null,
       subtitles: state.project?.subtitles ?? null,
-      audio_enhance: state.project?.audio_enhance ?? null,
     };
     return _sha256Hex16(_manifestJson(payload));
   },
@@ -669,6 +691,7 @@ const Editor = {
     const body = {
       segments: this.segments.map((s) => ({
         clip_id: s.clip_id, start: s.start, end: s.end, text: s.text || "",
+        paragraph_break: !!s.paragraph_break,
         transition: s.transition || { type: "none", duration: 0.5 },
       })),
     };

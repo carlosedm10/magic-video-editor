@@ -335,6 +335,7 @@ window.AudioPanel = window.AudioPanel || {
         <div class="hint">
           El realce solo se aplica al render/exportación final — no se oye en Draft.
           Usa "Probar (desde el cursor)" para escucharlo en el editor sin exportar.
+          Esa vista previa desde el cursor es solo realce de voz; "Generate preview" incluye también el EQ.
         </div>
         <div class="row" style="margin-top:8px;gap:8px;align-items:center">
           <button class="btn small" id="audio-cursor-preview-btn">Probar (desde el cursor)</button>
