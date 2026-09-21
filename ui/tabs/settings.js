@@ -476,10 +476,31 @@ function _sfsRenderGeneral(host) {
       // cancel just this edit), not the app-wide Escape handler in core.js
       // that closes the whole Settings overlay -- letting it bubble would
       // cancel-and-also-close instead of just cancel-in-place.
-      if (e.key === "Enter") { e.stopPropagation(); cancelled = false; saveExportDir(input.value); }
-      else if (e.key === "Escape") { e.stopPropagation(); cancelled = true; stopEditing(); }
+      if (e.key === "Enter") {
+        e.preventDefault();
+        e.stopPropagation();
+        cancelled = false;
+        input.blur();
+      } else if (e.key === "Escape") {
+        e.preventDefault();
+        e.stopPropagation();
+        cancelled = true;
+        input.blur();
+      }
     };
-    input.onblur = () => { if (!cancelled) stopEditing(); };
+    input.onblur = () => {
+      if (cancelled) {
+        cancelled = false;
+        stopEditing();
+        return;
+      }
+      const path = input.value;
+      if (!path || !path.trim()) {
+        stopEditing();
+        return;
+      }
+      saveExportDir(path);
+    };
   }
 
   $("#sfs-change-folder").onclick = async () => {

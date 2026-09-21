@@ -1,0 +1,53 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+
+      - name: Set up Python 3.12
+        run: uv python install 3.12
+
+      - name: Install ffmpeg
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+
+      - name: Install dependencies
+        run: uv sync --frozen
+
+      # scripts/test_*.py predate ruff enforcement and have many style violations;
+      # lint the application package and this CI runner only.
+      - name: Ruff
+        run: uvx ruff check magic_video_editor scripts/run_ci_tests.py
+
+      - name: Run tests with coverage
+        env:
+          COVERAGE: "1"
+        run: uv run python scripts/run_ci_tests.py
+
+      - name: Coverage report
+        run: |
+          uv run --with coverage coverage combine
+          uv run --with coverage coverage report -m
+          uv run --with coverage coverage xml -o coverage.xml
+
+      - name: Upload coverage.xml
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-xml
+          path: coverage.xml

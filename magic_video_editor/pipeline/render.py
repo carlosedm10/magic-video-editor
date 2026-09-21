@@ -64,7 +64,7 @@ import time
 from pathlib import Path
 
 from .. import config, ffmpeg_utils, queue, settings, store
-from . import audio_enhance, filters, ordering, subtitles, sync
+from . import audio_enhance, eq, filters, ordering, subtitles, sync
 
 PREVIEW_HEIGHT = 540
 PREVIEW_CRF = 32
@@ -282,14 +282,15 @@ def _export_dir_for(project: dict) -> Path:
 
 def _preview_manifest(project: dict) -> str:
     """Stable hash of the config a preview render corresponds to (edl + color
-    + subtitles + audio_enhance + audio_track) so the UI render-bar can
-    compare it against current project state and know if the preview is
+    + subtitles + audio_enhance + audio_eq + audio_track) so the UI render-bar
+    can compare it against current project state and know if the preview is
     stale."""
     payload = {
         "edl": project.get("edl"),
         "color": project.get("color"),
         "subtitles": project.get("subtitles"),
         "audio_enhance": project.get("audio_enhance"),
+        "audio_eq": project.get("audio_eq"),
         "audio_track": project.get("audio_track"),
     }
     blob = json.dumps(payload, sort_keys=True, default=str).encode()
@@ -662,6 +663,36 @@ def _apply_music_bed(log, project: dict, in_path: Path, out_path: Path) -> bool:
     return True
 
 
+def _apply_program_eq(log, project: dict, in_path: Path, out_path: Path) -> bool:
+    """8-band program EQ (project["audio_eq"]): one ffmpeg pass with -c:v copy.
+    Replaces in_path with the filtered result. No-op (False) when EQ is flat."""
+    af = eq.build_audio_filter(project.get("audio_eq"))
+    if not af:
+        return False
+
+    log("Applying 8-band program EQ...")
+    cmd = [
+        ffmpeg_utils.ffmpeg_bin(),
+        "-y",
+        "-i",
+        str(in_path),
+        "-c:v",
+        "copy",
+        "-af",
+        af,
+        "-c:a",
+        "aac",
+        "-b:a",
+        "192k",
+        "-threads",
+        str(ffmpeg_utils.ffmpeg_threads()),
+        str(out_path),
+    ]
+    ffmpeg_utils.run(cmd, heavy=True)
+    out_path.replace(in_path)
+    return True
+
+
 def _build(
     log,
     project: dict,
@@ -772,6 +803,9 @@ def _build(
         audio_enhance.enhance(str(raw_wav), str(enhanced_wav))
         ffmpeg_utils.mux_audio(str(out_path), str(enhanced_wav), str(remuxed))
         remuxed.replace(out_path)
+
+    eq_out = work / "program_eq.mp4"
+    _apply_program_eq(log, project, out_path, eq_out)
 
     # Main audio track (spec vNext): AFTER audio-enhance -- ducking should
     # key off the final, already-enhanced program audio (see _apply_music_bed

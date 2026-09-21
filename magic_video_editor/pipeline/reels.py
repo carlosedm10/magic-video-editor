@@ -1105,6 +1105,9 @@ def render_reel(log, project: dict, reel_id: str) -> None:
         ffmpeg_utils.mux_audio(str(work_out), str(enhanced_wav), str(remuxed))
         remuxed.replace(work_out)
 
+    eq_out = work / f"reel_{reel_id}_program_eq.mp4"
+    render_mod._apply_program_eq(log, project, work_out, eq_out)
+
     # Main audio track (spec vNext "Main audio track"): reuses render.py's
     # own _apply_music_bed (source of truth for the ducking filtergraph, same
     # reuse pattern as _encode_segment/_merge_crossfades above), AFTER

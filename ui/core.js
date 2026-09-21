@@ -219,8 +219,8 @@ const fmtT = (t) => {
 // standalone "stage:reels" run triggered from the Reels tab).
 const STAGES = [
   ["ingest", "1 Ingest"], ["sync", "2 Sync"], ["transcribe", "3 Transcribe"],
-  ["takes", "4 Takes"], ["order", "5 Order"], ["review", "6 Review"],
-  ["judge", "7 Judge"], ["render", "8 Render"],
+  ["takes", "4 Takes"], ["order", "5 Order"], ["paragraphs", "6 Paragraphs"],
+  ["review", "7 Review"], ["judge", "8 Judge"], ["render", "9 Render"],
 ];
 // Friendly labels for the run-all progress panel (spec: Pipeline orchestration UX).
 // Mirrors magic_video_editor/api/pipeline.py's STAGE_LABELS — keep in lockstep.
@@ -228,7 +228,8 @@ const STAGES = [
 // progress copy) even though it's no longer in STAGES above.
 const STAGE_LABELS = {
   ingest: "Reading files", sync: "Syncing cameras", transcribe: "Transcribing",
-  takes: "Analyzing takes", order: "Ordering the story", review: "Checking for suggestions",
+  takes: "Analyzing takes", order: "Ordering the story",
+  paragraphs: "Marking paragraph breaks", review: "Checking for suggestions",
   judge: "Judging the edit", render: "Editing the video", reels: "Making shorts",
 };
 
@@ -367,8 +368,9 @@ function updateTopbarForProject() {
 }
 
 /* ---------- pipeline status chip (spec v7 §7.2) ----------
-   Replaces the old 8 always-visible stage pills with ONE compact chip
-   ("Pipeline ✓" done / "Pipeline N/8" in progress / garnet error) that opens
+   Replaces the old always-visible stage pills with ONE compact chip
+   ("Pipeline ✓" done / "Pipeline N/M" in progress where M = STAGES.length
+   (9 stages) / garnet error) that opens
    an anchored popover listing every stage with its status and a per-stage
    re-run button (same runStage() the old pills called). Self-contained:
    injects its own <style> + popover DOM into #stage-bar (still the anchor
