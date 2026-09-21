@@ -16,6 +16,8 @@ const KIND_LABEL = {
   redundant: "Redundant", repeated_idea: "Repeated idea",
   off_topic: "Off topic", incoherent: "Incoherent",
   placement: "New clip", duplicate_clip: "Possible duplicate",
+  lost_content: "Lost content", kept_blooper: "Blooper",
+  order_issue: "Order", incoherent_transition: "Transition",
 };
 
 const Suggestions = {

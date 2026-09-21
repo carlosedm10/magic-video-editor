@@ -265,7 +265,13 @@ def media_reel_preview(pid: str, reel_id: str, request: Request):
 def media_file(pid: str, path: str, request: Request):
     pdir = store.project_dir(pid).resolve()
     target = Path(path).resolve()
-    if not str(target).startswith(str(pdir)):
+    # String prefix matching treats ".../projects/abc" as authorizing
+    # ".../projects/abc_other/secret". Require a real path boundary.
+    try:
+        inside = target.is_relative_to(pdir)
+    except ValueError:
+        inside = False
+    if not inside:
         raise HTTPException(403)
     return _stream(target, request)
 

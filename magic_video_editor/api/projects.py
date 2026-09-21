@@ -179,7 +179,12 @@ def project_update(pid: str, body: ProjectUpdate):
     if body.pacing is not None:
         if body.pacing not in PACING_VALUES:
             raise HTTPException(422, f"pacing must be one of {sorted(PACING_VALUES)}")
+        # Pacing is baked into segment boundaries by build_edl. A cached EDL
+        # keeps the previous rhythm until it is dropped.
+        current = project.get("pacing") or "natural"
         project["pacing"] = body.pacing
+        if body.pacing != current:
+            project["edl"] = None
     if body.speakers is not None:
         by_id = {sp["id"]: sp for sp in project.get("speakers", [])}
         for upd in body.speakers:
@@ -348,8 +353,14 @@ def sentence_update(pid: str, sid: str, body: SentenceUpdate):
     project = store.load(pid)
     for s in project["sentences"]:
         if s["id"] == sid:
+            changed = bool(s.get("kept")) != bool(body.kept)
             s["kept"] = body.kept
             s["reason"] = "" if body.kept else "excluded manually"
+            # The timeline and the export both read project["edl"]. Leaving
+            # the previous cut in place made a keep/cut toggle look like it
+            # worked in Takes while the Studio cut (and the render) ignored it.
+            if changed:
+                project["edl"] = None
             store.save(project)
             return s
     raise HTTPException(404)
@@ -372,5 +383,8 @@ def order_update(pid: str, body: OrderUpdate):
     project = store.load(pid)
     project["clip_order"] = body.clip_order
     project["order_notes"] = "manual order"
+    # Narrative order is applied when the EDL is built. A stale EDL would
+    # keep playing the previous clip sequence.
+    project["edl"] = None
     store.save(project)
     return {"ok": True}

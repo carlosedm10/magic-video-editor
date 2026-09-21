@@ -1,9 +1,11 @@
 """Suggestions API: list / accept / dismiss the reviewer agent's findings
 (project["suggestions"]), populated by magic_video_editor/pipeline/review.py. Accepting
 a "cut" suggestion applies it (marks the referenced sentences kept=False and
-invalidates the cached EDL so it's rebuilt); accepting "reorder"/"merge" only
-flips the suggestion's status — per spec ("suggest, don't delete") the actual
-reordering/merging stays a manual Studio edit.
+invalidates the cached EDL so it's rebuilt). Accepting a "restore" suggestion
+(judge lost-content) marks those sentences kept=True and invalidates the EDL
+the same way. Accepting "reorder"/"merge" only flips the suggestion's status —
+per spec ("suggest, don't delete") the actual reordering/merging stays a manual
+Studio edit.
 
 Accepting a "placement" or "duplicate_clip" suggestion (spec v7.3, populated
 by magic_video_editor/pipeline/placement.py for incrementally-added clips) instead
@@ -53,6 +55,16 @@ def suggestions_accept(pid: str, sid: str):
             if s["id"] in ids:
                 s["kept"] = False
                 s["reason"] = "suggestion accepted"
+        project["edl"] = None
+    elif suggestion.get("proposed_action") == "restore":
+        # Judge "lost content" cards (pipeline/judge.py) ask to put sentences
+        # back. Accept used to flip status only, so the card vanished and the
+        # sentences stayed cut.
+        ids = set(suggestion.get("sentence_ids") or [])
+        for s in project.get("sentences", []):
+            if s["id"] in ids:
+                s["kept"] = True
+                s["reason"] = ""
         project["edl"] = None
     suggestion["status"] = "accepted"
     store.save(project)

@@ -178,6 +178,13 @@ const TransitionsBrowser = {
     Editor.select(i);
     this._focusIndex = i;
     try { window.EditorUI.inspector?.switchTab("fx"); } catch (e) { console.error(e); }
+    // switchTab only flips visibility. The FX panel was rendered earlier
+    // against the previous junction, so "Junction N" and the highlighted
+    // card stayed stale until the user left the tab and came back.
+    try {
+      const el = document.getElementById("insp-fx");
+      if (el) this.render(el);
+    } catch (e) { console.error(e); }
   },
 
   /* Display name for a stored transition type — used by the timeline's

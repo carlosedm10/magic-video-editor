@@ -491,6 +491,14 @@ def build_edl(project: dict, paragraph_break_after: set[str] | None = None) -> l
         pad_start = pacing["head_pad_s"] if i == 0 else config.SEGMENT_PAD
         pad_end = pacing["tail_pad_s"] if i == last_idx else config.SEGMENT_PAD
         seg["start"] = max(0.0, seg["start"] - pad_start)
-        seg["end"] = min(clip["info"]["duration"], seg["end"] + pad_end)
+        # Clips can be registered before ffprobe fills info (ingest leaves
+        # info=None). Reading ["info"]["duration"] 500'd GET /edl in that window.
+        info = clip.get("info") if isinstance(clip.get("info"), dict) else {}
+        duration = info.get("duration")
+        padded_end = seg["end"] + pad_end
+        if isinstance(duration, (int, float)) and duration > 0:
+            seg["end"] = min(float(duration), padded_end)
+        else:
+            seg["end"] = padded_end
 
     return _trim_trailing_low_content(segments)

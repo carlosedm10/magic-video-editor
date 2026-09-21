@@ -304,6 +304,9 @@ function hideHome() {
 }
 
 function goHome() {
+  // Home is an explicit "no project" choice. Leaving the last id in
+  // localStorage made the next launch jump straight back into the editor.
+  setPersistedProjectId(null);
   state.pid = null;
   state.project = null;
   state.tab = null;
@@ -840,6 +843,9 @@ function closeDrawer() {
    needs no changes to keep mounting into it. ---------- */
 
 function openSettings() {
+  // The Takes/Reels drawer sits underneath this overlay (lower z-index).
+  // Closing Settings used to reveal it again, still open.
+  closeDrawer();
   state.tab = "settings";
   $("#settings-overlay").hidden = false;
   renderTab();
@@ -851,7 +857,10 @@ function closeSettings() {
 }
 
 function renderTab() {
-  if (!state.project || !state.tab) return;
+  // Settings (About, export path, models) does not need an open project.
+  // Bailing here left the About menu as an empty full-screen sheet on Home.
+  if (!state.tab) return;
+  if (state.tab !== "settings" && !state.project) return;
   const fn = window.TABS[state.tab];
   if (!fn) return;
   try {
