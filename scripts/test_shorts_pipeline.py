@@ -214,6 +214,7 @@ class StandaloneReelsStageTests(unittest.TestCase):
         pid = self.project["id"]
         with (
             patch("magic_video_editor.pipeline.reels.llm.available", return_value=True),
+            patch.object(pipeline, "_preflight_stage", lambda _stage: None),
             patch(
                 "magic_video_editor.pipeline.reels._candidate_windows",
                 return_value=[
